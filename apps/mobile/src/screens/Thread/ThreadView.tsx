@@ -94,7 +94,7 @@ import { ReplyFailureSheet } from '../../components/chat/ReplyFailureSheet';
 import { RunResult } from '../../components/chat/RunResult';
 import { RunCard } from '../../components/ui/RunCard';
 import { Skeleton } from '../../components/ui/Skeleton';
-import { LoadingState } from '../../components/ui/LoadingState';
+import { LoadingState, useLoadingHandoff } from '../../components/ui/LoadingState';
 import { ConnectionUnavailable, type ConnectionUnavailableProps } from '../../components/ui/ConnectionUnavailable';
 import { SystemEventRow } from '../../components/ui/SystemEventRow';
 import { triggerLightImpact } from '../../services/haptics';
@@ -548,6 +548,12 @@ export function ThreadView({
     && !connectionFailure?.message && (state.kind === 'offline' || connectionOutage);
   const showConnectionFailure = Boolean(connectionFailure && savedScope !== connectionFailure.scope
     && offline && !retainReadableConversation);
+  // The Companion covers the timeline while it waits, then plays its success payoff over the arriving content.
+  const loaderActive = !(showConnectionFailure && connectionFailure)
+    && (state.kind === 'loading' || (state.kind === 'reconnecting' && messages.length === 0));
+  const loaderPhase = useLoadingHandoff(loaderActive, state.kind === 'ready' || state.kind === 'empty');
+  const loaderMessage = useRef('');
+  if (loaderActive) loaderMessage.current = state.kind === 'reconnecting' ? t('Reconnecting…') : connectingLabel ?? copy.loadingHistory;
 
   const locked = state.kind === 'locked';
   // A scheduled run's transcript is read, not continued: the header names it and the composer stays away.
@@ -1105,9 +1111,7 @@ export function ThreadView({
                 onViewSaved={messages.length > 0 || runCards.length > 0 ? () => setSavedScope(connectionFailure.scope) : undefined}
               />
             </View>
-          ) : (state.kind === 'loading' || (state.kind === 'reconnecting' && messages.length === 0)) ? (
-            <View style={[styles.centeredState, { paddingTop: timelineTopClearance }]}><LoadingState testID="thread-history-loading" message={state.kind === 'reconnecting' ? t('Reconnecting…') : connectingLabel ?? copy.loadingHistory} pose={connectingLabel ? 'connecting' : 'loading'} /></View>
-          ) : messages.length === 0 && (state.kind === 'error' || state.kind === 'offline') ? (
+          ) : loaderActive ? null : messages.length === 0 && (state.kind === 'error' || state.kind === 'offline') ? (
             <View style={[styles.sessionContent, { paddingTop: timelineTopClearance }]}><ConnectionUnavailable name={agentName} message={state.kind === 'error' ? state.message : undefined} onRetry={onRetry} /></View>
           ) : state.kind === 'locked' ? (
             <View
@@ -1166,6 +1170,17 @@ export function ThreadView({
               ) : null}
             </>
           )}
+          {/* One mounted loader for the wait and its payoff, so the scene that waited is the one that celebrates. */}
+          {loaderPhase ? (
+            <View
+              pointerEvents={loaderPhase === 'ready' ? 'none' : 'box-none'}
+              style={[StyleSheet.absoluteFill, styles.centeredState, { paddingTop: timelineTopClearance }]}
+            >
+              <LoadingState testID="thread-history-loading" phase={loaderPhase} message={loaderMessage.current}
+                pose={connectingLabel ? 'connecting' : 'loading'}
+                slowAction={connectionFailure?.onManage ? { label: t('Manage connection', { ns: 'config' }), onPress: connectionFailure.onManage } : undefined} />
+            </View>
+          ) : null}
         </Animated.View>
         {timelineItems.length > 0 && !locked ? (
           <Animated.View

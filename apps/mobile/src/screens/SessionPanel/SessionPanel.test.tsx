@@ -535,19 +535,20 @@ describe('SessionPanelView', () => {
     expect(view.getByTestId('session-panel-action-export')).toBeTruthy();
   });
 
-  it('runs pin, reset and delete after the action sheet dismisses and labels pinned rows as Unpin', async () => {
+  it('runs home toggle, reset and delete after the action sheet dismisses and labels shown rows as Hide', async () => {
     const onSessionAction = jest.fn(async () => undefined);
     const view = render(<SessionPanelView {...props({ onSessionAction })} />);
     const mainRow = rowById('agent:main:main');
     const cron = rowById('agent:main:cron:Daily report');
 
+    // Conversations are shown on or hidden from home; only Agents pin (owner decision 2026-09-27).
     fireEvent(view.getByTestId(`session-panel-row-${cron.id}`), 'longPress');
-    expect(view.getByText('Unpin from roster')).toBeTruthy();
+    expect(view.getByText('Hide from home')).toBeTruthy();
     chooseAfterDismiss(view, 'pin');
     expect(onSessionAction).toHaveBeenCalledWith(cron, 'pin');
 
     fireEvent(view.getByTestId(`session-panel-row-${mainRow.id}`), 'longPress');
-    expect(view.getByText('Pin to roster')).toBeTruthy();
+    expect(view.getByText('Show on home')).toBeTruthy();
     chooseAfterDismiss(view, 'reset');
     expect(view.getByTestId('session-panel-confirm')).toBeTruthy();
     await act(async () => {

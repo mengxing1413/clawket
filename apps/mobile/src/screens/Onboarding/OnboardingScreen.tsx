@@ -304,16 +304,18 @@ export function OnboardingScreen({
         {status.kind === 'error' ? <ErrorBanner code={status.code} backendKind={backendKind} onAction={onErrorAction} /> : null}
         {localError ? <Banner tone="bad" message={t('Please try again later.', { ns: 'common' })} /> : null}
         {choosing ? <>
-          <View testID="onboarding-backends" style={styles.backendList}>
-            {chooserRows.map((row) => {
-              if (row.kind === 'youmind') return <ChoiceRow key={row.kind} testID="onboarding-youmind" leading={<PlatformMark platform="youmind" />} title={row.label} onPress={onOpenYouMind} />;
-              const kind = row.kind;
-              return <ChoiceRow key={kind} testID={`onboarding-backend-${kind}`} leading={<PlatformMark platform={kind} />} title={row.label} onPress={() => chooseBackend(kind)} />;
-            })}
-          </View>
-          <View style={styles.secondaryActions}>
-            <Button testID="onboarding-docs-toggle" label={t('No agent yet?')} variant="text" onPress={() => setDocsExpanded((expanded) => !expanded)} />
-            {docsExpanded ? <View testID="onboarding-doc-options" style={styles.docsList}>{websiteOptions.map((backend) => <Button key={backend.kind} testID={`onboarding-doc-${backend.kind}`} label={backend.label} variant="text" onPress={() => onOpenWebsite(backend.kind)} />)}</View> : null}
+          <View testID="onboarding-chooser" style={styles.chooser}>
+            <View testID="onboarding-backends">
+              {chooserRows.map((row) => {
+                if (row.kind === 'youmind') return <ChoiceRow key={row.kind} testID="onboarding-youmind" leading={<PlatformMark platform="youmind" balanced />} title={row.label} onPress={onOpenYouMind} />;
+                const kind = row.kind;
+                return <ChoiceRow key={kind} testID={`onboarding-backend-${kind}`} leading={<PlatformMark platform={kind} balanced />} title={row.label} onPress={() => chooseBackend(kind)} />;
+              })}
+            </View>
+            <View style={styles.secondaryActions}>
+              <Button testID="onboarding-docs-toggle" label={t('No agent yet?')} variant="text" onPress={() => setDocsExpanded((expanded) => !expanded)} />
+              {docsExpanded ? <View testID="onboarding-doc-options" style={styles.docsList}>{websiteOptions.map((backend) => <Button key={backend.kind} testID={`onboarding-doc-${backend.kind}`} label={backend.label} variant="text" onPress={() => onOpenWebsite(backend.kind)} />)}</View> : null}
+            </View>
           </View>
           <View testID="onboarding-open-source" style={styles.openSource}>
             <Text style={styles.openSourceTitle}>{t('This project is open source.')}</Text>
@@ -495,16 +497,19 @@ function createStyles(colors: ReturnType<typeof useAppTheme>['theme']['colors'])
     },
     content: { flexGrow: 1, paddingHorizontal: Space.xl, gap: Space.xl },
     subtitle: { color: colors.inkSecondary, fontSize: FontSize.secondary, lineHeight: LineHeight.secondary, fontWeight: FontWeight.regular },
-    backendList: { gap: Space.sm },
     keyboardAnchor: { gap: Space.md },
     // Step 02 gets a touch more air than the page's uniform block gap so the two steps read as separate moves.
     secondStep: { marginTop: Space.sm },
     codeInputText: { fontSize: FontSize.title, lineHeight: LineHeight.title, fontVariant: ['tabular-nums'], letterSpacing: Space.xs, textAlign: 'center' },
-    secondaryActions: { marginTop: Space.xl, gap: Space.sm },
-    openSource: { marginTop: 'auto', paddingTop: Space.xxl, paddingBottom: Space.lg, alignItems: 'center', gap: Space.xs },
+    // "No agent yet?" sits under the choices it answers; the open-source note follows as its own block
+    // rather than anchoring to the screen bottom (owner feedback 2026-09-27: the help floated between them).
+    chooser: { gap: Space.sm },
+    secondaryActions: { gap: Space.sm },
+    openSource: { paddingTop: Space.lg, paddingBottom: Space.lg, alignItems: 'center', gap: Space.xs },
     openSourceTitle: { color: colors.inkSecondary, fontSize: FontSize.secondary, lineHeight: LineHeight.secondary, fontWeight: FontWeight.semibold, textAlign: 'center' },
     openSourceCopy: { color: colors.inkSecondary, fontSize: FontSize.secondary, lineHeight: LineHeight.secondary, fontWeight: FontWeight.regular, textAlign: 'center' },
-    docsList: { flexDirection: 'row', justifyContent: 'center' },
+    // Five or more website links outgrow one line on a phone; wrap them rather than run off both edges.
+    docsList: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center' },
     alternatives: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: Space.xs },
     progress: {
       flexDirection: 'row',

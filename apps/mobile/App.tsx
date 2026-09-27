@@ -7,11 +7,11 @@ import { IncomingShareCoordinator } from './src/features/sharing/IncomingShareCo
 import 'react-native-get-random-values';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
   Alert,
   AppState,
   type AppStateStatus,
   I18nManager,
+  Image,
   Linking,
   Platform,
   Share,
@@ -43,6 +43,7 @@ import { GatewayScannerProvider } from './src/contexts/GatewayScannerContext';
 import { NodeCameraCaptureProvider } from './src/contexts/NodeCameraCaptureContext';
 import { ProPaywallProvider, useProPaywall } from './src/contexts/ProPaywallContext';
 import { GlobalLoadingOverlay } from './src/components/ui';
+import { Companion } from './src/components/ui/Companion';
 import { DeepLinkConfirmationModal } from './src/components/DeepLinkConfirmationModal';
 import { ProPaywallOverlay } from './src/components/pro/ProPaywallOverlay';
 import { loadAgentAvatars } from './src/services/agent-avatar';
@@ -216,10 +217,17 @@ type AnnouncementPresentation = Readonly<{
   openedAtMs: number;
 }>;
 
+const LAUNCH_MARK = require('./assets/splash-icon.png');
+// The native splash draws splash-icon.png 200 points wide (app.json, expo-splash-screen `imageWidth`),
+// and the Companion fills 94 × 3.2 of its 1024-pixel canvas (scripts/generate-companion-icons.cjs).
+const SPLASH_IMAGE_WIDTH = 200;
+const SPLASH_COMPANION_WIDTH = (94 * 3.2 / 1024) * SPLASH_IMAGE_WIDTH;
+
+/** Continues the native splash with the same artwork, size and centring instead of a spinner. */
 function LaunchLoading(): React.JSX.Element {
   return (
     <View style={[loadingStyles.loading, { backgroundColor: LOADING_THEME.colors.canvas }]}>
-      <ActivityIndicator size="large" color={LOADING_THEME.colors.accent} />
+      <Image source={LAUNCH_MARK} style={loadingStyles.launchMark} resizeMode="contain" accessibilityIgnoresInvertColors />
       <StatusBar style="auto" />
     </View>
   );
@@ -1501,7 +1509,7 @@ function AppContent({
   if (!connections.initialized) {
     return (
       <View style={[loadingStyles.loading, { backgroundColor: theme.colors.canvas }]}>
-        <ActivityIndicator size="large" color={theme.colors.accent} />
+        <Companion size={SPLASH_COMPANION_WIDTH} />
         <StatusBar style={theme.scheme === 'dark' ? 'light' : 'dark'} />
       </View>
     );
@@ -2247,5 +2255,9 @@ const loadingStyles = StyleSheet.create({
     alignItems: 'center',
     flex: 1,
     justifyContent: 'center',
+  },
+  launchMark: {
+    width: SPLASH_IMAGE_WIDTH,
+    height: SPLASH_IMAGE_WIDTH,
   },
 });

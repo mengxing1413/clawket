@@ -16,9 +16,21 @@ jest.mock('../../../components/ui/Sheet', () => ({ Sheet: ({ children, onAfterCl
 jest.mock('../../../components/ui/SheetHeaderButton', () => ({ SheetHeaderButton: () => null }));
 jest.mock('../../../components/ui/SearchInput', () => ({ SearchInput: () => null }));
 jest.mock('../../../components/ui/Banner', () => ({ Banner: () => null }));
-jest.mock('../../../components/ui/LoadingState', () => ({ LoadingState: () => null }));
+jest.mock('../../../components/ui/ListSkeleton', () => ({ ListSkeleton: (props: any) => require('react').createElement('ListSkeleton', props) }));
 jest.mock('../../../components/ui/SettingsGroup', () => ({ SettingsDivider: () => null, SettingsRow: (props: any) => require('react').createElement('Pressable', props) }));
 const report = (name: string): SkillStatusReport => ({ workspaceDir: name, managedSkillsDir: '', skills: [{ name, skillKey: name, invocation: `$${name}`, eligible: true, disabled: false, blockedByAllowlist: false }] } as SkillStatusReport);
+
+it('shows list-shaped placeholders until the first answer instead of flashing an empty state', async () => {
+  let resolve!: (value: SkillStatusReport) => void;
+  const status = jest.fn(() => new Promise<SkillStatusReport>(done => { resolve = done; }));
+  const adapter = { connection: { id: 'qa' }, management: { skills: { status } } } as unknown as AgentAdapter;
+  const view = render(<SkillPickerSheet visible adapter={adapter} agentId="main" online onClose={jest.fn()} onSelect={jest.fn()} onManage={jest.fn()} />);
+  expect(view.getByTestId('skill-picker-loading')).toBeTruthy();
+  expect(view.queryByText('No available skills')).toBeNull();
+  await act(async () => resolve({ workspaceDir: '', managedSkillsDir: '', skills: [] } as unknown as SkillStatusReport));
+  expect(view.queryByTestId('skill-picker-loading')).toBeNull();
+  expect(view.getByText('No available skills')).toBeTruthy();
+});
 
 it('fences late skill results and closed-sheet selection when the chat changes', async () => {
   let resolveFirst!: (value: SkillStatusReport) => void;

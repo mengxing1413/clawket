@@ -19,9 +19,8 @@ import {
   Folder,
   Check,
   ChevronDown,
-  Pin,
+  House,
   SquarePen,
-  Terminal,
 } from 'lucide-react-native';
 import { ChevronRight } from '../../components/ui/DirectionalIcon';
 import { BottomSheetFlatList, TouchableOpacity as SheetTouchableOpacity } from '@gorhom/bottom-sheet';
@@ -37,8 +36,8 @@ import { Button } from '../../components/ui/Button';
 import { FormTextInput } from '../../components/ui/FormTextInput';
 import { SearchInput } from '../../components/ui/SearchInput';
 import {
-  resolveSessionChannelIcon,
   resolveSessionKindIcon,
+  resolveSessionTileIcon,
 } from '../../components/ui/sessionKindIcon';
 import { Sheet } from '../../components/ui/Sheet';
 import { SheetHeaderButton } from '../../components/ui/SheetHeaderButton';
@@ -177,11 +176,7 @@ function SessionTile({
       />
     );
   }
-  const Icon = row.project && (row.kind === 'direct' || row.kind === 'other')
-    ? Terminal
-    : row.kind === 'channel'
-    ? resolveSessionChannelIcon(row.channel)
-    : resolveSessionKindIcon(row.kind);
+  const Icon = resolveSessionTileIcon(row);
   return (
     <View style={styles.tileSlot}>
       <View
@@ -267,8 +262,9 @@ const SessionRow = memo(function SessionRow({
       <SessionTile row={row} agent={agent} />
       <View style={styles.copy}>
         <View style={styles.titleRow}>
+          {/* Shown on the home roster (owner decision 2026-09-27: pinning is only for Agents). */}
           {row.pinned ? (
-            <Pin
+            <House
               testID={`session-panel-row-${row.id}-pinned`}
               size={IconSize.sm}
               color={theme.colors.inkTertiary}
@@ -545,7 +541,7 @@ function actionLabel(
   t: Translate,
 ): string {
   if (action === 'export') return t('Export conversation', { ns: 'chat' });
-  if (action === 'pin') return pinned ? t('Unpin from roster') : t('Pin to roster');
+  if (action === 'pin') return pinned ? t('Hide from home') : t('Show on home');
   if (action === 'rename') return t('Rename');
   if (action === 'reset') return t('Reset');
   return t('Delete');
@@ -1146,6 +1142,7 @@ export function SessionPanel({
     rowCount: rows.length,
     activeState: connectionId && connections.activeConnectionId !== connectionId ? 'offline' : connections.activeState,
     hasError: connections.error !== null,
+    awaitingSessions: group?.source !== 'live',
   });
 
   return (
