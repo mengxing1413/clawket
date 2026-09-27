@@ -291,7 +291,10 @@ export function ModelPickerModal({
       initialNumToRender={18}
       maxToRenderPerBatch={24}
       windowSize={10}
-      removeClippedSubviews
+      // Filtering replaces whole sections while the sheet/keyboard resizes. Native
+      // clipping can detach Fabric children before that same commit removes them.
+      // Keep virtualization, but let React own the mounted children's lifecycle.
+      removeClippedSubviews={false}
       showsVerticalScrollIndicator
     />
   );

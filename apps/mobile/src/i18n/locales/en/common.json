@@ -255,5 +255,6 @@
   "Projects": "Projects",
   "Choose a project": "Choose a project",
   "Search projects": "Search projects",
-  "Next": "Next"
+  "Next": "Next",
+  "Could not refresh sessions": "Could not refresh sessions"
 }

@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const mock = vi.hoisted(() => ({ control: vi.fn(), background: vi.fn(), fetch: vi.fn() }));
+const mock = vi.hoisted(() => ({ control: vi.fn(), background: vi.fn(), fetch: vi.fn(), home: '' }));
+vi.mock('node:os', async (original) => ({ ...await original<typeof import('node:os')>(), homedir: () => mock.home }));
 vi.mock('./codex-lifecycle.js', () => ({ codexControl: mock.control, startCodexBackground: mock.background }));
 vi.mock('qrcode', () => ({ default: { toString: async () => '[test QR]' } }));
 vi.mock('@clawket/bridge-runtime', async () => {
@@ -17,7 +18,7 @@ vi.mock('@clawket/bridge-runtime', async () => {
 import { handleCodexCommand } from './codex.js';
 let root: string, project: string, path: string;
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'codex-cli-')); project = join(root, 'project'); mkdirSync(project); path = join(root, 'runtime.json');
+  root = mkdtempSync(join(tmpdir(), 'codex-cli-')); mock.home = root; project = join(root, 'project'); mkdirSync(project); path = join(root, 'runtime.json');
   mock.control.mockReset(); mock.background.mockReset(); mock.fetch.mockReset();
   mock.control.mockRejectedValue(new Error('offline'));
   if (process.send) vi.spyOn(process as unknown as { send: (...args: unknown[]) => boolean }, 'send').mockImplementation(() => true);
@@ -65,4 +66,26 @@ it('refuses contradictory scope flags and never widens an existing project pairi
   await expect(handleCodexCommand(['pair', '--device', '--config', path])).rejects.toThrow('different scope');
   expect(JSON.parse(readFileSync(path, 'utf8')).device).toBeUndefined();
   expect(mock.background).not.toHaveBeenCalled();
+});
+
+it.each([false, true])('preserves default device scope on first detached pairing (preview=%s)', async (preview) => {
+  const args = ['pair', '--local', '--address', '127.0.0.1', ...(preview ? ['--preview'] : [])];
+  await handleCodexCommand(args);
+  const childArgs = mock.background.mock.calls[0][0];
+  const childConfig = childArgs[childArgs.indexOf('--config') + 1];
+  await handleCodexCommand([...childArgs, '--foreground']);
+  const initial = JSON.parse(readFileSync(childConfig, 'utf8'));
+  expect(initial).toMatchObject({ device: true, project: realpathSync(join(root, 'Documents', 'Clawket', 'Chats')) });
+  await handleCodexCommand(args);
+  const repeatedArgs = mock.background.mock.calls[1][0];
+  expect(repeatedArgs[repeatedArgs.indexOf('--config') + 1]).toBe(childConfig);
+  await handleCodexCommand([...repeatedArgs, '--foreground']);
+  expect(JSON.parse(readFileSync(childConfig, 'utf8'))).toMatchObject({ device: true, token: initial.token, port: initial.port });
+});
+
+it('keeps explicit project scope through a first detached pairing', async () => {
+  await handleCodexCommand(['pair', '--local', '--address', '127.0.0.1', '--project', project, '--config', path]);
+  const childArgs = mock.background.mock.calls[0][0];
+  await handleCodexCommand([...childArgs, '--foreground']);
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ device: false, project: realpathSync(project) });
 });

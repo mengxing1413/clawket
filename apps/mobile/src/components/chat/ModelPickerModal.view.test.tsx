@@ -213,7 +213,7 @@ describe('ModelPickerModal view', () => {
       initialNumToRender: 18,
       maxToRenderPerBatch: 24,
       windowSize: 10,
-      removeClippedSubviews: true,
+      removeClippedSubviews: false,
       showsVerticalScrollIndicator: true,
     });
     expect(view.getByTestId('model-picker-search').props.compositionSafeBottomSheet).toBe(true);

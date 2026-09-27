@@ -255,5 +255,6 @@
   "Projects": "Projets",
   "Choose a project": "Choisir un projet",
   "Search projects": "Rechercher des projets",
-  "Next": "Suivant"
+  "Next": "Suivant",
+  "Could not refresh sessions": "Impossible d’actualiser les sessions"
 }

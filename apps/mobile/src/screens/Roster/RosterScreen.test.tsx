@@ -521,6 +521,16 @@ describe('RosterScreen', () => {
     expect(onLongPressRow).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'main' }));
   });
 
+  it('shows a pending question as input needed instead of active work', () => {
+    mockRoster = [group('live', 'live', [agent('live', 'main')])];
+    mockRoster = mockRoster.map(group => ({ ...group, agents: group.agents.map(agent => ({ ...agent, attention: 'input' as const, sessions: agent.sessions.map(session => ({ ...session, attention: 'input' as const, hasActiveRun: true })) })) }));
+    mockConnections = snapshot({ connections: [connection('live')], roster: mockRoster });
+    const view = render(<RosterScreen {...props()} />);
+    expect(view.getByText('Agent needs your input')).toBeTruthy();
+    expect(view.queryByTestId('roster-row-agent:live:main-avatar-working-ring')).toBeNull();
+    expect(view.getByTestId('roster-row-agent:live:main').props.accessibilityLabel).toContain('Agent needs your input');
+  });
+
   it('marks the live connection\'s rows only while the roster mixes connections', () => {
     const mixed = () => [
       group('live', 'live', [agent('live', 'main'), agent('live', 'builder')]),

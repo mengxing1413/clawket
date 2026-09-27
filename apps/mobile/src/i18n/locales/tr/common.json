@@ -255,5 +255,6 @@
   "Projects": "Projeler",
   "Choose a project": "Proje seç",
   "Search projects": "Proje ara",
-  "Next": "İleri"
+  "Next": "İleri",
+  "Could not refresh sessions": "Oturumlar yenilenemedi"
 }

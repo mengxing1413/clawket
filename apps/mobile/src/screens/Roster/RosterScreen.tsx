@@ -457,13 +457,15 @@ export function RosterView({
         avatarName={item.avatarName}
         emoji={item.emoji}
         avatarUrl={item.avatarUrl}
-        preview={!activeConnectionOffline && item.working
+        preview={!activeConnectionOffline && item.attention === 'input' ? t('Agent needs your input', { ns: 'chat' })
+          : !activeConnectionOffline && item.working && item.attention === 'approval' ? t('Needs attention')
+          : !activeConnectionOffline && item.working
           ? item.activity === 'thinking' ? t('Thinking…', { ns: 'chat' })
             : item.activity === 'tool' ? t('Using tool', { ns: 'chat' }) : t('Working')
           : item.subtitle?.label ?? item.preview ?? t('No activity yet')}
         pinned={item.kind === 'pinned_session' || item.agentPinned}
         sessionKind={item.sessionKind}
-        avatarStatus={activeConnectionOffline ? 'offline' : item.working ? 'working' : 'idle'}
+        avatarStatus={activeConnectionOffline ? 'offline' : item.working && item.attention !== 'input' && item.attention !== 'approval' ? 'working' : 'idle'}
         timeLabel={timeLabel}
         unreadCount={item.unreadCount}
         unreadIndicator="dot"
@@ -472,7 +474,7 @@ export function RosterView({
         cached={item.cached}
         locked={item.locked}
         live={live}
-        accessibilityLabel={[item.name, live ? t('Connected', { ns: 'settings' }) : null, timeLabel, item.cached && item.syncedAt ? `${t('Last synced')} ${relativeTime(item.syncedAt, translateRelativeTime)}` : null, item.working ? t('Working') : null, item.unreadCount > 0 ? t('Unread messages') : null].filter(Boolean).join(', ')}
+        accessibilityLabel={[item.name, live ? t('Connected', { ns: 'settings' }) : null, timeLabel, item.cached && item.syncedAt ? `${t('Last synced')} ${relativeTime(item.syncedAt, translateRelativeTime)}` : null, item.attention === 'input' ? t('Agent needs your input', { ns: 'chat' }) : item.attention === 'approval' ? t('Needs attention') : item.working ? t('Working') : null, item.unreadCount > 0 ? t('Unread messages') : null].filter(Boolean).join(', ')}
         onPress={() => { dismissRoster?.(); open(item); }}
         {...(onLongPressRow ? { onLongPress: () => onLongPressRow(item) } : {})}
       />

@@ -150,7 +150,8 @@ import {
 } from './src/services/app-update-announcement';
 import { ThreadScreen } from './src/screens/Thread';
 import {
-  SessionPanel,
+  SessionPanelHost,
+  type SessionPanelHandle,
   type SessionPanelAction,
   type SessionPanelRow,
 } from './src/screens/SessionPanel';
@@ -430,12 +431,12 @@ function AppContent({
   const [pendingChatInput, setPendingChatInput] = useState<string | null>(null);
   const [pendingMainSessionSwitch, setPendingMainSessionSwitch] = useState(false);
   const [pendingAddGateway, setPendingAddGateway] = useState(false);
-  const [sessionPanelVisible, setSessionPanelVisible] = useState(false);
+  const sessionPanelRef = useRef<SessionPanelHandle>(null);
   const [exportTarget, setExportTarget] = useState<SessionPanelRow | null>(null);
   const pendingExport = useRef<SessionPanelRow | null>(null);
   useEffect(() => { pendingExport.current = null; }, [connections.activeAdapter]);
   const manualSessions = useManualSessions();
-  useEffect(() => { setExportTarget(null); }, [connections.activeAdapter, sessionPanelVisible]);
+  useEffect(() => { setExportTarget(null); }, [connections.activeAdapter]);
   const [threadContext, setThreadContext] = useState<RootStackParamList['Thread'] | null>(null);
   const [pinnedSessionKeys, setPinnedSessionKeys] = useState<Readonly<
     Record<string, ReadonlyArray<string>>
@@ -562,14 +563,12 @@ function AppContent({
     rootNavigationRef,
     activeBackend: activeConnection?.backendKind,
   });
-  const manualScreenVisibilityRef = useRef({ sessionPanel: false, paywall: false });
+  const manualScreenVisibilityRef = useRef({ paywall: false });
 
-  useEffect(() => {
-    if (sessionPanelVisible && !manualScreenVisibilityRef.current.sessionPanel) {
-      trackManualScreen('SessionPanel');
-    }
-    manualScreenVisibilityRef.current.sessionPanel = sessionPanelVisible;
-  }, [sessionPanelVisible, trackManualScreen]);
+  const handleSessionPanelVisibilityChange = useCallback((visible: boolean) => {
+    setExportTarget(null);
+    if (visible) trackManualScreen('SessionPanel');
+  }, [trackManualScreen]);
 
   useEffect(() => {
     if (paywallVisible && !manualScreenVisibilityRef.current.paywall) {
@@ -1332,7 +1331,7 @@ function AppContent({
         return;
       }
       pendingExport.current = row;
-      setSessionPanelVisible(false);
+      sessionPanelRef.current?.close();
       return;
     }
     if (action === 'pin') {
@@ -1362,7 +1361,7 @@ function AppContent({
       const agent = getConnectionRuntime().getSnapshot().roster.find(group => group.connection.id === row.connectionId)
         ?.agents.find(item => item.agent.agentId === row.agentId)?.agent;
       if (agent?.entryMode === 'sessions' && params?.connectionId === row.connectionId && params.sessionKey === row.key) {
-        setSessionPanelVisible(false);
+        sessionPanelRef.current?.close();
         rootNavigationRef.dispatch(StackActions.replace('Thread', { ...params, sessionKey: '' }));
       }
     }
@@ -1753,14 +1752,12 @@ function AppContent({
                               ? 'agents'
                               : 'gatewayConnections',
                             () => {
-                              setThreadContext(props.route.params);
-                              setSessionPanelVisible(true);
+                              sessionPanelRef.current?.open(props.route.params);
                             },
                           );
                           return;
                         }
-                        setThreadContext(props.route.params);
-                        setSessionPanelVisible(true);
+                        sessionPanelRef.current?.open(props.route.params);
                       }}
                       onOpenRunSession={(sessionKey, agentId) => {
                         const targetAgentId = agentId ?? props.route.params.agentId;
@@ -2059,15 +2056,15 @@ function AppContent({
                 onContinue={() => closeAnnouncement('continue')}
                 onEntryPress={handleAnnouncementEntryPress}
               />
-              <SessionPanel
-                visible={sessionPanelVisible}
+              <SessionPanelHost
+                ref={sessionPanelRef}
+                onVisibilityChange={handleSessionPanelVisibilityChange}
                 pinnedSessionKeys={pinnedSessionKeys}
                 currentAgentId={threadContext?.agentId ?? currentAgentId}
                 currentSessionKey={threadContext?.sessionKey ?? mainSessionKey}
                 permissionDenied={threadContext
                   ? !canAccessRosterAgent(threadContext.connectionId, threadContext.agentId)
                   : false}
-                onClose={() => setSessionPanelVisible(false)}
                 onSelectSession={(row) => {
                   if (!canAccessRosterAgent(row.connectionId, row.agentId)) {
                     presentPaywall(
@@ -2104,7 +2101,7 @@ function AppContent({
                     if (getConnectionRuntime().getSnapshot().activeAdapter !== adapter || !rootNavigationRef.isReady()) return;
                     const params: RootStackParamList['Thread'] = { connectionId: agent.connectionId, agentId: agent.agentId, sessionKey: session.key, from: 'panel' };
                     setThreadContext(params); setCurrentAgentId(agent.agentId);
-                    setSessionPanelVisible(false); rootNavigationRef.navigate('Thread', params);
+                    sessionPanelRef.current?.close(); rootNavigationRef.navigate('Thread', params);
                   };
                   if (!canAccessRosterAgent(agent.connectionId, agent.agentId)) {
                     presentPaywall(canAccessConnection(agent.connectionId) ? 'agents' : 'gatewayConnections', create);

@@ -255,5 +255,6 @@
   "Projects": "प्रोजेक्ट",
   "Choose a project": "प्रोजेक्ट चुनें",
   "Search projects": "प्रोजेक्ट खोजें",
-  "Next": "अगला"
+  "Next": "अगला",
+  "Could not refresh sessions": "सत्र रीफ़्रेश नहीं हो सके"
 }

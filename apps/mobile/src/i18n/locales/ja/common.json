@@ -255,5 +255,6 @@
   "Projects": "プロジェクト",
   "Choose a project": "プロジェクトを選択",
   "Search projects": "プロジェクトを検索",
-  "Next": "次へ"
+  "Next": "次へ",
+  "Could not refresh sessions": "セッションを更新できませんでした"
 }

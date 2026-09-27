@@ -203,6 +203,20 @@ describe('OnboardingScreen', () => {
     consoleErrorSpy.mockRestore();
   });
 
+  it.each(['openclaw', 'hermes', 'codex', 'claude-code', 'pi'] as const)('does not claim a completed transport before %s is ready', (initialBackend) => {
+    const props = createProps({ initialBackend });
+    const view = render(<OnboardingScreen {...props} status={{ kind: 'connecting', phase: 'relay_connected' }} />);
+    for (const phase of ['relay_connected', 'waiting_bridge'] as const) {
+      view.rerender(<OnboardingScreen {...props} status={{ kind: 'connecting', phase }} />);
+      expect(view.getByText('common:Connecting')).toBeTruthy();
+      expect(view.queryByText('Relay connected')).toBeNull();
+      expect(view.queryByText('Ready')).toBeNull();
+    }
+    view.rerender(<OnboardingScreen {...props} status={{ kind: 'connecting', phase: 'ready' }} />);
+    expect(view.getByText('Ready')).toBeTruthy();
+    expect(view.queryByText('common:Connecting')).toBeNull();
+  });
+
   it('separates backend selection from pairing and returns without retaining a stale code', () => {
     const view = render(<OnboardingScreen {...createProps({ initialBackend: undefined })} />);
     expect(view.getByText('Connect your agent')).toBeTruthy();

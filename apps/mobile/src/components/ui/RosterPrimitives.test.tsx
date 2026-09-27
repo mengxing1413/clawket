@@ -43,6 +43,7 @@ jest.mock('react-native', () => {
     ),
   );
   return {
+    ...require('../../../__mocks__/native-animated'),
     Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
     Image: primitive('Image'),
     Pressable: primitive('Pressable'),

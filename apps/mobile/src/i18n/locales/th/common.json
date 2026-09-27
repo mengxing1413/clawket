@@ -255,5 +255,6 @@
   "Projects": "โปรเจกต์",
   "Choose a project": "เลือกโปรเจกต์",
   "Search projects": "ค้นหาโปรเจกต์",
-  "Next": "ถัดไป"
+  "Next": "ถัดไป",
+  "Could not refresh sessions": "รีเฟรชเซสชันไม่สำเร็จ"
 }

@@ -255,5 +255,6 @@
   "Projects": "Dự án",
   "Choose a project": "Chọn dự án",
   "Search projects": "Tìm dự án",
-  "Next": "Tiếp theo"
+  "Next": "Tiếp theo",
+  "Could not refresh sessions": "Không thể làm mới phiên"
 }

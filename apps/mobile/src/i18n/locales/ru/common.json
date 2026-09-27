@@ -255,5 +255,6 @@
   "Projects": "Проекты",
   "Choose a project": "Выбрать проект",
   "Search projects": "Поиск проектов",
-  "Next": "Далее"
+  "Next": "Далее",
+  "Could not refresh sessions": "Не удалось обновить сеансы"
 }

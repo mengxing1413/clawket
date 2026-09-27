@@ -1,10 +1,12 @@
 import { ClaudeFault } from './errors.js';
-import { randomUUID } from 'node:crypto';
+import { ClaudeOwnerLock } from './owner-lock.js';
+import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 
 export type ClaudeRecord = {
   key: string;
+  imported?: true;
   nativeId?: string;
   cwd: string;
   title: string;
@@ -22,7 +24,9 @@ function validate(records: unknown): asserts records is ClaudeRecord[] {
   const keys = new Set<string>();
   const nativeIds = new Set<string>();
   for (const row of records) {
-    if (!row || typeof row !== 'object' || !UUID.test(row.key) || keys.has(row.key)
+    if (!row || typeof row !== 'object' || (row.imported === true ? row.key !== `native:${createHash('sha256').update(typeof row.nativeId === 'string' ? row.nativeId : '').digest('hex').slice(0, 32)}` : !UUID.test(row.key)) || keys.has(row.key)
+      || row.imported !== undefined && row.imported !== true
+      || row.imported === true && (!row.nativeId || row.materialized !== true)
       || typeof row.cwd !== 'string' || !isAbsolute(row.cwd) || typeof row.title !== 'string' || row.title.length > 300
       || !Number.isFinite(row.createdAt) || row.createdAt < 0
       || row.lastActivityAt !== undefined && (!Number.isFinite(row.lastActivityAt) || row.lastActivityAt < 0)
@@ -49,16 +53,14 @@ function validate(records: unknown): asserts records is ClaudeRecord[] {
 export class ClaudeStore {
   records: ClaudeRecord[] = [];
   private readonly indexPath: string;
-  private readonly lockPath: string;
-  private readonly owner = JSON.stringify({ pid: process.pid, nonce: randomUUID() });
+  private readonly lock: ClaudeOwnerLock;
   private closed = false;
 
   constructor(private readonly directory: string, private readonly scope: { project: string; device: boolean }) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     if (!lstatSync(directory).isDirectory() || lstatSync(directory).isSymbolicLink()) throw new ClaudeFault('Invalid Claude state directory');
     this.indexPath = join(directory, 'sessions.json');
-    this.lockPath = join(directory, 'owner.lock');
-    this.acquire();
+    this.lock = new ClaudeOwnerLock(directory);
     try {
       if (!existsSync(this.indexPath)) return;
       const stat = lstatSync(this.indexPath);
@@ -69,35 +71,6 @@ export class ClaudeStore {
       if (!scope.device && saved.sessions.some((row: ClaudeRecord) => row.cwd !== scope.project)) throw new ClaudeFault('Claude project scope mismatch');
       this.records = saved.sessions;
     } catch (error) { this.close(); throw error; }
-  }
-
-  private acquire(): void {
-    try { writeFileSync(this.lockPath, this.owner, { flag: 'wx', mode: 0o600 }); return; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw new ClaudeFault('Cannot create Claude owner lock'); }
-    // Two contenders must not both decide the same old lock is stale and unlink a replacement.
-    const recoveryPath = join(this.directory, 'owner-recovery.lock');
-    try { writeFileSync(recoveryPath, this.owner, { flag: 'wx', mode: 0o600 }); }
-    catch { throw new ClaudeFault('Claude owner recovery is already in progress'); }
-    try { this.recoverDeadOwner(); }
-    finally {
-      try { if (readFileSync(recoveryPath, 'utf8') === this.owner) unlinkSync(recoveryPath); } catch { /* Fail closed. */ }
-    }
-  }
-
-  private recoverDeadOwner(): void {
-    const stat = lstatSync(this.lockPath);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 || stat.nlink !== 1) throw new ClaudeFault('Invalid Claude owner lock');
-    let prior: { pid: number };
-    try { prior = JSON.parse(readFileSync(this.lockPath, 'utf8')); }
-    catch { throw new ClaudeFault('Invalid Claude owner lock'); }
-    if (!Number.isSafeInteger(prior?.pid) || prior.pid <= 0) throw new ClaudeFault('Invalid Claude owner process');
-    try { process.kill(prior.pid, 0); throw new ClaudeFault('This Claude pairing already has a Bridge owner'); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
-    // Compare the inode again before removing a confirmed dead owner's lock.
-    const current = lstatSync(this.lockPath);
-    if (current.ino !== stat.ino || current.dev !== stat.dev) throw new ClaudeFault('Claude owner changed during recovery');
-    unlinkSync(this.lockPath);
-    writeFileSync(this.lockPath, this.owner, { flag: 'wx', mode: 0o600 });
   }
 
   save(): void {
@@ -117,8 +90,6 @@ export class ClaudeStore {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    try {
-      if (readFileSync(this.lockPath, 'utf8') === this.owner) unlinkSync(this.lockPath);
-    } catch { /* A removed/replaced lock is never recreated or taken from its new owner. */ }
+    this.lock.close();
   }
 }

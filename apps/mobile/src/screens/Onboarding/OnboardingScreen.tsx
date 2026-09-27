@@ -15,7 +15,6 @@ import {
   Check,
   ArrowUpRight,
   CheckCircle2,
-  Circle,
   Copy,
   ImagePlus,
   MessageSquareText,
@@ -398,29 +397,11 @@ function ConnectionProgress({
   const { t } = useTranslation('config');
   const { theme } = useAppTheme();
   const styles = useMemo(() => createStyles(theme.colors), [theme.colors]);
-  const connectionPhases = useMemo(() => [
-    { key: 'relay_connected', label: t('Relay connected') },
-    { key: 'waiting_bridge', label: t('Waiting for Bridge') },
-    { key: 'ready', label: t('Ready') },
-  ] as const, [t]);
-  const activeIndex = connectionPhases.findIndex((item) => item.key === phase);
+  const ready = phase === 'ready';
   return (
     <View testID="onboarding-progress" style={styles.progress}>
-      {connectionPhases.map((item, index) => {
-        const complete = index <= activeIndex;
-        const ProgressIcon = complete ? CheckCircle2 : Circle;
-        return (
-          <View key={item.key} style={styles.progressItem}>
-            <ProgressIcon
-              size={IconSize.sm}
-              color={complete ? theme.colors.good : theme.colors.inkTertiary}
-            />
-            <Text style={[styles.progressLabel, complete ? styles.progressLabelActive : null]}>
-              {item.label}
-            </Text>
-          </View>
-        );
-      })}
+      {ready ? <CheckCircle2 size={IconSize.sm} color={theme.colors.good} /> : null}
+      <Text style={styles.progressLabel}>{ready ? t('Ready') : t('common:Connecting')}</Text>
     </View>
   );
 }
@@ -527,23 +508,16 @@ function createStyles(colors: ReturnType<typeof useAppTheme>['theme']['colors'])
     alternatives: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: Space.xs },
     progress: {
       flexDirection: 'row',
-      justifyContent: 'space-between',
-      gap: Space.sm,
-    },
-    progressItem: {
-      flex: 1,
+      justifyContent: 'center',
       alignItems: 'center',
       gap: Space.xs,
     },
     progressLabel: {
-      color: colors.inkTertiary,
+      color: colors.inkSecondary,
       fontSize: FontSize.secondary,
       lineHeight: LineHeight.secondary,
       fontWeight: FontWeight.regular,
       textAlign: 'center',
-    },
-    progressLabelActive: {
-      color: colors.inkSecondary,
     },
     skeletonScreen: {
       paddingHorizontal: Space.lg,

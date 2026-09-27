@@ -255,5 +255,6 @@
   "Projects": "项目",
   "Choose a project": "选择项目",
   "Search projects": "搜索项目",
-  "Next": "下一步"
+  "Next": "下一步",
+  "Could not refresh sessions": "会话刷新失败"
 }

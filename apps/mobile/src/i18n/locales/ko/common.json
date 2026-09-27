@@ -255,5 +255,6 @@
   "Projects": "프로젝트",
   "Choose a project": "프로젝트 선택",
   "Search projects": "프로젝트 검색",
-  "Next": "다음"
+  "Next": "다음",
+  "Could not refresh sessions": "세션을 새로고침하지 못했어요"
 }

@@ -255,5 +255,6 @@
   "Projects": "專案",
   "Choose a project": "選擇專案",
   "Search projects": "搜尋專案",
-  "Next": "下一步"
+  "Next": "下一步",
+  "Could not refresh sessions": "工作階段重新整理失敗"
 }

@@ -255,5 +255,6 @@
   "Projects": "المشاريع",
   "Choose a project": "اختيار مشروع",
   "Search projects": "البحث عن المشاريع",
-  "Next": "التالي"
+  "Next": "التالي",
+  "Could not refresh sessions": "تعذر تحديث الجلسات"
 }

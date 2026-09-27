@@ -11,10 +11,11 @@ import type {
   SessionDescriptor,
 } from '@clawket/agent-protocol';
 
-import type { RosterConnectionGroup } from '../../connection';
+import { useConnections, useRoster, type RosterConnectionGroup } from '../../connection';
 import { analyticsEvents } from '../../services/analytics/events';
 import { FontSize, StatusSize } from '../../theme/tokens';
 import {
+  SessionPanel,
   SessionPanelView,
   type SessionPanelViewProps,
 } from './SessionPanel';
@@ -72,6 +73,8 @@ jest.mock('react-native', () => {
     ),
   );
   return {
+    Platform: { OS: 'android', select: (options: Record<string, unknown>) => options.android ?? options.default },
+    Keyboard: { dismiss: jest.fn() },
     Pressable: host('Pressable'),
     ScrollView: host('ScrollView'),
     useWindowDimensions: () => ({ width: 393, height: 852, fontScale: 1 }),
@@ -729,3 +732,69 @@ it('does not offer session creation without a handler or an Agent', () => {
    await act(async () => finish());
    expect(onClose).toHaveBeenCalledTimes(1);
  });
+
+
+describe('project refresh lifecycle', () => {
+  const project = { id: 'project-a', name: 'Work', path: '/work', available: true };
+  const props = { currentAgentId: 'main', currentSessionKey: 'agent:main:main', onClose: jest.fn(), onSelectSession: jest.fn(), onCreateSession: jest.fn() };
+  function connect(list: jest.Mock, id = 'connection') {
+    const adapter = { connection: { id }, capabilities: { ...capabilities, projects: true, sessionCreate: true }, projects: { list }, createSession: jest.fn() };
+    jest.mocked(useConnections).mockReturnValue({ initialized: true, activeConnectionId: id, activeAdapter: adapter, activeState: 'ready', error: null } as unknown as ReturnType<typeof useConnections>);
+    jest.mocked(useRoster).mockReturnValue([source]);
+    return adapter;
+  }
+  it('does not scan while hidden or on close; cached projects keep New session usable while refreshing', async () => {
+    const list = jest.fn().mockResolvedValue([project]);
+    connect(list);
+    const tree = render(<SessionPanel {...props} visible={false} />);
+    expect(list).not.toHaveBeenCalled();
+    tree.rerender(<SessionPanel {...props} visible />);
+    await waitFor(() => expect(tree.getByTestId('session-panel-create')).toBeTruthy());
+    expect(list).toHaveBeenCalledTimes(1);
+    tree.rerender(<SessionPanel {...props} visible={false} />);
+    expect(list).toHaveBeenCalledTimes(1);
+    list.mockImplementation(() => new Promise(() => {}));
+    tree.rerender(<SessionPanel {...props} visible />);
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(tree.getByTestId('session-panel-create')).toBeTruthy();
+  });
+  it('discards late project results from a replaced adapter', async () => {
+    let finish!: (value: typeof project[]) => void;
+    connect(jest.fn(() => new Promise(resolve => { finish = resolve; })));
+    const tree = render(<SessionPanel {...props} visible />);
+    connect(jest.fn().mockResolvedValue([]));
+    tree.rerender(<SessionPanel {...props} visible />);
+    await act(async () => {});
+    await act(async () => finish([project]));
+    expect(tree.queryByTestId('session-panel-create')).toBeNull();
+  });
+  it('keeps creation reachable after a roster refresh error, but never while offline or denied', async () => {
+    connect(jest.fn().mockResolvedValue([project]));
+    const tree = render(<SessionPanel {...props} visible />);
+    await waitFor(() => expect(tree.getByTestId('session-panel-create')).toBeTruthy());
+    const snapshot = jest.mocked(useConnections).mock.results.at(-1)!.value;
+    jest.mocked(useConnections).mockReturnValue({ ...snapshot, error: { operation: 'roster', message: 'Timed out' } });
+    tree.rerender(<SessionPanel {...props} visible />);
+    expect(tree.getByTestId('session-panel-error')).toBeTruthy();
+    expect(tree.getByTestId('session-panel-create')).toBeTruthy();
+    tree.rerender(<SessionPanel {...props} permissionDenied visible />);
+    expect(tree.queryByTestId('session-panel-create')).toBeNull();
+    jest.mocked(useConnections).mockReturnValue({ ...snapshot, activeState: 'offline' });
+    tree.rerender(<SessionPanel {...props} visible />);
+    expect(tree.queryByTestId('session-panel-create')).toBeNull();
+  });
+  it('keeps the current cache on refresh failure, without enabling creation for another adapter', async () => {
+    const list = jest.fn().mockResolvedValue([project]);
+    connect(list);
+    const tree = render(<SessionPanel {...props} visible />);
+    await waitFor(() => expect(tree.getByTestId('session-panel-create')).toBeTruthy());
+    tree.rerender(<SessionPanel {...props} visible={false} />);
+    list.mockRejectedValue(new Error('Offline'));
+    tree.rerender(<SessionPanel {...props} visible />);
+    await act(async () => {});
+    expect(tree.getByTestId('session-panel-create')).toBeTruthy();
+    connect(jest.fn(() => new Promise(() => {})));
+    tree.rerender(<SessionPanel {...props} visible />);
+    expect(tree.queryByTestId('session-panel-create')).toBeNull();
+  });
+});

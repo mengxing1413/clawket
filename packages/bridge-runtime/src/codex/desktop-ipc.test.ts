@@ -67,3 +67,31 @@ it('does not send a delayed owner reply on a replacement IPC connection', async 
   await new Promise(resolve => setImmediate(resolve));
   expect(write).not.toHaveBeenCalled();
 });
+
+
+it('waits beyond native discovery before accepting an explicit no-owner response', async () => {
+  vi.useFakeTimers();
+  const ipc = new DesktopIpc([]);
+  const write = vi.fn();
+  Object.assign(ipc, { socket: { destroyed: false, destroy: vi.fn() }, clientId: 'qa', write });
+  try {
+    const result = ipc.request('thread-follower-start-turn', { conversationId: 'qa' }).catch(error => error);
+    await Promise.resolve();
+    const requestId = write.mock.calls[0][0].requestId;
+    await vi.advanceTimersByTimeAsync(10_100);
+    (ipc as any).receive({ type: 'response', requestId, resultType: 'error', error: 'no-client-found' });
+    expect(await result).toMatchObject({ outcome: 'no-owner' });
+  } finally { ipc.stop(); vi.useRealTimers(); }
+});
+
+it.each(['request-timeout', 'client-disconnected', 'error-handling-request', 'Clawket could not complete this operation'])('retains unknown dispatch for native %s', async error => {
+  const ipc = new DesktopIpc([]);
+  const write = vi.fn();
+  Object.assign(ipc, { socket: { destroyed: false, destroy: vi.fn() }, clientId: 'qa', write });
+  try {
+    const result = ipc.request('thread-follower-start-turn', {}).catch(error => error);
+    await Promise.resolve();
+    (ipc as any).receive({ type: 'response', requestId: write.mock.calls[0][0].requestId, resultType: 'error', error });
+    expect(await result).toMatchObject({ outcome: 'uncertain' });
+  } finally { ipc.stop(); }
+});
