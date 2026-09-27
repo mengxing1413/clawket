@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 const mock = vi.hoisted(() => ({ instances: [] as any[], request: vi.fn(), respond: vi.fn(), refuse: vi.fn() }));
 vi.mock('./rpc.js', async () => {
@@ -298,7 +298,7 @@ describe('device project discovery and desktop routing', () => {
       if (method === 'turn/start') return { turn: { id: 'new-turn' } }; return {};
     });
     const projects = await request('projects.list'); expect(projects).toHaveLength(2);
-    const p = projects.find((p: any) => p.path.endsWith('/second'));
+    const p = projects.find((p: any) => basename(p.path) === 'second');
     const created = await request('sessions.create', { projectId: p.id });
     await request('chat.send', { sessionKey: created.key, text: 'hello', idempotencyKey: 'project-send' });
     expect(mock.request).toHaveBeenCalledWith('thread/start', expect.objectContaining({ cwd: p.path }));

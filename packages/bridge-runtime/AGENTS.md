@@ -211,3 +211,5 @@ SDK Relay heartbeat termination logs fixed cause, pong idle duration, scheduler 
 Codex skill catalogs resolve optional session scope to an already authorized native/owned project. Reject unknown sessions and mismatched returned project rows; absence of session context retains the configured default project.
 
 Codex Desktop IPC deadlines must outlast native owner discovery plus dispatch (currently 10 seconds each). Only explicit no-owner permits local fallback; routed timeouts, disconnects and generic handler failures retain uncertain dispatch. Do not clear the writer fence or resend after an ambiguous error.
+
+Claude metadata commits must flush the writable exclusive-create handle before atomic rename; reopening it read-only fails `fsync` on Windows. Preserve the old index on write/flush failure. Cross-platform IPC tests use Windows named pipes and platform-native path comparisons.

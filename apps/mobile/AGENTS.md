@@ -481,3 +481,5 @@ Pi standard question choices use explicit radio selection followed by Send; pend
 Current-model reads must not overwrite newer native session metadata or an explicit user selection received while the read was pending. Fence stale selection values independently of catalog loading so the picker still completes and remains usable.
 
 Share posters preserve custom avatars/emoji and use the shared Agent name initials when neither exists, matching the conversation identity instead of inventing a generic mascot.
+
+Explicit React Native unit-test factories must retain `Platform` (including `OS` and `select`) for platform-dependent typography; importing shared tokens must not depend on a test-only optional-platform fallback.

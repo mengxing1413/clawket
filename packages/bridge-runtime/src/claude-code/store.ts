@@ -80,9 +80,9 @@ export class ClaudeStore {
     if (Buffer.byteLength(json) > MAX_BYTES) throw new ClaudeFault('Claude metadata storage limit reached');
     const temporary = join(this.directory, `sessions-${randomUUID()}.pending`);
     try {
-      writeFileSync(temporary, json, { flag: 'wx', mode: 0o600 });
-      const descriptor = openSync(temporary, 'r');
-      try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+      // Flush the writable handle itself: Windows rejects fsync on a read-only handle.
+      const descriptor = openSync(temporary, 'wx', 0o600);
+      try { writeFileSync(descriptor, json); fsyncSync(descriptor); } finally { closeSync(descriptor); }
       renameSync(temporary, this.indexPath);
     } finally { if (existsSync(temporary)) unlinkSync(temporary); }
   }

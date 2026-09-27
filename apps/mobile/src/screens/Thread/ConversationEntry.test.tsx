@@ -3,6 +3,7 @@ import { act, render, waitFor } from '@testing-library/react-native';
 import { ConversationEntry } from './ConversationEntry';
 
 jest.mock('react-native', () => ({ ...jest.requireActual('react-native'), View: 'View' }));
+jest.mock('lucide-react-native', () => ({ ChevronLeft: () => null }));
 
 let mockPanel: any;
 let mockLoading: any = null;
