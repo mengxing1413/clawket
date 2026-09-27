@@ -25,7 +25,7 @@ import { ClaudeService } from './service.js';
 const services: ClaudeService[] = [], dirs: string[] = [];
 const request = (service: ClaudeService, method: string, params?: Record<string, unknown>) => service.request({ type: 'req', id: randomUUID(), method, params });
 function fixture(device = false) {
-  const project = realpathSync(mkdtempSync(join(tmpdir(), 'clawket-claude-service-'))); dirs.push(project);
+  const project = realpathSync.native(mkdtempSync(join(tmpdir(), 'clawket-claude-service-'))); dirs.push(project);
   const options = { project, directory: join(project, 'state'), executable: '/unused/claude', ownershipDirectory: join(project, 'writers'), device };
   const open = () => { const service = new ClaudeService(options); services.push(service); return service; };
   return { project, open, service: open() };

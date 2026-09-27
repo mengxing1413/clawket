@@ -38,7 +38,9 @@ export class ClaudeService extends EventEmitter {
 
   constructor(private readonly options: ClaudeOptions) {
     super();
-    this.project = realpathSync(options.project);
+    // Match fs.promises.realpath in the catalog: Windows short paths must expand
+    // identically before storing the authorization scope and per-session cwd.
+    this.project = realpathSync.native(options.project);
     if (!statSync(this.project).isDirectory()) throw new ClaudeFault('Claude project must be a directory');
     const scope = { project: this.project, device: options.device === true };
     this.store = new ClaudeStore(options.directory, scope);

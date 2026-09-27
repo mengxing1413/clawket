@@ -213,3 +213,5 @@ Codex skill catalogs resolve optional session scope to an already authorized nat
 Codex Desktop IPC deadlines must outlast native owner discovery plus dispatch (currently 10 seconds each). Only explicit no-owner permits local fallback; routed timeouts, disconnects and generic handler failures retain uncertain dispatch. Do not clear the writer fence or resend after an ambiguous error.
 
 Claude metadata commits must flush the writable exclusive-create handle before atomic rename; reopening it read-only fails `fsync` on Windows. Preserve the old index on write/flush failure. Cross-platform IPC tests use Windows named pipes and platform-native path comparisons.
+
+Claude service project scope uses `realpathSync.native` to match the catalog’s asynchronous native realpath; Windows 8.3 and full paths must not create different scope/cwd identities on restart.

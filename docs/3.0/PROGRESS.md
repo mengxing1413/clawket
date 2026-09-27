@@ -1,6 +1,6 @@
 # PROGRESS · Clawket 3.0 进度日志
 
-- 2026-09-27 PR #44 首轮 CI 阻止合并：macOS Bridge/Relay 与密钥扫描通过；Windows 揭示 Claude 元数据对只读句柄 fsync 失败，已改为独占创建的可写句柄完成写入和落盘后原子替换。IPC 测试改 Windows named pipe、路径断言改按平台解析；Mobile 20 个旧 React Native mock 补 Platform，入口图标 mock 与 Claude 官网断言同步。继续验证，不绕过失败检查。
+- 2026-09-27 PR #44 首轮 CI 阻止合并：macOS Bridge/Relay 与密钥扫描通过；Windows 揭示 Claude 元数据对只读句柄 fsync 失败，已改为独占创建的可写句柄完成写入和落盘后原子替换。IPC 测试改 Windows named pipe、路径断言改按平台解析；Mobile 20 个旧 React Native mock 补 Platform，入口图标 mock 与 Claude 官网断言同步。第二轮 Windows 进一步暴露短路径/完整路径不一致导致重启误报项目范围，Service 改为 native realpath 与目录发现保持一致。继续验证，不绕过失败检查。
 
 - 2026-09-27 负责人授权本轮稳定性与接入修复、已完成的 Loading 动画和相关 UI 整理为 PR，通过检查后合并并同步本地 main。按负责人决定暂不引入物理电脑跨配对去重；本轮只修默认 Codex 设备范围丢失。合并复查另补 Loading 交接回归：首次成功渲染不得先返回 null 卸载场景，回归先失败后修复。代码合并不代表发布放行：独立网络稳定性、生产快照兼容、正式升级及物理 iPhone 仍有待验项。
 
