@@ -88,13 +88,17 @@ describe('pending origin safety', () => {
 
   it('ignores restricted and corrupted metadata', async () => {
     const now = Date.now();
-    const pairing = client('restricted', { authScope: 'pairing', pendingRequests: [['private', now + 1000]] });
-    const invalid = client('invalid', { pendingRequests: [null, ['infinite', Infinity], ['future', now + PENDING_REQUEST_TTL_MS + 1], [5, now + 1000]] as never });
-    const full = client('full', { activeClient: true }); const gateway = owner();
-    const runtime = room([pairing, invalid, full, gateway]);
-    expect(runtime.requestClientByReqId.size).toBe(0);
-    for (const id of ['private', 'infinite', 'future']) await deliver(runtime, gateway, id);
-    expect(pairing.sent).toEqual([]); expect(invalid.sent).toEqual([]); expect(full.sent).toEqual([]);
+    // Keep the +1 ms invalid-TTL boundary fixed across asynchronous delivery.
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const pairing = client('restricted', { authScope: 'pairing', pendingRequests: [['private', now + 1000]] });
+      const invalid = client('invalid', { pendingRequests: [null, ['infinite', Infinity], ['future', now + PENDING_REQUEST_TTL_MS + 1], [5, now + 1000]] as never });
+      const full = client('full', { activeClient: true }); const gateway = owner();
+      const runtime = room([pairing, invalid, full, gateway]);
+      expect(runtime.requestClientByReqId.size).toBe(0);
+      for (const id of ['private', 'infinite', 'future']) await deliver(runtime, gateway, id);
+      expect(pairing.sent).toEqual([]); expect(invalid.sent).toEqual([]); expect(full.sent).toEqual([]);
+    } finally { clock.mockRestore(); }
   });
 
   it('bounds outstanding requests without evicting them and frees capacity after expiry', () => {
