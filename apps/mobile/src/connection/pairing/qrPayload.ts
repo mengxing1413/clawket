@@ -374,5 +374,3 @@ export function parseQRPayload(raw: string): QRScanResult | null {
 
   return null;
 }
-n null;
-}
