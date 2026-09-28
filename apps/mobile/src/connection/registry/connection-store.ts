@@ -525,7 +525,7 @@ function findConnectionIdentityIndex(
       && record.relay?.gatewayId.trim() === gatewayId
     ));
   }
-  if (input.backendKind === 'openclaw' || input.backendKind === 'hermes' || input.backendKind === 'pi' || input.backendKind === 'codex' || input.backendKind === 'claude-code') {
+  if (input.backendKind === 'openclaw' || input.backendKind === 'hermes' || input.backendKind === 'pi' || input.backendKind === 'codex' || input.backendKind === 'claude-code' || input.backendKind === 'nanobot') {
     const endpointUrl = normalizeConnectionIdentityUrl(
       input.backendKind === 'hermes' ? input.hermes?.bridgeUrl ?? input.url : input.url,
     );
@@ -838,7 +838,7 @@ export class ConnectionStore {
       await this.secureStorage.setItemAsync(
         CURRENT_STORAGE_KEY,
         serializeSnapshot(revision, previous.state),
-        SECURE_OPTIONS,
+        OPTIONS,
       );
       this.publish(previous.state, revision);
       return this.snapshot;
@@ -997,3 +997,4 @@ export class ConnectionStore {
 }
 
 export const connectionStore = new ConnectionStore();
+ore();
