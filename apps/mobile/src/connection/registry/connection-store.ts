@@ -25,7 +25,7 @@ const SECURE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
 };
 
-const BACKEND_KINDS = new Set<BackendKind>(['openclaw', 'hermes', 'youmind', 'local-model', 'pi', 'codex', 'claude-code']);
+const BACKEND_KINDS = new Set<BackendKind>(['openclaw', 'hermes', 'youmind', 'local-model', 'pi', 'codex', 'claude-code', 'nanobot']);
 const TRANSPORT_KINDS = new Set<TransportKind>([
   'relay',
   'local',
@@ -43,6 +43,7 @@ const LEGACY_TRANSPORT_NORMALIZERS: Record<BackendKind, (value: TransportKind) =
   pi: value => value,
   codex: value => value,
   'claude-code': value => value,
+  nanobot: value => value,
 };
 
 const LEGACY_YOUMIND_METADATA: Record<BackendKind, (id: string) => ConnectionRecord['youmind']> = {
@@ -53,6 +54,7 @@ const LEGACY_YOUMIND_METADATA: Record<BackendKind, (id: string) => ConnectionRec
   pi: () => undefined,
   codex: () => undefined,
   'claude-code': () => undefined,
+  nanobot: () => undefined,
 };
 
 // Before 3.0, onboarding generated `YouMind (<email>)`. Keep the matcher
@@ -838,7 +840,7 @@ export class ConnectionStore {
       await this.secureStorage.setItemAsync(
         CURRENT_STORAGE_KEY,
         serializeSnapshot(revision, previous.state),
-        OPTIONS,
+        SECURE_OPTIONS,
       );
       this.publish(previous.state, revision);
       return this.snapshot;
