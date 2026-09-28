@@ -997,4 +997,3 @@ export class ConnectionStore {
 }
 
 export const connectionStore = new ConnectionStore();
-ore();
