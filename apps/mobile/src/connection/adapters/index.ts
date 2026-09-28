@@ -14,6 +14,7 @@ import { CodexAdapter } from './codex';
 import { ClaudeCodeAdapter } from './claude-code';
 import { PiAdapter } from './pi';
 import { LocalModelAdapter } from './local-model';
+import { NanobotAdapter } from './nanobot';
 
 type CreateConnectionAdapterOptions = ConnectionAdapterFactoryContext & Readonly<{
   gateway?: GatewayClient;
