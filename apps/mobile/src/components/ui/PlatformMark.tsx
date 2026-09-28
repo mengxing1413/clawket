@@ -68,7 +68,7 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
  */
 export function PlatformMark({ platform, size, balanced = false }: { platform: Platform; size?: number; balanced?: boolean }) {
   const drawn = balanced ? BALANCED_SIZE[platform] : size;
-  if (platform === 'local-model') return <LocalModelMark size={drawn} />;
+  if (platform === 'local-model' || platform === 'nanobot') return <NanobotMark size={drawn ?? ControlSize.settingsRow} />;
   return <Image accessible={false} source={marks[platform]} resizeMode="contain" style={[platform === 'hermes' || platform === 'codex' ? styles.appIcon : styles.mark, drawn ? { width: drawn, height: drawn } : null]} />;
 }
 
@@ -100,6 +100,32 @@ function LocalModelGlyph({ size, ink }: { size: number; ink?: string }) {
   const { theme: { colors } } = useAppTheme();
   return <Svg testID="platform-disc-local-model-glyph" accessible={false} width={size} height={size} viewBox={LOCAL_MODEL_CHIP_VIEWBOX}>
     <Path d={LOCAL_MODEL_CHIP} fill="none" stroke={ink ?? colors.ink} strokeWidth={(DISC_OUTLINE_WIDTH * LOCAL_MODEL_CHIP_EXTENT) / size}
+      strokeLinecap="round" strokeLinejoin="round" />
+  </Svg>;
+}
+
+/** Clawket-drawn mark for the Nanobot backend; theme ink on a quiet tile, no asset needed. */
+const NANOBOT_GLYPH_VIEWBOX = '13 13 26 26';
+const NANOBOT_GLYPH_EXTENT = 26;
+const NANOBOT_GLYPH = 'M17 18h18a4 4 0 0 1 4 4v7a4 4 0 0 1-4 4H17a4 4 0 0 1-4-4v-7a4 4 0 0 1 4-4Z'
+  + 'M26 18v-4'
+  + 'M20.4 26a1.6 1.6 0 1 0 3.2 0a1.6 1.6 0 1 0 -3.2 0Z'
+  + 'M28.4 26a1.6 1.6 0 1 0 3.2 0a1.6 1.6 0 1 0 -3.2 0Z'
+  + 'M21 33h10';
+
+function NanobotMark({ size = ControlSize.settingsRow }: { size?: number }) {
+  const { theme: { colors } } = useAppTheme();
+  const strokeWidth = Math.max(1.9, (1.2 * ControlSize.settingsRow) / size);
+  return <Svg testID="platform-mark-nanobot" accessible={false} width={size} height={size} viewBox="0 0 52 52">
+    <Rect x={5} y={5} width={42} height={42} rx={10.5} fill={colors.surface} />
+    <Path d={NANOBOT_GLYPH} fill="none" stroke={colors.ink} strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" />
+  </Svg>;
+}
+
+function NanobotGlyph({ size, ink }: { size: number; ink?: string }) {
+  const { theme: { colors } } = useAppTheme();
+  return <Svg testID="platform-disc-nanobot-glyph" accessible={false} width={size} height={size} viewBox={NANOBOT_GLYPH_VIEWBOX}>
+    <Path d={NANOBOT_GLYPH} fill="none" stroke={ink ?? colors.ink} strokeWidth={(DISC_OUTLINE_WIDTH * NANOBOT_GLYPH_EXTENT) / size}
       strokeLinecap="round" strokeLinejoin="round" />
   </Svg>;
 }
