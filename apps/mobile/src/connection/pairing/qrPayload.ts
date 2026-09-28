@@ -223,7 +223,7 @@ export function parseQRPayload(raw: string): QRScanResult | null {
         const hermes = readHermes(obj.hermes);
         return {
           url: String(obj.url),
-          ...(['pi', 'codex', 'claude-code'].includes(obj.backendKind) ? { backendKind: obj.backendKind as 'pi' | 'codex' | 'claude-code' } : {}),
+          ...(['pi', 'codex', 'claude-code', 'nanobot'].includes(obj.backendKind) ? { backendKind: obj.backendKind as 'pi' | 'codex' | 'claude-code' | 'nanobot' } : {}),
           ...(hermes ? { backendKind: 'hermes' as const } : {}),
           ...(mode && mode !== 'hermes' ? { transportKind: mode } : {}),
           ...(typeof obj.token === 'string' ? { token: obj.token } : {}),
@@ -373,4 +373,6 @@ export function parseQRPayload(raw: string): QRScanResult | null {
   }
 
   return null;
+}
+n null;
 }
