@@ -142,6 +142,7 @@ const LEGACY_BACKENDS: Record<GatewayBackendKind, GatewayBackendDescriptor> = {
   openclaw: { kind: 'openclaw', label: 'OpenClaw', capabilities: OPENCLAW_LEGACY_CAPABILITIES },
   hermes: { kind: 'hermes', label: 'Hermes', capabilities: HERMES_LEGACY_CAPABILITIES },
   youmind: { kind: 'youmind', label: 'YouMind', capabilities: YOUMIND_LEGACY_CAPABILITIES },
+  nanobot: { kind: 'nanobot', label: 'Nanobot', capabilities: { ...YOUMIND_LEGACY_CAPABILITIES, gatewayConnection: true } },
   'local-model': { kind: 'local-model', label: 'Local model', capabilities: { ...YOUMIND_LEGACY_CAPABILITIES, modelCatalog: true, modelSelection: true, chatAttachments: true } },
 };
 
@@ -165,7 +166,7 @@ export function isGatewayTransportKind(value: unknown): value is GatewayTranspor
 }
 
 export function isGatewayBackendKind(value: unknown): value is GatewayBackendKind {
-  return value === 'openclaw' || value === 'hermes' || value === 'youmind' || value === 'local-model' || value === 'pi' || value === 'codex' || value === 'claude-code';
+  return value === 'openclaw' || value === 'hermes' || value === 'youmind' || value === 'local-model' || value === 'pi' || value === 'codex' || value === 'claude-code' || value === 'nanobot';
 }
 
 export function resolveGatewayBackendKind(value: LegacyGatewayLike | null | undefined): GatewayBackendKind {
@@ -214,13 +215,14 @@ export function getGatewayThinkingLevels(
 
 export function selectByBackend<T>(
   input: LegacyGatewayLike | GatewayBackendKind | null | undefined,
-  options: { openclaw: T; hermes: T; youmind?: T },
+  options: { openclaw: T; hermes: T; youmind?: T; nanobot?: T },
 ): T {
   const kind = typeof input === 'string' && isGatewayBackendKind(input)
     ? input
     : resolveGatewayBackendKind(input as LegacyGatewayLike | null | undefined);
   if (kind === 'hermes') return options.hermes;
   if (kind === 'youmind') return options.youmind ?? options.openclaw;
+  if (kind === 'nanobot') return options.nanobot ?? options.openclaw;
   return options.openclaw;
 }
 
@@ -284,7 +286,5 @@ function parseHost(url: string): string {
     return new URL(url).host;
   } catch {
     return '';
-  }
-}
   }
 }
