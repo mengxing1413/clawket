@@ -286,7 +286,7 @@ const NANOBOT_CAPABILITIES: Capabilities = {
   models: false,
   modelPerSession: false,
   thinkingLevels: false,
-  slashCommandAp false,
+  slashCommands: false,
   skills: false,
   skillDiscover: false,
   skillInstall: false,
@@ -324,6 +324,7 @@ export const CAPABILITY_MATRIX: Record<BackendKind, Capabilities> = {
   openclaw: OPENCLAW_CAPABILITIES,
   hermes: HERMES_CAPABILITIES,
   youmind: YOUMIND_CAPABILITIES,
+  nanobot: NANOBOT_CAPABILITIES,
   'local-model': {
     ...YOUMIND_CAPABILITIES,
     chat: true, abort: true, history: true, attachments: true,
