@@ -1,6 +1,4 @@
-# 在 GitHub 上云编译 Clawket 安卓 APK（社区构建 = 不配计费 = Pro 功能解锁）
-# 用法：把本文件放到你 fork 的 Clawket 仓库的 .github/workflows/ 目录下，
-#      然后在仓库的 Actions 页面手动触发（Run workflow），跑完在 Artifacts 里下载 APK。
+# 云编译 Clawket 安卓 APK（社区构建 = 不配计费 = Pro 解锁）
 name: Build Clawket Android APK (Community)
 
 on:
@@ -25,8 +23,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Show Android SDK info
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          ls "$ANDROID_HOME" 2>/dev/null || true
+          ls "$ANDROID_HOME/platforms" 2>/dev/null || true
+          ls "$ANDROID_HOME/build-tools" 2>/dev/null || true
 
       - name: Install dependencies
         run: npm ci
@@ -39,33 +42,24 @@ jobs:
         working-directory: apps/mobile
         run: ./scripts/patch-android-native-deps.sh || true
 
-      - name: Ensure release build falls back to debug signing (社区构建无正式签名)
+      - name: Force release signing to debug (社区构建无正式 keystore)
         working-directory: apps/mobile
         run: |
           python3 - <<'PY'
           from pathlib import Path
           p = Path('android/app/build.gradle')
-          if p.exists():
-              t = p.read_text()
-              # 若 release 块仍指向 release 签名又没有 keystore，则回退 debug 签名
-              t = t.replace('signingConfig signingConfigs.release\n        }\n        release {',
-                            'signingConfig signingConfigs.debug\n        }\n        release {')
-              p.write_text(t)
-              print('build.gradle normalized')
-          else:
-              print('build.gradle not found!')
+          if not p.exists():
+              print('build.gradle not found!'); raise SystemExit(1)
+          t = p.read_text()
+          before = t.count('signingConfig signingConfigs.release')
+          t = t.replace('signingConfig signingConfigs.release', 'signingConfig signingConfigs.debug')
+          p.write_text(t)
+          print(f'replaced release->debug signing: {before} occurrence(s)')
           PY
 
       - name: Build release APK
         working-directory: apps/mobile/android
-        run: chmod +x gradlew && ./gradlew assembleRelease -x lint -x test --no-daemon
-
-      - name: Locate APK
-        id: apk
-        run: |
-          APK=$(find apps/mobile/android/app/build/outputs/apk -name "*.apk" | head -1)
-          echo "apk=$APK" >> "$GITHUB_OUTPUT"
-          ls -l "$APK"
+        run: chmod +x gradlew && ./gradlew assembleRelease -x lint -x test --no-daemon --stacktrace
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
