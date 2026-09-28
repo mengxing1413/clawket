@@ -34,7 +34,7 @@ jobs:
         working-directory: apps/mobile
         run: ./scripts/patch-android-native-deps.sh || true
 
-      - name: Build release APK (community: allow debug signing)
+      - name: Build release APK (community build allowed)
         working-directory: apps/mobile/android
         run: >
           chmod +x gradlew &&
