@@ -13,7 +13,7 @@ const marks = {
   youmind: require('../../../assets/brands/youmind.png'),
 } as const;
 
-type Platform = keyof typeof marks | 'local-model';
+type Platform = keyof typeof marks | 'local-model' | 'nanobot';
 export type PlatformKind = Platform;
 
 /**
@@ -60,6 +60,7 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
   pi: 50,
   youmind: 36,
   'local-model': 41,
+  nanobot: 41,
 };
 
 /**
@@ -148,8 +149,8 @@ export function PlatformDisc({ platform, size, glyph, ground = 'floating', artwo
 }) {
   const { theme: { colors } } = useAppTheme();
   let content: React.ReactNode;
-  if (platform === 'local-model') {
-    content = <LocalModelGlyph size={size * glyph} ink={artworkColors?.ink} />;
+  if (platform === 'local-model' || platform === 'nanobot') {
+    content = <NanobotGlyph size={size * glyph} ink={artworkColors?.ink} />;
   } else {
     const artwork = ARTWORK[platform];
     const box = artwork.tile
