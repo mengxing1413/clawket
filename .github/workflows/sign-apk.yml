@@ -1,0 +1,48 @@
+name: Sign Clawket APK (v1+v2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Source run id that produced clawket-community-apk'
+        required: true
+        default: '36404649540'
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download unsigned APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: clawket-community-apk
+          path: in
+          run-id: ${{ github.event.inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign APK (v1 + v2)
+        run: |
+          set -e
+          APK=$(find in -name "*.apk" | head -1)
+          echo "input: $APK"
+          BT=$(ls -d "${ANDROID_HOME}"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          keytool -genkeypair -v -keystore /tmp/ck.jks -alias clawket \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass clawket123 -keypass clawket123 \
+            -dname "CN=Clawket Community,OU=Dev,O=Clawket,L=NA,ST=NA,C=CN"
+          "$BT/zipalign" -f -p 4 "$APK" /tmp/aligned.apk
+          "$BT/apksigner" sign --ks /tmp/ck.jks --ks-key-alias clawket \
+            --ks-pass pass:clawket123 --key-pass pass:clawket123 \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            --out /tmp/Clawket-signed.apk /tmp/aligned.apk
+          "$BT/apksigner" verify --verbose /tmp/Clawket-signed.apk
+          ls -la /tmp/Clawket-signed.apk
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawket-signed-apk
+          path: /tmp/Clawket-signed.apk
+          if-no-files-found: error
