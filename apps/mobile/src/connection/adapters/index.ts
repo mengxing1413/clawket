@@ -55,6 +55,8 @@ export function createConnectionAdapter(
         isFreeSlot,
         onGreetingSent: options.onSpriteGreetingSent,
       });
+    case 'nanobot':
+      return new NanobotAdapter(record, { isFreeSlot });
     default:
       return assertNever(record.backendKind);
   }
