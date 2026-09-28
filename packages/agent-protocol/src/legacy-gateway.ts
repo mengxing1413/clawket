@@ -208,6 +208,7 @@ export function getGatewayThinkingLevels(
   return selectByBackend(input, {
     openclaw: [...OPENCLAW_THINKING_LEVELS],
     hermes: [...HERMES_THINKING_LEVELS],
+    nanobot: [],
   });
 }
 
@@ -283,5 +284,7 @@ function parseHost(url: string): string {
     return new URL(url).host;
   } catch {
     return '';
+  }
+}
   }
 }
