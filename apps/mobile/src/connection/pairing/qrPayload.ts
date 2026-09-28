@@ -217,7 +217,7 @@ export function parseQRPayload(raw: string): QRScanResult | null {
       const pairingPayload = readPairingPayload(obj);
       if (pairingPayload) return pairingPayload;
       const bootstrap = readBootstrap(obj.bootstrap);
-      if (obj.url && (obj.token || obj.password || bootstrap)) {
+      if (obj.url && (obj.token || obj.password || bootstrap || obj.backendKind === 'nanobot')) {
         const mode = normalizeMode(obj.mode);
         const relay = readRelay(obj.relay);
         const hermes = readHermes(obj.hermes);
