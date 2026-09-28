@@ -74,6 +74,7 @@ export type OnboardingScreenProps = Readonly<{
   onCopyAgentPrompt?: (prompt: string, backendKind: PairableBackendKind) => MaybePromise<void>;
   onPastePairingCode?: (backendKind: PairableBackendKind) => MaybePromise<string | null>;
   onSubmitPairing: (submission: PairingSubmission) => MaybePromise<void>;
+  onSubmitNanobot?: (input: { url: string }) => MaybePromise<void>;
   onScanQr: (expectedBackendKind: PairableBackendKind) => void;
   onImportQr?: (expectedBackendKind: PairableBackendKind) => void;
   onOpenYouMind: () => void;
@@ -135,6 +136,7 @@ export function OnboardingScreen({
   onCopyAgentPrompt,
   onPastePairingCode,
   onSubmitPairing,
+  onSubmitNanobot,
   onScanQr,
   onImportQr,
   onOpenYouMind,
@@ -154,6 +156,8 @@ export function OnboardingScreen({
   const [backendKind, setBackendKind] = useState<PairableBackendKind>(initialBackend ?? 'openclaw');
   const [pairingCode, setPairingCode] = useState('');
   const [choosing, setChoosing] = useState(!initialBackend);
+  const [nanobot, setNanobot] = useState(false);
+  const [nanobotUrl, setNanobotUrl] = useState('');
   const [copied, flashCopied] = useCopiedFlash();
   const [agentPromptCopied, flashAgentPromptCopied] = useCopiedFlash();
   const [pairingMethod, setPairingMethod] = useState<PairingMethod>('agent');
@@ -190,7 +194,7 @@ export function OnboardingScreen({
   ] as const, [t]);
   // Chooser order (owner decision 2026-09-26): OpenClaw, Hermes, Codex, Claude Code, Pi,
   // then the model server the user already runs (2026-09-19: installable products first).
-  const chooserRows = useMemo((): ReadonlyArray<{ kind: PairableBackendKind | 'youmind'; label: string }> => [
+  const chooserRows = useMemo((): ReadonlyArray<{ kind: PairableBackendKind | 'youmind' | 'nanobot'; label: string }> => [
     backendOptions[0],
     backendOptions[1],
     backendOptions[4],
@@ -198,10 +202,11 @@ export function OnboardingScreen({
     backendOptions[3],
     ...(YOUMIND_SPRITE_ENTRY_VISIBLE ? [{ kind: 'youmind' as const, label: t('YouMind Sprite') }] : []),
     backendOptions[2],
+    { kind: 'nanobot' as const, label: 'Nanobot' },
   ], [backendOptions, t]);
   // "No agent yet?" links follow the chooser order.
   const websiteOptions = useMemo((): ReadonlyArray<{ kind: OnboardingWebsiteBackendKind; label: string }> => [
-    ...chooserRows.flatMap((row) => row.kind === 'local-model' || row.kind === 'youmind' ? [] : [{ kind: row.kind, label: row.label }]),
+    ...chooserRows.flatMap((row) => row.kind === 'local-model' || row.kind === 'youmind' || row.kind === 'nanobot' ? [] : [{ kind: row.kind, label: row.label }]),
     ...(YOUMIND_SPRITE_ENTRY_VISIBLE ? [{ kind: 'youmind' as const, label: t('YouMind') }] : []),
   ], [chooserRows, t]);
   const styles = useMemo(
@@ -282,17 +287,29 @@ export function OnboardingScreen({
     setPairingCode(''); setLocalError(false); setAgentPromptSent(false); setAgentPromptExpanded(false);
   };
   const goBack = () => {
-    if (!choosing && !connecting) { setChoosing(true); resetPairingStep(); }
+    if (!choosing && !connecting) { setNanobot(false); setChoosing(true); resetPairingStep(); }
     else onClose?.();
   };
   const chooseBackend = (kind: PairableBackendKind) => {
-    setBackendKind(kind); setChoosing(false); resetPairingStep();
+    setBackendKind(kind); setNanobot(false); setChoosing(false); resetPairingStep();
+  };
+  const chooseNanobot = () => { setNanobot(true); setChoosing(false); setNanobotUrl(''); };
+  const submitNanobot = () => {
+    if (!onSubmitNanobot || connecting || submitInFlightRef.current) return;
+    const url = nanobotUrl.trim();
+    if (!url) return;
+    Keyboard.dismiss();
+    submitInFlightRef.current = true;
+    void Promise.resolve(onSubmitNanobot({ url })).then(
+      () => { submitInFlightRef.current = false; },
+      () => { submitInFlightRef.current = false; setLocalError(true); },
+    );
   };
   const copyAgentPrompt = () => {
     if (!onCopyAgentPrompt) return;
     void Promise.resolve(onCopyAgentPrompt(agentPrompt, backendKind)).then(() => { flashAgentPromptCopied(); setAgentPromptSent(true); }, () => setLocalError(true));
   };
-  const backendLabel = backendKind === 'local-model' ? t('Local model') : backendKind === 'openclaw' ? 'OpenClaw' : backendKind === 'claude-code' ? 'Claude Code' : backendKind === 'codex' ? 'Codex' : backendKind === 'pi' ? 'Pi' : 'Hermes';
+  const backendLabel = nanobot ? 'Nanobot' : backendKind === 'local-model' ? t('Local model') : backendKind === 'openclaw' ? 'OpenClaw' : backendKind === 'claude-code' ? 'Claude Code' : backendKind === 'codex' ? 'Codex' : backendKind === 'pi' ? 'Pi' : 'Hermes';
   const agentMethodAvailable = backendKind !== 'local-model' && Boolean(onCopyAgentPrompt);
   const agentMethod = agentMethodAvailable && pairingMethod === 'agent';
   return (
@@ -312,11 +329,24 @@ export function OnboardingScreen({
         {status.kind === 'offline' ? <Banner tone="neutral" icon={WifiOff} testID="onboarding-offline" message={t('Offline · reconnecting', { ns: 'common' })} actionLabel={onRetry ? t('Reconnect', { ns: 'common' }) : undefined} onAction={onRetry} /> : null}
         {status.kind === 'error' ? <ErrorBanner code={status.code} backendKind={backendKind} onAction={onErrorAction} /> : null}
         {localError ? <Banner tone="bad" message={t('Please try again later.', { ns: 'common' })} /> : null}
-        {choosing ? <>
+        {nanobot ? <>
+          <FormStep number="01" title={t('Paste your Nanobot connection URL')}>
+            <Text testID="onboarding-nanobot-hint" style={styles.subtitle}>{t('Open your Nanobot WebUI and copy its WebSocket URL, e.g. ws://host:8765/?token=...')}</Text>
+            <FormTextInput testID="onboarding-nanobot-url" accessibilityLabel={t('Nanobot URL')} surface="quiet"
+              autoCapitalize="none" autoCorrect={false} keyboardType="url" editable={!connecting}
+              onChangeText={setNanobotUrl} placeholder="ws://host:8765/?token=..." value={nanobotUrl}
+              minHeight={ControlSize.settingsRow} inputStyle={styles.codeInputText} />
+          </FormStep>
+          <FormStep number="02" style={styles.secondStep} title={t('Connect')}>
+            <Button testID="onboarding-nanobot-connect" label={t('Connect')} variant="neutral" size="lg" loading={connecting}
+              disabled={nanobotUrl.trim().length === 0 || connecting} onPress={submitNanobot} />
+          </FormStep>
+        </> : choosing ? <>
           <View testID="onboarding-chooser" style={styles.chooser}>
             <View testID="onboarding-backends">
               {chooserRows.map((row) => {
                 if (row.kind === 'youmind') return <ChoiceRow key={row.kind} testID="onboarding-youmind" leading={<PlatformMark platform="youmind" balanced />} title={row.label} onPress={onOpenYouMind} />;
+                if (row.kind === 'nanobot') return <ChoiceRow key="nanobot" testID="onboarding-backend-nanobot" leading={<PlatformMark platform="nanobot" balanced />} title={row.label} onPress={chooseNanobot} />;
                 const kind = row.kind;
                 return <ChoiceRow key={kind} testID={`onboarding-backend-${kind}`} leading={<PlatformMark platform={kind} balanced />} title={row.label} onPress={() => chooseBackend(kind)} />;
               })}
