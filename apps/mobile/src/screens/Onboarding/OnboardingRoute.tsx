@@ -23,6 +23,7 @@ import {
 } from '../../connection';
 import { useAppContext } from '../../contexts/AppContext';
 import { useGatewayScanner } from '../../contexts/GatewayScannerContext';
+import { savePairedConnection } from '../../connection/pairing/save-paired-connection';
 import { useProPaywall } from '../../contexts/ProPaywallContext';
 import type { RootStackParamList } from '../../navigation/root-stack';
 import type { RelayServiceEnvironment } from '../../types';
@@ -350,6 +351,23 @@ export function OnboardingRoute({
     runtime.activeState,
   ]);
 
+  const submitNanobot = useCallback(async (input: { url: string }): Promise<void> => {
+    const url = input.url.trim();
+    if (!url) return;
+    if (!acquirePairingRequest()) return;
+    try {
+      const saved = await savePairedConnection({
+        runtime: getConnectionRuntime(),
+        payload: { url, backendKind: 'nanobot', transportKind: 'custom' },
+        debugMode,
+        source: 'gateway_scanner',
+      });
+      onConnected?.({ connectionId: saved.connection.id, backendKind: 'nanobot' });
+    } finally {
+      releasePairingRequest();
+    }
+  }, [acquirePairingRequest, debugMode, onConnected, releasePairingRequest]);
+
   const status = useMemo(() => resolveOnboardingRouteStatus({
     initialized: runtime.initialized,
     activeConnectionId: runtime.activeConnectionId,
@@ -463,6 +481,7 @@ export function OnboardingRoute({
         return pasted;
       }}
       onSubmitPairing={submitPairing}
+      onSubmitNanobot={submitNanobot}
       onScanQr={scanQr}
       onImportQr={(backend) => scanQr(backend, true)}
       onOpenYouMind={openYouMind}
