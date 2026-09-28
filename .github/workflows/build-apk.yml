@@ -30,6 +30,17 @@ jobs:
         working-directory: apps/mobile
         run: npx expo prebuild --platform android --no-install
 
+      - name: Allow cleartext WebSocket (Tailscale / LAN agents)
+        working-directory: apps/mobile/android
+        run: |
+          MF=app/src/main/AndroidManifest.xml
+          echo "before:"; grep -o '<application[^>]*' "$MF" | head -1
+          if ! grep -q 'usesCleartextTraffic' "$MF"; then
+            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MF"
+          fi
+          grep -q 'usesCleartextTraffic="true"' "$MF" || { echo "CLEARTEXT PATCH FAILED"; exit 1; }
+          echo "after:"; grep -o '<application[^>]*' "$MF" | head -1
+
       - name: Patch native deps (best effort)
         working-directory: apps/mobile
         run: ./scripts/patch-android-native-deps.sh || true
