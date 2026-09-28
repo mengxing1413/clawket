@@ -34,11 +34,19 @@ jobs:
         working-directory: apps/mobile
         run: ./scripts/patch-android-native-deps.sh || true
 
-      - name: Build release APK (community build allowed)
+      - name: Raise Gradle heap
+        working-directory: apps/mobile/android
+        run: |
+          printf '\norg.gradle.jvmargs=-Xmx6144m -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8\n' >> gradle.properties
+          echo 'reactNativeArchitectures=arm64-v8a' >> gradle.properties
+          tail -5 gradle.properties
+
+      - name: Build release APK arm64
         working-directory: apps/mobile/android
         run: >
           chmod +x gradlew &&
           ./gradlew assembleRelease -x lint -x test --no-daemon --stacktrace
+          -PreactNativeArchitectures=arm64-v8a
           -Pclawket.allowDebugReleaseSigning=true
 
       - name: Upload APK artifact
