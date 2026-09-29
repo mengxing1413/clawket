@@ -21,7 +21,7 @@ export type PlatformKind = Platform;
  * so the official mark is that Agent's face wherever it appears (owner decision 2026-09-27). OpenClaw
  * Agents and YouMind Sprites keep their own avatars and carry the mark as a corner badge instead.
  */
-const PRODUCT_FACE_PLATFORMS: ReadonlySet<Platform> = new Set(['hermes', 'codex', 'claude-code', 'pi', 'local-model']);
+const PRODUCT_FACE_PLATFORMS: ReadonlySet<Platform> = new Set(['hermes', 'codex', 'claude-code', 'pi', 'local-model', 'nanobot']);
 
 export function isProductFacePlatform(platform: Platform | null | undefined): platform is Platform {
   return platform != null && PRODUCT_FACE_PLATFORMS.has(platform);
@@ -69,7 +69,8 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
  */
 export function PlatformMark({ platform, size, balanced = false }: { platform: Platform; size?: number; balanced?: boolean }) {
   const drawn = balanced ? BALANCED_SIZE[platform] : size;
-  if (platform === 'local-model' || platform === 'nanobot') return <NanobotMark size={drawn ?? ControlSize.settingsRow} />;
+  if (platform === 'local-model') return <LocalModelMark size={drawn ?? ControlSize.settingsRow} />;
+  if (platform === 'nanobot') return <NanobotMark size={drawn ?? ControlSize.settingsRow} />;
   return <Image accessible={false} source={marks[platform]} resizeMode="contain" style={[platform === 'hermes' || platform === 'codex' ? styles.appIcon : styles.mark, drawn ? { width: drawn, height: drawn } : null]} />;
 }
 
@@ -105,14 +106,15 @@ function LocalModelGlyph({ size, ink }: { size: number; ink?: string }) {
   </Svg>;
 }
 
-/** Clawket-drawn mark for the Nanobot backend; theme ink on a quiet tile, no asset needed. */
-const NANOBOT_GLYPH_VIEWBOX = '13 13 26 26';
-const NANOBOT_GLYPH_EXTENT = 26;
-const NANOBOT_GLYPH = 'M17 18h18a4 4 0 0 1 4 4v7a4 4 0 0 1-4 4H17a4 4 0 0 1-4-4v-7a4 4 0 0 1 4-4Z'
-  + 'M26 18v-4'
-  + 'M20.4 26a1.6 1.6 0 1 0 3.2 0a1.6 1.6 0 1 0 -3.2 0Z'
-  + 'M28.4 26a1.6 1.6 0 1 0 3.2 0a1.6 1.6 0 1 0 -3.2 0Z'
-  + 'M21 33h10';
+/** Clawket-drawn mark for the Nanobot backend: a single-visor bot with side ears, theme ink on a quiet tile. */
+const NANOBOT_GLYPH_VIEWBOX = '8 9 36 32';
+const NANOBOT_GLYPH_EXTENT = 32;
+const NANOBOT_GLYPH = 'M26 18.3v-3.4'
+  + 'M24.4 13.1a1.6 1.6 0 1 0 3.2 0a1.6 1.6 0 1 0 -3.2 0Z'
+  + 'M18 18.3h16a4.2 4.2 0 0 1 4.2 4.2v10a4.2 4.2 0 0 1 -4.2 4.2H18a4.2 4.2 0 0 1 -4.2 -4.2v-10a4.2 4.2 0 0 1 4.2 -4.2Z'
+  + 'M11.4 25.1v5.6'
+  + 'M40.6 25.1v5.6'
+  + 'M21.5 27.9h9a2.4 2.4 0 0 1 0 4.8h-9a2.4 2.4 0 0 1 0 -4.8Z';
 
 function NanobotMark({ size = ControlSize.settingsRow }: { size?: number }) {
   const { theme: { colors } } = useAppTheme();
@@ -150,7 +152,9 @@ export function PlatformDisc({ platform, size, glyph, ground = 'floating', artwo
   const { theme: { colors } } = useAppTheme();
   let content: React.ReactNode;
   if (platform === 'local-model' || platform === 'nanobot') {
-    content = <NanobotGlyph size={size * glyph} ink={artworkColors?.ink} />;
+    content = platform === 'local-model'
+      ? <LocalModelGlyph size={size * glyph} ink={artworkColors?.ink} />
+      : <NanobotGlyph size={size * glyph} ink={artworkColors?.ink} />;
   } else {
     const artwork = ARTWORK[platform];
     const box = artwork.tile
