@@ -11,9 +11,10 @@ const marks = {
   openclaw: require('../../../assets/brands/openclaw.png'),
   hermes: require('../../../assets/brands/hermes.png'),
   youmind: require('../../../assets/brands/youmind.png'),
+  nanobot: require('../../../assets/brands/nanobot.png'),
 } as const;
 
-type Platform = keyof typeof marks | 'local-model' | 'nanobot';
+type Platform = keyof typeof marks | 'local-model';
 export type PlatformKind = Platform;
 
 /**
@@ -38,6 +39,7 @@ const ARTWORK: Readonly<Record<keyof typeof marks, Readonly<{ fill: number; tile
   codex: { fill: 0.81, tile: true },
   hermes: { fill: 0.79, tile: true },
   youmind: { fill: 1, tile: true },
+  nanobot: { fill: 0.98, tile: true },
 };
 
 /** A dense mark reads larger than a sparse one of the same width; tuned by eye on the device roster. */
@@ -60,7 +62,7 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
   pi: 50,
   youmind: 36,
   'local-model': 41,
-  nanobot: 41,
+  nanobot: 45,
 };
 
 /**
@@ -70,8 +72,7 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
 export function PlatformMark({ platform, size, balanced = false }: { platform: Platform; size?: number; balanced?: boolean }) {
   const drawn = balanced ? BALANCED_SIZE[platform] : size;
   if (platform === 'local-model') return <LocalModelMark size={drawn ?? ControlSize.settingsRow} />;
-  if (platform === 'nanobot') return <NanobotMark size={drawn ?? ControlSize.settingsRow} />;
-  return <Image accessible={false} source={marks[platform]} resizeMode="contain" style={[platform === 'hermes' || platform === 'codex' ? styles.appIcon : styles.mark, drawn ? { width: drawn, height: drawn } : null]} />;
+  return <Image accessible={false} source={marks[platform]} resizeMode="contain" style={[platform === 'hermes' || platform === 'codex' || platform === 'nanobot' ? styles.appIcon : styles.mark, drawn ? { width: drawn, height: drawn } : null]} />;
 }
 
 /** Processor outline in the 52-point frame, sized to sit inside the 42-point tile like the app-icon artwork. */
@@ -106,33 +107,6 @@ function LocalModelGlyph({ size, ink }: { size: number; ink?: string }) {
   </Svg>;
 }
 
-/** Clawket-drawn mark for the Nanobot backend: a single-visor bot with side ears, theme ink on a quiet tile. */
-const NANOBOT_GLYPH_VIEWBOX = '8 9 36 32';
-const NANOBOT_GLYPH_EXTENT = 32;
-const NANOBOT_GLYPH = 'M26 18.3v-3.4'
-  + 'M24.4 13.1a1.6 1.6 0 1 0 3.2 0a1.6 1.6 0 1 0 -3.2 0Z'
-  + 'M18 18.3h16a4.2 4.2 0 0 1 4.2 4.2v10a4.2 4.2 0 0 1 -4.2 4.2H18a4.2 4.2 0 0 1 -4.2 -4.2v-10a4.2 4.2 0 0 1 4.2 -4.2Z'
-  + 'M11.4 25.1v5.6'
-  + 'M40.6 25.1v5.6'
-  + 'M21.5 27.9h9a2.4 2.4 0 0 1 0 4.8h-9a2.4 2.4 0 0 1 0 -4.8Z';
-
-function NanobotMark({ size = ControlSize.settingsRow }: { size?: number }) {
-  const { theme: { colors } } = useAppTheme();
-  const strokeWidth = Math.max(1.9, (1.2 * ControlSize.settingsRow) / size);
-  return <Svg testID="platform-mark-nanobot" accessible={false} width={size} height={size} viewBox="0 0 52 52">
-    <Rect x={5} y={5} width={42} height={42} rx={10.5} fill={colors.surface} />
-    <Path d={NANOBOT_GLYPH} fill="none" stroke={colors.ink} strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" />
-  </Svg>;
-}
-
-function NanobotGlyph({ size, ink }: { size: number; ink?: string }) {
-  const { theme: { colors } } = useAppTheme();
-  return <Svg testID="platform-disc-nanobot-glyph" accessible={false} width={size} height={size} viewBox={NANOBOT_GLYPH_VIEWBOX}>
-    <Path d={NANOBOT_GLYPH} fill="none" stroke={ink ?? colors.ink} strokeWidth={(DISC_OUTLINE_WIDTH * NANOBOT_GLYPH_EXTENT) / size}
-      strokeLinecap="round" strokeLinejoin="round" />
-  </Svg>;
-}
-
 /**
  * The official mark fitted to a circle of `size` points: app artwork fills the circle edge to edge (its
  * tile is the ground) and a bare mark spans `glyph` of the diameter on the `ground` surface. Used as a
@@ -151,10 +125,8 @@ export function PlatformDisc({ platform, size, glyph, ground = 'floating', artwo
 }) {
   const { theme: { colors } } = useAppTheme();
   let content: React.ReactNode;
-  if (platform === 'local-model' || platform === 'nanobot') {
-    content = platform === 'local-model'
-      ? <LocalModelGlyph size={size * glyph} ink={artworkColors?.ink} />
-      : <NanobotGlyph size={size * glyph} ink={artworkColors?.ink} />;
+  if (platform === 'local-model') {
+    content = <LocalModelGlyph size={size * glyph} ink={artworkColors?.ink} />;
   } else {
     const artwork = ARTWORK[platform];
     const box = artwork.tile
