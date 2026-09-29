@@ -2,7 +2,9 @@ import {
   AdapterError, resolveCapabilities,
   type AgentAdapter, type AgentDescriptor, type ConnectionDescriptor, type ConnectionRecord,
   type ConnectionState, type SessionDescriptor, type SessionHistory, type SessionUpdate,
-  type PromptInput, type ChatMessage,
+  type PromptInput, type ChatMessage, type ManagementOperations,
+  type ModelInfo, type ModelSelectionState, type SkillStatusEntry, type SkillStatusReport,
+  type CronJob, type CronListResult, type CronSchedule, type CostSummary,
 } from '@clawket/agent-protocol';
 import { generateId } from '../../services/gateway-auth';
 import { DirectWsTransport } from '../transports/direct-ws';
@@ -24,16 +26,35 @@ interface NanobotInbound {
   detail?: string;
 }
 
+interface ServerSession {
+  key?: string;
+  title?: string | null;
+  preview?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+interface ServerThreadMessage {
+  id?: string;
+  role?: string;
+  content?: string;
+  createdAt?: number;
+}
+
 const NO_SESSION_ACTIONS = { rename: false, reset: false, delete: false, pin: false };
+const SESSION_CHANNEL_PREFIX = 'websocket:';
 
 /**
- * Direct-WebSocket adapter for the Nanobot gateway (ws://host:port/?token=...).
- * Maps Nanobot's event protocol (ready/attached/delta/stream_end/message) onto the
- * AgentAdapter surface; transcripts are buffered locally (Nanobot exposes no history API).
+ * Nanobot adapter. Chat streams over the native gateway WebSocket
+ * (ws://host:port/?token=...) while sessions, history and management data are
+ * read from Nanobot's built-in WebUI HTTP API on the same host:port
+ * (bootstrap -> api_token -> /api/*). Keeping history server-side is what makes
+ * conversations survive reconnects and app restarts.
  */
 export class NanobotAdapter implements AgentAdapter {
   readonly connection: ConnectionDescriptor;
   readonly capabilities = resolveCapabilities('nanobot', {});
+  readonly management: ManagementOperations;
 
   private transport: DirectWsTransport;
   private currentState: ConnectionState = 'idle';
@@ -45,6 +66,10 @@ export class NanobotAdapter implements AgentAdapter {
   private epoch = 0;
   private connectPromise: Promise<void> | null = null;
   private cancelConnect: (() => void) | null = null;
+  private readonly httpBase: string;
+  private readonly secret: string | null;
+  private apiToken: string | null = null;
+  private apiTokenExpiresAt = 0;
   private readonly listeners: { [K in keyof Listeners]: Set<Listeners[K]> } = { update: new Set(), state: new Set(), sessions: new Set() };
 
   constructor(private readonly record: ConnectionRecord, options: { isFreeSlot?: boolean; webSocketFactory?: WebSocketFactory } = {}) {
@@ -55,7 +80,9 @@ export class NanobotAdapter implements AgentAdapter {
       isFreeSlot: options.isFreeSlot ?? false,
     };
     const url = new URL(record.url);
-    if (record.auth?.token && !url.searchParams.has('token')) url.searchParams.set('token', record.auth.token);
+    this.secret = record.auth?.token ?? url.searchParams.get('token') ?? null;
+    this.httpBase = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`;
+    if (this.secret && !url.searchParams.has('token')) url.searchParams.set('token', this.secret);
     url.searchParams.set('client_id', `clawket-${generateId().slice(0, 8)}`);
     this.transport = new DirectWsTransport({ url: url.toString(), webSocketFactory: options.webSocketFactory, autoReadyOnFirstFrame: false });
     this.transport.onOpen(() => { /* Nanobot sends `ready` right away; no client handshake */ });
@@ -64,6 +91,23 @@ export class NanobotAdapter implements AgentAdapter {
       if (change.state !== 'ready') this.setState(change.state === 'closed' ? 'offline' : change.state);
     });
     this.transport.onClose(() => { this.epoch++; this.pendingNewChat = null; });
+
+    this.management = {
+      models: {
+        list: () => this.listModels(),
+        getSelection: () => this.getModelSelection(),
+        listThinkingLevels: () => [],
+      },
+      skills: {
+        status: () => this.listSkills(),
+      },
+      cron: {
+        list: () => this.listCron(),
+      },
+      usage: {
+        cost: params => this.costSummary(params),
+      },
+    };
   }
 
   get state(): ConnectionState { return this.currentState; }
@@ -128,16 +172,48 @@ export class NanobotAdapter implements AgentAdapter {
   }
 
   async listSessions(_agentId?: string): Promise<SessionDescriptor[]> {
-    const sessions: SessionDescriptor[] = [];
-    if (this.defaultChatId) sessions.push(this.describeSession(this.defaultChatId, 'Nanobot'));
+    const out: SessionDescriptor[] = [];
+    const seen = new Set<string>();
+    try {
+      const data = await this.api<{ sessions?: ServerSession[] }>('/api/sessions');
+      for (const session of data.sessions ?? []) {
+        const key = this.toChatId(session.key);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(this.describeSession(
+          key,
+          (session.title && session.title.trim()) || (session.preview && session.preview.trim()) || `Chat ${key.slice(0, 6)}`,
+          Date.parse(session.updated_at ?? '') || Date.now(),
+        ));
+      }
+    } catch { /* fall back to locally-known chats below */ }
     for (const key of this.transcripts.keys()) {
-      if (key !== this.defaultChatId) sessions.push(this.describeSession(key, `Chat ${key.slice(0, 6)}`));
+      if (seen.has(key) || key === this.defaultChatId) continue;
+      seen.add(key);
+      out.push(this.describeSession(key, `Chat ${key.slice(0, 6)}`, Date.now()));
     }
-    return sessions;
+    if (this.defaultChatId && !seen.has(this.defaultChatId)) {
+      out.unshift(this.describeSession(this.defaultChatId, 'Nanobot', Date.now()));
+    }
+    return out;
   }
 
   async loadSession(key: string, _options?: { limit?: number; cursor?: string }): Promise<SessionHistory> {
-    return { key, messages: this.transcripts.get(key) ?? [], hasActiveRun: this.activeRunByChat.has(key) };
+    try {
+      const data = await this.api<{ messages?: ServerThreadMessage[] }>(`/api/sessions/${encodeURIComponent(this.toServerKey(key))}/webui-thread`);
+      const messages: ChatMessage[] = (data.messages ?? [])
+        .filter(message => message.role === 'user' || message.role === 'assistant')
+        .map(message => ({
+          id: message.id ?? generateId(),
+          role: message.role as ChatMessage['role'],
+          text: message.content ?? '',
+          timestampMs: message.createdAt,
+        }));
+      this.transcripts.set(key, messages);
+      return { key, messages, hasActiveRun: this.activeRunByChat.has(key) };
+    } catch {
+      return { key, messages: this.transcripts.get(key) ?? [], hasActiveRun: this.activeRunByChat.has(key) };
+    }
   }
 
   async prompt(key: string, input: PromptInput): Promise<{ runId: string }> {
@@ -166,7 +242,7 @@ export class NanobotAdapter implements AgentAdapter {
 
   async createSession(_agentId: string, options?: { title?: string }): Promise<SessionDescriptor> {
     const chatId = await this.requestNewChat();
-    return this.describeSession(chatId, options?.title ?? `Chat ${chatId.slice(0, 6)}`);
+    return this.describeSession(chatId, options?.title ?? `Chat ${chatId.slice(0, 6)}`, Date.now());
   }
 
   async patchSession(_key: string, _patch: { title?: string }): Promise<void> {
@@ -180,6 +256,169 @@ export class NanobotAdapter implements AgentAdapter {
     this.listeners[event].add(listener);
     return () => { this.listeners[event].delete(listener); };
   }
+
+  // ---------------------------------------------------------------- HTTP API
+
+  private async ensureApiToken(): Promise<string> {
+    if (this.apiToken && Date.now() < this.apiTokenExpiresAt - 30_000) return this.apiToken;
+    if (!this.secret) throw new AdapterError('server', 'Nanobot token missing');
+    const response = await fetch(`${this.httpBase}/webui/bootstrap`, { headers: { Authorization: `Bearer ${this.secret}` } });
+    if (!response.ok) throw new AdapterError('server', `Nanobot bootstrap failed (${response.status})`);
+    const data = await response.json() as { api_token?: string; expires_in?: number };
+    if (!data.api_token) throw new AdapterError('server', 'Nanobot did not return an API token');
+    this.apiToken = data.api_token;
+    this.apiTokenExpiresAt = Date.now() + (data.expires_in ?? 300) * 1000;
+    return this.apiToken;
+  }
+
+  private async api<T>(path: string): Promise<T> {
+    let token = await this.ensureApiToken();
+    let response = await fetch(`${this.httpBase}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (response.status === 401) {
+      this.apiToken = null;
+      token = await this.ensureApiToken();
+      response = await fetch(`${this.httpBase}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+    }
+    if (!response.ok) throw new AdapterError('server', `Nanobot API ${path} failed (${response.status})`);
+    return await response.json() as T;
+  }
+
+  private toChatId(key: string | undefined | null): string | null {
+    if (!key) return null;
+    return key.startsWith(SESSION_CHANNEL_PREFIX) ? key.slice(SESSION_CHANNEL_PREFIX.length) : key;
+  }
+
+  private toServerKey(chatId: string): string {
+    return chatId.startsWith(SESSION_CHANNEL_PREFIX) ? chatId : `${SESSION_CHANNEL_PREFIX}${chatId}`;
+  }
+
+  private async listModels(): Promise<ModelInfo[]> {
+    const settings = await this.api<{ agent?: { provider?: string }; providers?: Array<{ name?: string; configured?: boolean }> }>('/api/settings');
+    const providers = (settings.providers ?? [])
+      .filter(provider => provider.configured && typeof provider.name === 'string')
+      .map(provider => provider.name as string);
+    const fallbackProvider = settings.agent?.provider;
+    if (!providers.length && fallbackProvider) providers.push(fallbackProvider);
+    const models: ModelInfo[] = [];
+    const seen = new Set<string>();
+    for (const provider of providers) {
+      try {
+        const data = await this.api<{ models?: Array<{ id?: string; label?: string | null }> }>(`/api/settings/provider-models?provider=${encodeURIComponent(provider)}`);
+        for (const model of data.models ?? []) {
+          if (!model.id || seen.has(model.id)) continue;
+          seen.add(model.id);
+          models.push({ id: model.id, name: model.label || model.id, provider });
+        }
+      } catch { /* a provider without a usable catalog is skipped */ }
+    }
+    return models;
+  }
+
+  private async getModelSelection(): Promise<ModelSelectionState> {
+    const settings = await this.api<{ agent?: { model?: string; provider?: string; resolved_provider?: string; model_preset?: string | null } }>('/api/settings');
+    const models = await this.listModels().catch(() => [] as ModelInfo[]);
+    return {
+      currentModel: settings.agent?.model ?? '',
+      currentProvider: settings.agent?.provider ?? '',
+      currentBaseUrl: this.httpBase,
+      models,
+    };
+  }
+
+  private async listSkills(): Promise<SkillStatusReport> {
+    const data = await this.api<{ skills?: Array<{ name?: string; description?: string; source?: string; enabled?: boolean; available?: boolean; unavailable_reason?: string }> }>('/api/webui/skills');
+    const skills: SkillStatusEntry[] = (data.skills ?? []).map(skill => ({
+      name: skill.name ?? '',
+      description: skill.description ?? '',
+      source: skill.source ?? 'workspace',
+      bundled: false,
+      filePath: '',
+      baseDir: '',
+      skillKey: skill.name ?? '',
+      always: false,
+      disabled: skill.enabled === false,
+      blockedByAllowlist: false,
+    }));
+    return { workspaceDir: '', managedSkillsDir: '', skills };
+  }
+
+  private async listCron(): Promise<CronListResult> {
+    const data = await this.api<{ jobs?: Array<Record<string, unknown>> }>('/api/webui/automations');
+    const jobs: CronJob[] = (data.jobs ?? []).map(job => this.toCronJob(job));
+    return { jobs, total: jobs.length, offset: 0, limit: jobs.length, hasMore: false, nextOffset: null };
+  }
+
+  private toCronJob(raw: Record<string, unknown>): CronJob {
+    const scheduleRaw = (raw.schedule ?? {}) as Record<string, unknown>;
+    let schedule: CronSchedule;
+    if (typeof scheduleRaw.expr === 'string' && scheduleRaw.expr) {
+      schedule = { kind: 'cron', expr: scheduleRaw.expr, tz: typeof scheduleRaw.tz === 'string' ? scheduleRaw.tz : undefined };
+    } else if (typeof scheduleRaw.at_ms === 'number') {
+      schedule = { kind: 'at', at: new Date(scheduleRaw.at_ms).toISOString() };
+    } else {
+      schedule = { kind: 'every', everyMs: typeof scheduleRaw.every_ms === 'number' ? scheduleRaw.every_ms : 0 };
+    }
+    const payloadRaw = (raw.payload ?? {}) as Record<string, unknown>;
+    const message = typeof payloadRaw.message === 'string' ? payloadRaw.message : '';
+    const payload = payloadRaw.kind === 'system_event'
+      ? { kind: 'systemEvent' as const, text: message }
+      : { kind: 'agentTurn' as const, message };
+    const stateRaw = (raw.state ?? {}) as Record<string, unknown>;
+    const lastStatus = stateRaw.last_status;
+    return {
+      id: typeof raw.id === 'string' ? raw.id : generateId(),
+      name: typeof raw.name === 'string' ? raw.name : 'job',
+      enabled: raw.enabled !== false,
+      createdAtMs: 0,
+      updatedAtMs: 0,
+      schedule,
+      sessionTarget: 'main',
+      wakeMode: 'next-heartbeat',
+      payload,
+      state: {
+        nextRunAtMs: typeof stateRaw.next_run_at_ms === 'number' ? stateRaw.next_run_at_ms : undefined,
+        lastRunAtMs: typeof stateRaw.last_run_at_ms === 'number' ? stateRaw.last_run_at_ms : undefined,
+        lastStatus: lastStatus === 'ok' || lastStatus === 'error' || lastStatus === 'skipped' ? lastStatus : undefined,
+      },
+    };
+  }
+
+  private async costSummary(params: { startDate?: string; endDate?: string }): Promise<CostSummary> {
+    const data = await this.api<{ days?: Array<Record<string, unknown>> }>('/api/settings/usage');
+    const start = params?.startDate ?? '';
+    const end = params?.endDate ?? start;
+    const inRange = (data.days ?? []).filter(day => {
+      const date = typeof day.date === 'string' ? day.date : '';
+      if (!date) return false;
+      if (start && date < start) return false;
+      if (end && date > end) return false;
+      return true;
+    });
+    const sum = (key: string) => inRange.reduce((total, day) => total + (typeof day[key] === 'number' ? day[key] as number : 0), 0);
+    const totals = {
+      input: sum('input_tokens'), output: sum('output_tokens'),
+      cacheRead: sum('cache_read_tokens'), cacheWrite: sum('cache_write_tokens'),
+      totalTokens: sum('total_tokens'),
+      totalCost: 0, inputCost: 0, outputCost: 0, cacheReadCost: 0, cacheWriteCost: 0, missingCostEntries: 0,
+    };
+    return {
+      updatedAt: Date.now(),
+      days: inRange.length,
+      daily: inRange.map(day => ({
+        date: typeof day.date === 'string' ? day.date : '',
+        input: typeof day.input_tokens === 'number' ? day.input_tokens : 0,
+        output: typeof day.output_tokens === 'number' ? day.output_tokens : 0,
+        cacheRead: typeof day.cache_read_tokens === 'number' ? day.cache_read_tokens : 0,
+        cacheWrite: typeof day.cache_write_tokens === 'number' ? day.cache_write_tokens : 0,
+        totalTokens: typeof day.total_tokens === 'number' ? day.total_tokens : 0,
+        totalCost: 0, inputCost: 0, outputCost: 0, cacheReadCost: 0, cacheWriteCost: 0, missingCostEntries: 0,
+      })),
+      totals,
+      costPresentation: { mode: 'unknown' },
+    };
+  }
+
+  // ---------------------------------------------------------------- Streaming
 
   private requestNewChat(): Promise<string> {
     if (this.pendingNewChat) return Promise.reject(new AdapterError('unsupported', 'A session is already being created'));
@@ -200,14 +439,14 @@ export class NanobotAdapter implements AgentAdapter {
     });
   }
 
-  private describeSession(key: string, title: string): SessionDescriptor {
+  private describeSession(key: string, title: string, updatedAt: number): SessionDescriptor {
     return {
       connectionId: this.record.id,
       agentId: this.record.id,
       key,
       kind: 'direct',
       title,
-      updatedAt: Date.now(),
+      updatedAt,
       hasActiveRun: this.activeRunByChat.has(key),
       allowedActions: { ...NO_SESSION_ACTIONS },
     };
@@ -227,6 +466,7 @@ export class NanobotAdapter implements AgentAdapter {
         this.transport.markReady();
         this.setState('ready');
         this.announceSessions();
+        void this.adoptLatestServerSession();
         break;
       }
       case 'attached': {
@@ -273,6 +513,25 @@ export class NanobotAdapter implements AgentAdapter {
       }
       default: break;
     }
+  }
+
+  /** Point the "main" session at the most recent server-side session so a reconnect resumes it. */
+  private async adoptLatestServerSession(): Promise<void> {
+    try {
+      const data = await this.api<{ sessions?: ServerSession[] }>('/api/sessions');
+      let best: { chatId: string; updatedAt: number } | null = null;
+      for (const session of data.sessions ?? []) {
+        const chatId = this.toChatId(session.key);
+        if (!chatId) continue;
+        const updatedAt = Date.parse(session.updated_at ?? '') || 0;
+        if (!best || updatedAt > best.updatedAt) best = { chatId, updatedAt };
+      }
+      if (best) {
+        this.defaultChatId = best.chatId;
+        if (!this.transcripts.has(best.chatId)) this.transcripts.set(best.chatId, []);
+        this.announceSessions();
+      }
+    } catch { /* keep the server-assigned default chat */ }
   }
 
   private ensureRun(key: string): string {
