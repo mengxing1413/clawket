@@ -219,13 +219,13 @@ export function parseQRPayload(raw: string): QRScanResult | null {
       const pairingPayload = readPairingPayload(obj);
       if (pairingPayload) return pairingPayload;
       const bootstrap = readBootstrap(obj.bootstrap);
-      if (obj.url && (obj.token || obj.password || bootstrap)) {
+      if (obj.url && (obj.token || obj.password || bootstrap || obj.backendKind === 'nanobot')) {
         const mode = normalizeMode(obj.mode);
         const relay = readRelay(obj.relay);
         const hermes = readHermes(obj.hermes);
         return {
           url: String(obj.url),
-          ...(['pi', 'codex', 'claude-code'].includes(obj.backendKind) ? { backendKind: obj.backendKind as 'pi' | 'codex' | 'claude-code' } : {}),
+          ...(['pi', 'codex', 'claude-code', 'nanobot'].includes(obj.backendKind) ? { backendKind: obj.backendKind as 'pi' | 'codex' | 'claude-code' | 'nanobot' } : {}),
           ...(hermes ? { backendKind: 'hermes' as const } : {}),
           ...(mode && mode !== 'hermes' ? { transportKind: mode } : {}),
           ...(mode === 'local' && !hermes && ['codex', 'claude-code'].includes(obj.backendKind)

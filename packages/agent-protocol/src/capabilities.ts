@@ -285,6 +285,20 @@ const MINIMAL_CHAT_CAPABILITIES: Capabilities = {
   pairRequests: false,
 };
 
+const NANOBOT_CAPABILITIES: Capabilities = {
+  ...MINIMAL_CHAT_CAPABILITIES,
+  abort: false,
+  sessions: true,
+  sessionCreate: true,
+  agents: true,
+  models: true,
+  skills: true,
+  cron: true,
+  usage: true,
+  cost: true,
+  files: true,
+};
+
 export const CAPABILITY_MATRIX: Record<BackendKind, Capabilities> = {
   'claude-code': { ...MINIMAL_CHAT_CAPABILITIES, promptStatus: true, steer: false, sessionBranch: true, projects: true, chat: true, abort: true, history: true, attachments: true,
     sessions: true, sessionCreate: true, sessionRename: true, sessionReset: true, sessionDelete: true,
@@ -297,6 +311,7 @@ export const CAPABILITY_MATRIX: Record<BackendKind, Capabilities> = {
     models: true, modelPerSession: true, thinkingLevels: true, skills: true, agentQuestions: true, sessionBranch: true },
   openclaw: OPENCLAW_CAPABILITIES,
   hermes: HERMES_CAPABILITIES,
+  nanobot: NANOBOT_CAPABILITIES,
   'local-model': {
     ...MINIMAL_CHAT_CAPABILITIES,
     chat: true, abort: true, history: true, attachments: true,

@@ -10,6 +10,7 @@ const marks = {
   pi: require('../../../assets/brands/pi.png'),
   openclaw: require('../../../assets/brands/openclaw.png'),
   hermes: require('../../../assets/brands/hermes.png'),
+  nanobot: require('../../../assets/brands/nanobot.png'),
 } as const;
 
 type Platform = keyof typeof marks | 'local-model';
@@ -20,7 +21,7 @@ export type PlatformKind = Platform;
  * so the official mark is that Agent's face wherever it appears (owner decision 2026-09-27). OpenClaw
  * Agents keep their own avatars and carry the mark as a corner badge instead.
  */
-const PRODUCT_FACE_PLATFORMS: ReadonlySet<Platform> = new Set(['hermes', 'codex', 'claude-code', 'pi', 'local-model']);
+const PRODUCT_FACE_PLATFORMS: ReadonlySet<Platform> = new Set(['hermes', 'codex', 'claude-code', 'pi', 'local-model', 'nanobot']);
 
 export function isProductFacePlatform(platform: Platform | null | undefined): platform is Platform {
   return platform != null && PRODUCT_FACE_PLATFORMS.has(platform);
@@ -36,6 +37,7 @@ const ARTWORK: Readonly<Record<keyof typeof marks, Readonly<{ fill: number; tile
   pi: { fill: 0.59, tile: false },
   codex: { fill: 0.81, tile: true },
   hermes: { fill: 0.79, tile: true },
+  nanobot: { fill: 0.98, tile: true },
 };
 
 /** A dense mark reads larger than a sparse one of the same width; tuned by eye on the device roster. */
@@ -57,6 +59,7 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
   codex: 45,
   pi: 50,
   'local-model': 41,
+  nanobot: 45,
 };
 
 /**
@@ -66,7 +69,7 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
 export function PlatformMark({ platform, size, balanced = false }: { platform: Platform; size?: number; balanced?: boolean }) {
   const drawn = balanced ? BALANCED_SIZE[platform] * ((size ?? ControlSize.floatingButton) / ControlSize.floatingButton) : size;
   if (platform === 'local-model') return <LocalModelMark size={drawn} />;
-  return <Image accessible={false} source={marks[platform]} resizeMode="contain" style={[platform === 'hermes' || platform === 'codex' ? styles.appIcon : styles.mark, drawn ? { width: drawn, height: drawn } : null]} />;
+  return <Image accessible={false} source={marks[platform]} resizeMode="contain" style={[platform === 'hermes' || platform === 'codex' || platform === 'nanobot' ? styles.appIcon : styles.mark, drawn ? { width: drawn, height: drawn } : null]} />;
 }
 
 /** Processor outline in the 52-point frame, sized to sit inside the 42-point tile like the app-icon artwork. */

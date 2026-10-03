@@ -1,0 +1,77 @@
+# 云编译 Clawket 安卓 APK（社区构建 = 不配计费 = Pro 解锁）
+name: Build Clawket Android APK (Community)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'Android versionCode override (must exceed the installed build; 3.3.0 was 30300)'
+        required: false
+        default: '31101'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # app.config.js derives versionCode from package.json (3.1.1-nano.1 -> 30101, BELOW the
+      # previously installed 30300 build, which would block the update). Override it here.
+      EXPO_ANDROID_VERSION_CODE: ${{ github.event.inputs.version_code || '31101' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Expo prebuild (android)
+        working-directory: apps/mobile
+        run: npx expo prebuild --platform android --no-install
+
+      - name: Allow cleartext WebSocket (Tailscale / LAN agents)
+        working-directory: apps/mobile/android
+        run: |
+          MF=app/src/main/AndroidManifest.xml
+          echo "before:"; grep -o '<application[^>]*' "$MF" | head -1
+          if ! grep -q 'usesCleartextTraffic' "$MF"; then
+            sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$MF"
+          fi
+          grep -q 'usesCleartextTraffic="true"' "$MF" || { echo "CLEARTEXT PATCH FAILED"; exit 1; }
+          echo "after:"; grep -o '<application[^>]*' "$MF" | head -1
+
+      - name: Patch native deps (best effort)
+        working-directory: apps/mobile
+        run: ./scripts/patch-android-native-deps.sh || true
+
+      - name: Raise Gradle heap
+        working-directory: apps/mobile/android
+        run: |
+          printf '\norg.gradle.jvmargs=-Xmx6144m -XX:MaxMetaspaceSize=1536m -Dfile.encoding=UTF-8\n' >> gradle.properties
+          echo 'reactNativeArchitectures=arm64-v8a' >> gradle.properties
+          tail -5 gradle.properties
+
+      - name: Build release APK arm64
+        working-directory: apps/mobile/android
+        run: >
+          chmod +x gradlew &&
+          ./gradlew assembleRelease -x lint -x test --no-daemon --stacktrace
+          -PreactNativeArchitectures=arm64-v8a
+          -Pclawket.allowDebugReleaseSigning=true
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clawket-community-apk
+          path: apps/mobile/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error

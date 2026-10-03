@@ -1,4 +1,4 @@
-export type BackendKind = 'openclaw' | 'hermes' | 'local-model' | 'pi' | 'codex' | 'claude-code';
+export type BackendKind = 'openclaw' | 'hermes' | 'local-model' | 'pi' | 'codex' | 'claude-code' | 'nanobot';
 
 export type TransportKind =
   | 'relay'

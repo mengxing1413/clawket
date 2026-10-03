@@ -69,6 +69,7 @@ export function normalizePairableBackendKind(
     pi: 'pi',
     codex: 'codex',
     'claude-code': 'claude-code',
+    nanobot: 'openclaw',
   };
   return normalized[backendKind ?? 'openclaw'];
 }

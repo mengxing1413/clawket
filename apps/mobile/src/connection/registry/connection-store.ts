@@ -25,7 +25,7 @@ const SECURE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
 };
 
-const BACKEND_KINDS = new Set<BackendKind>(['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code']);
+const BACKEND_KINDS = new Set<BackendKind>(['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code', 'nanobot']);
 const TRANSPORT_KINDS = new Set<TransportKind>([
   'relay',
   'local',
@@ -41,6 +41,7 @@ const LEGACY_TRANSPORT_NORMALIZERS: Record<BackendKind, (value: TransportKind) =
   pi: value => value,
   codex: value => value,
   'claude-code': value => value,
+  nanobot: value => value,
 };
 
 type RegistryState = {

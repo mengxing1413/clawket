@@ -13,6 +13,7 @@ import { CodexAdapter } from './codex';
 import { ClaudeCodeAdapter } from './claude-code';
 import { PiAdapter } from './pi';
 import { LocalModelAdapter } from './local-model';
+import { NanobotAdapter } from './nanobot';
 
 type CreateConnectionAdapterOptions = ConnectionAdapterFactoryContext & Readonly<{
   gateway?: GatewayClient;
@@ -48,6 +49,8 @@ export function createConnectionAdapter(
         gateway: options.gateway,
         onReconnect: options.onReconnect,
       });
+    case 'nanobot':
+      return new NanobotAdapter(record, { isFreeSlot });
     default:
       return assertNever(record.backendKind);
   }

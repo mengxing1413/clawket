@@ -196,6 +196,7 @@ const BACKEND_NAMES: Readonly<Record<BackendKind, string | null>> = {
   pi: 'Pi',
   codex: 'Codex',
   'claude-code': 'Claude Code',
+  nanobot: 'Nanobot',
   'local-model': null,
 };
 

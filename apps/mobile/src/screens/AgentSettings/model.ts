@@ -132,6 +132,7 @@ const BACKEND_LABELS: Readonly<Record<ConnectionDescriptor['backendKind'], strin
   pi: 'Pi',
   codex: 'Codex',
   'claude-code': 'Claude Code',
+  nanobot: 'Nanobot',
 };
 
 const CONNECTION_STATE_LABELS: Readonly<Record<ConnectionState, string>> = {

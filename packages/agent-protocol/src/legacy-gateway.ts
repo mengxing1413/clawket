@@ -142,6 +142,7 @@ const LEGACY_BACKENDS: Record<GatewayBackendKind, GatewayBackendDescriptor> = {
   pi: { kind: 'pi', label: 'Pi', capabilities: { ...MINIMAL_LEGACY_CAPABILITIES, gatewayConnection: true, modelCatalog: true, modelSelection: true, chatAttachments: true, consoleAgentSessionsBoard: true } },
   openclaw: { kind: 'openclaw', label: 'OpenClaw', capabilities: OPENCLAW_LEGACY_CAPABILITIES },
   hermes: { kind: 'hermes', label: 'Hermes', capabilities: HERMES_LEGACY_CAPABILITIES },
+  nanobot: { kind: 'nanobot', label: 'Nanobot', capabilities: { ...MINIMAL_LEGACY_CAPABILITIES, gatewayConnection: true } },
   'local-model': { kind: 'local-model', label: 'Local model', capabilities: { ...MINIMAL_LEGACY_CAPABILITIES, modelCatalog: true, modelSelection: true, chatAttachments: true } },
 };
 
@@ -165,7 +166,7 @@ export function isGatewayTransportKind(value: unknown): value is GatewayTranspor
 }
 
 export function isGatewayBackendKind(value: unknown): value is GatewayBackendKind {
-  return value === 'openclaw' || value === 'hermes' || value === 'local-model' || value === 'pi' || value === 'codex' || value === 'claude-code';
+  return value === 'openclaw' || value === 'hermes' || value === 'local-model' || value === 'pi' || value === 'codex' || value === 'claude-code' || value === 'nanobot';
 }
 
 export function resolveGatewayBackendKind(value: LegacyGatewayLike | null | undefined): GatewayBackendKind {
