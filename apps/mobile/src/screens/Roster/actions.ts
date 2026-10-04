@@ -9,7 +9,8 @@ export type RosterRowAction =
   | 'manage_connection'
   | 'remove_connection'
   | 'unpin_session'
-  | 'rename_session';
+  | 'rename_session'
+  | 'rename_agent';
 
 export function assembleRosterAddActions(input: Readonly<{
   canCreateAgent: boolean;
@@ -31,6 +32,7 @@ export function assembleRosterRowActions(input: Readonly<{
   if (input.row.kind === 'agent') {
     return [
       input.row.agentPinned ? 'unpin_agent' : 'pin_agent',
+      ...(input.connectionAgentCount === 1 ? ['rename_agent' as const] : []),
       'manage_connection',
       ...(input.connectionAgentCount === 1 ? ['remove_connection' as const] : []),
     ];
