@@ -150,6 +150,7 @@ export type RosterScreenProps = Readonly<{
   onRemoveConnection?: (row: RosterDisplayRow) => MaybePromise;
   onUnpinSession?: (row: RosterDisplayRow) => MaybePromise;
   onRenameSession?: (row: RosterDisplayRow, title: string) => MaybePromise;
+  onRenameAgent?: (row: RosterDisplayRow, name: string) => MaybePromise;
   onGraceAction?: () => void;
   onOpenPro?: () => void;
 }>;
@@ -658,6 +659,7 @@ export function RosterScreen({
   onRemoveConnection,
   onUnpinSession,
   onRenameSession,
+  onRenameAgent,
   onGraceAction,
   onOpenPro,
 }: RosterScreenProps): React.JSX.Element {
@@ -676,6 +678,7 @@ export function RosterScreen({
   const [actionRow, setActionRow] = useState<RosterDisplayRow | null>(null);
   const [removeRow, setRemoveRow] = useState<RosterDisplayRow | null>(null);
   const [renameRow, setRenameRow] = useState<RosterDisplayRow | null>(null);
+  const [renameAgentRow, setRenameAgentRow] = useState<RosterDisplayRow | null>(null);
   const rows = useMemo(() => buildRosterRows(roster, {
     runActivities: connections.runActivities,
     ...(pinnedSessionKeys ? { pinnedSessionKeys } : {}),
@@ -787,6 +790,7 @@ export function RosterScreen({
       case 'manage_connection': return t('Manage connection', { ns: 'config' });
       case 'remove_connection': return t('Remove connection', { ns: 'config' });
       case 'unpin_session': return t('Hide from home', { ns: 'common' });
+      case 'rename_agent': return t('Rename', { ns: 'common' });
       default: return t('Rename', { ns: 'common' });
     }
   }, [t]);
@@ -814,6 +818,10 @@ export function RosterScreen({
     }
     if (action === 'rename_session') {
       setRenameRow(row);
+      return;
+    }
+    if (action === 'rename_agent') {
+      setRenameAgentRow(row);
       return;
     }
     if (action === 'manage_connection') {
@@ -853,6 +861,10 @@ export function RosterScreen({
     if (!renameRow || !onRenameSession) return;
     await onRenameSession(renameRow, title);
   }, [onRenameSession, renameRow]);
+  const submitRenameAgent = useCallback(async (name: string) => {
+    if (!renameAgentRow || !onRenameAgent) return;
+    await onRenameAgent(renameAgentRow, name);
+  }, [onRenameAgent, renameAgentRow]);
   const removeConnectionName = removeRow
     ? roster.find((item) => item.connection.id === removeRow.connectionId)?.connection.label
       ?? removeRow.name
@@ -927,6 +939,14 @@ export function RosterScreen({
         value={renameRow?.name ?? ''}
         onClose={() => setRenameRow(null)}
         onSubmit={submitRename}
+      />
+      <RenameSheet
+        testID="roster-agent-rename"
+        title={t('Agent name', { ns: 'common' })}
+        visible={renameAgentRow !== null}
+        value={renameAgentRow?.name ?? ''}
+        onClose={() => setRenameAgentRow(null)}
+        onSubmit={submitRenameAgent}
       />
       <ConfirmationModal
         testID="roster-remove-connection"
