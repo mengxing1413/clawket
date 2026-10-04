@@ -931,6 +931,63 @@ export type ModelsOperations = Partial<{
     setCost(write: ModelCostWrite): Promise<void>;
 }>;
 
+export interface NanobotModelPreset {
+  name: string;
+  label: string;
+  active: boolean;
+  isDefault: boolean;
+  model: string;
+  provider: string;
+  maxTokens: number | null;
+  contextWindowTokens: number | null;
+  temperature: number | null;
+  reasoningEffort: string | null;
+  reasoningEffortValues: string[];
+}
+
+export interface NanobotProviderRow {
+  name: string;
+  label: string;
+  isCustom: boolean;
+  configured: boolean;
+  authType: string;
+  apiKeyRequired: boolean;
+  apiKeyHint: string | null;
+  apiBase: string | null;
+  defaultApiBase: string | null;
+  proxy: string | null;
+}
+
+export interface NanobotModelSettings {
+  agent: {
+    model: string;
+    provider: string;
+    resolvedProvider: string;
+    modelPreset: string;
+    maxTokens: number | null;
+    contextWindowTokens: number | null;
+    temperature: number | null;
+    reasoningEffort: string | null;
+  };
+  presets: NanobotModelPreset[];
+  callOrder: string[];
+  callOrderEditable: boolean;
+  providers: NanobotProviderRow[];
+}
+
+/** nanobot-local model management over its authenticated WebSocket; not the Gateway catalog contract. */
+export type NanobotModelOperations = Partial<{
+  readSettings(): Promise<NanobotModelSettings>;
+  updateAgentModel(patch: Record<string, unknown>): Promise<void>;
+  createPreset(input: Record<string, unknown>): Promise<void>;
+  updatePreset(input: Record<string, unknown>): Promise<void>;
+  deletePreset(name: string): Promise<void>;
+  updateCallOrder(order: string[]): Promise<void>;
+  providerModels(provider: string): Promise<unknown>;
+  createProvider(input: Record<string, unknown>): Promise<void>;
+  updateProvider(input: Record<string, unknown>): Promise<void>;
+}>;
+
 export type SkillsOperations = Partial<{
     status(agentId?: string, context?: { sessionKey?: string }): Promise<SkillStatusReport>;
     get(key: string, params?: { agentId?: string; filePath?: string | null }): Promise<SkillDetail>;
@@ -997,6 +1054,7 @@ export type ConfigOperations = Partial<{
 export type ManagementOperations = Partial<{
   profile: import('./profile').AgentProfileOperations;
   models: ModelsOperations;
+  nanobotModels?: NanobotModelOperations;
   skills: SkillsOperations;
   cron: CronOperations;
   agents: AgentsOperations;
