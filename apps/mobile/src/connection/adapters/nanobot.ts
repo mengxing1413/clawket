@@ -5,6 +5,7 @@ import {
   type PromptInput, type ChatMessage, type ManagementOperations,
   type ModelInfo, type ModelSelectionState, type SkillStatusEntry, type SkillStatusReport,
   type CronJob, type CronListResult, type CronSchedule, type CostSummary,
+  type NanobotModelSettings, type NanobotModelPreset, type NanobotProviderRow,
 } from '@clawket/agent-protocol';
 import { generateId } from '../../services/gateway-auth';
 import { DirectWsTransport } from '../transports/direct-ws';
@@ -24,6 +25,10 @@ interface NanobotInbound {
   text?: string;
   stream_id?: string;
   detail?: string;
+  request_id?: string;
+  ok?: boolean;
+  result?: unknown;
+  error?: { status?: number; message?: string };
 }
 
 interface ServerSession {
@@ -65,6 +70,7 @@ export class NanobotAdapter implements AgentAdapter {
   private readonly runText = new Map<string, string>();
   private readonly activeRunByChat = new Map<string, string>();
   private pendingNewChat: { resolve: (chatId: string) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> } | null = null;
+  private readonly webuiPending = new Map<string, { resolve: (value: unknown) => void; reject: (reason: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private epoch = 0;
   private connectPromise: Promise<void> | null = null;
   private cancelConnect: (() => void) | null = null;
@@ -92,9 +98,20 @@ export class NanobotAdapter implements AgentAdapter {
     this.transport.onStateChange(change => {
       if (change.state !== 'ready') this.setState(change.state === 'closed' ? 'offline' : change.state);
     });
-    this.transport.onClose(() => { this.epoch++; this.pendingNewChat = null; });
+    this.transport.onClose(() => { this.epoch++; this.pendingNewChat = null; this.rejectWebuiPending(new AdapterError('network', 'Nanobot connection closed')); });
 
     this.management = {
+      nanobotModels: {
+        readSettings: () => this.readNanobotModelSettings(),
+        updateAgentModel: (patch) => this.wsRequest('settings.agent.update', patch),
+        createPreset: (input) => this.wsRequest('settings.model_configuration.create', input),
+        updatePreset: (input) => this.wsRequest('settings.model_configuration.update', input),
+        deletePreset: (name) => this.wsRequest('settings.model_configuration.delete', { name }),
+        updateCallOrder: (order) => this.wsRequest('settings.model_call_order.update', { order: JSON.stringify(order) }),
+        providerModels: (provider) => this.api(`/api/settings/provider-models?provider=${encodeURIComponent(provider)}`),
+        createProvider: (input) => this.wsRequest('settings.provider.create', input),
+        updateProvider: (input) => this.wsRequest('settings.provider.update', input),
+      },
       models: {
         list: () => this.listModels(),
         getSelection: () => this.getModelSelection(),
@@ -457,6 +474,75 @@ export class NanobotAdapter implements AgentAdapter {
     };
   }
 
+  private rejectWebuiPending(error: Error): void {
+    for (const pending of this.webuiPending.values()) { clearTimeout(pending.timer); pending.reject(error); }
+    this.webuiPending.clear();
+  }
+
+  private wsRequest<T = void>(action: string, payload: Record<string, unknown>): Promise<T> {
+    const requestId = generateId();
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.webuiPending.delete(requestId);
+        reject(new AdapterError('timeout', `Nanobot ${action} timed out`));
+      }, 20_000);
+      this.webuiPending.set(requestId, { resolve: (value) => resolve(value as T), reject, timer });
+      try {
+        this.transport.send(JSON.stringify({ type: 'webui_request', request_id: requestId, action, payload }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.webuiPending.delete(requestId);
+        reject(error instanceof AdapterError ? error : new AdapterError('network', error instanceof Error ? error.message : String(error)));
+      }
+    });
+  }
+
+  private async readNanobotModelSettings(): Promise<NanobotModelSettings> {
+    const data = await this.api<any>('/api/settings');
+    const agent = (data.agent ?? {}) as any;
+    const presets: NanobotModelPreset[] = (Array.isArray(data.model_presets) ? data.model_presets : []).map((p: any) => ({
+      name: p.name ?? '',
+      label: p.label ?? p.name ?? '',
+      active: p.active === true,
+      isDefault: p.is_default === true,
+      model: p.model ?? '',
+      provider: p.provider ?? '',
+      maxTokens: typeof p.max_tokens === 'number' ? p.max_tokens : null,
+      contextWindowTokens: typeof p.context_window_tokens === 'number' ? p.context_window_tokens : null,
+      temperature: typeof p.temperature === 'number' ? p.temperature : null,
+      reasoningEffort: typeof p.reasoning_effort === 'string' ? p.reasoning_effort : null,
+      reasoningEffortValues: Array.isArray(p.reasoning_effort_values) ? p.reasoning_effort_values : [],
+    }));
+    const providers: NanobotProviderRow[] = (Array.isArray(data.providers) ? data.providers : []).map((r: any) => ({
+      name: r.name ?? '',
+      label: r.label ?? r.name ?? '',
+      isCustom: r.is_custom === true,
+      configured: r.configured === true,
+      authType: typeof r.auth_type === 'string' ? r.auth_type : 'api_key',
+      apiKeyRequired: r.api_key_required === true,
+      apiKeyHint: typeof r.api_key_hint === 'string' ? r.api_key_hint : null,
+      apiBase: typeof r.api_base === 'string' ? r.api_base : null,
+      defaultApiBase: typeof r.default_api_base === 'string' ? r.default_api_base : null,
+      proxy: typeof r.proxy === 'string' ? r.proxy : null,
+    }));
+    return {
+      agent: {
+        model: agent.model ?? '',
+        provider: agent.provider ?? '',
+        resolvedProvider: agent.resolved_provider ?? '',
+        modelPreset: agent.model_preset ?? 'default',
+        maxTokens: typeof agent.max_tokens === 'number' ? agent.max_tokens : null,
+        contextWindowTokens: typeof agent.context_window_tokens === 'number' ? agent.context_window_tokens : null,
+        temperature: typeof agent.temperature === 'number' ? agent.temperature : null,
+        reasoningEffort: typeof agent.reasoning_effort === 'string' ? agent.reasoning_effort : null,
+      },
+      presets,
+      callOrder: Array.isArray(data.model_call_order) ? data.model_call_order.filter((x: unknown) => typeof x === 'string') : [],
+      callOrderEditable: data.model_call_order_editable === true,
+      providers,
+    };
+  }
+
   private receive(data: unknown): void {
     let msg: NanobotInbound;
     try { msg = typeof data === 'string' ? JSON.parse(data) as NanobotInbound : (data ?? {}) as NanobotInbound; }
@@ -508,6 +594,15 @@ export class NanobotAdapter implements AgentAdapter {
           this.pushMessage(key, { id: generateId(), role: 'assistant', text: msg.text ?? '', timestampMs: Date.now() });
           this.announceSessions();
         }
+        break;
+      }
+      case 'webui_response': {
+        const pending = msg.request_id ? this.webuiPending.get(msg.request_id) : undefined;
+        if (!pending) break;
+        this.webuiPending.delete(msg.request_id as string);
+        clearTimeout(pending.timer);
+        if (msg.ok) pending.resolve(msg.result);
+        else pending.reject(new AdapterError('server', msg.error?.message ?? 'Nanobot request failed'));
         break;
       }
       case 'error': {
