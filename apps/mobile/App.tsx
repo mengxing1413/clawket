@@ -1296,6 +1296,10 @@ function AppContent({
     });
   }, [canAccessConnection, canAccessRosterAgent, presentPaywall]);
 
+  const handleRosterAgentRename = useCallback(async (row: RosterDisplayRow, name: string) => {
+    await getConnectionRuntime().setAgentName(row.connectionId, name);
+  }, []);
+
   const removeConnectionAndExit = useCallback(async (connectionId: string) => {
     const runtime = getConnectionRuntime();
     const removed = await runtime.removeConnection(connectionId);
@@ -1660,6 +1664,7 @@ function AppContent({
                       onRemoveConnection={handleRosterConnectionRemove}
                       onUnpinSession={handleRosterSessionUnpin}
                       onRenameSession={handleRosterSessionRename}
+                      onRenameAgent={handleRosterAgentRename}
                       onGraceAction={() => presentPaywall('settingsMembershipPreview')}
                       onOpenPro={() => presentPaywall('settingsMembershipPreview')}
                     />
@@ -1969,6 +1974,7 @@ function AppContent({
                       onBack={navigation.goBack} onReconnect={() => resumeConnection(connection.id, true)} onResume={() => resumeConnection(connection.id)}
                       onPause={() => runtime.pauseConnection(connection.id)}
                       onRename={(label) => runtime.renameConnection(connection.id, label)}
+                      onRenameAgent={(name) => runtime.setAgentName(connection.id, name)}
                       onRemove={() => removeConnectionAndExit(connection.id)} />;
                   }}
                 </RootStack.Screen>
