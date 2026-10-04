@@ -39,6 +39,8 @@ export interface ConnectionRecord {
   backendKind: BackendKind;
   transportKind: TransportKind;
   label: string;
+  /** Local-only custom Agent name; never sent to the backend. */
+  agentName?: string;
   environment?: ServiceEnvironment;
   createdAt: number;
   url: string;
@@ -55,6 +57,7 @@ export interface ConnectionDescriptor {
   backendKind: BackendKind;
   transportKind: TransportKind;
   label: string;
+  agentName?: string;
   environment?: ServiceEnvironment;
   createdAt: number;
   bridgeOutdated?: boolean;
