@@ -63,6 +63,7 @@ import {
 } from './section-model';
 import { NativeProfileScreen, isNativeProfileSection } from './NativeProfileScreen';
 import { ModelsScreen } from './ModelsScreen';
+import { NanobotModelsScreen } from './NanobotModelsScreen';
 import { SkillsSection } from './SkillsSection';
 import { SkillDiscoverScreen } from './SkillDiscoverScreen';
 import { CronSection } from './CronSection';
@@ -421,6 +422,10 @@ export function AgentSettingsSectionScreen({
         onOpenPaywall={openPaywall}
       />
     );
+  }
+
+  if (section === 'models' && adapter && adapter.connection.backendKind === 'nanobot') {
+    return <NanobotModelsScreen adapter={adapter} onBack={navigation.goBack} />;
   }
 
   if (section === 'models' && adapter && agent && supported && !sectionLocked && state !== 'empty' && state !== 'loading') {
