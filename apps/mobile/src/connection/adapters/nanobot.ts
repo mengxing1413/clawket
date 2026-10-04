@@ -43,6 +43,8 @@ interface ServerThreadMessage {
 
 const NO_SESSION_ACTIONS = { rename: false, reset: false, delete: false, pin: false };
 const SESSION_CHANNEL_PREFIX = 'websocket:';
+/** Fixed chat id backing the stable 'main' session, so reconnects resume one conversation. */
+const MAIN_CHAT_ID = 'main';
 
 /**
  * Nanobot adapter. Chat streams over the native gateway WebSocket
@@ -223,9 +225,7 @@ export class NanobotAdapter implements AgentAdapter {
     this.emitUpdate({ type: 'run_started', sessionKey: key, runId });
     this.activeRunByChat.set(key, runId);
     this.runText.set(key, '');
-    const payload = key === this.defaultChatId
-      ? { content: input.text }
-      : { type: 'message', chat_id: key, content: input.text };
+    const payload = { type: 'message', chat_id: key, content: input.text };
     try {
       this.transport.send(JSON.stringify(payload));
     } catch (error) {
@@ -338,6 +338,11 @@ export class NanobotAdapter implements AgentAdapter {
       always: false,
       disabled: skill.enabled === false,
       blockedByAllowlist: false,
+      eligible: skill.enabled !== false,
+      requirements: {},
+      missing: {},
+      configChecks: [],
+      install: [],
     }));
     return { workspaceDir: '', managedSkillsDir: '', skills };
   }
@@ -460,13 +465,11 @@ export class NanobotAdapter implements AgentAdapter {
     const key = msg.chat_id ?? this.defaultChatId ?? undefined;
     switch (tag) {
       case 'ready': {
-        if (msg.chat_id) this.defaultChatId = msg.chat_id;
-        if (!this.defaultChatId) break;
+        this.defaultChatId = MAIN_CHAT_ID;
         if (!this.transcripts.has(this.defaultChatId)) this.transcripts.set(this.defaultChatId, []);
         this.transport.markReady();
         this.setState('ready');
         this.announceSessions();
-        void this.adoptLatestServerSession();
         break;
       }
       case 'attached': {
@@ -513,25 +516,6 @@ export class NanobotAdapter implements AgentAdapter {
       }
       default: break;
     }
-  }
-
-  /** Point the "main" session at the most recent server-side session so a reconnect resumes it. */
-  private async adoptLatestServerSession(): Promise<void> {
-    try {
-      const data = await this.api<{ sessions?: ServerSession[] }>('/api/sessions');
-      let best: { chatId: string; updatedAt: number } | null = null;
-      for (const session of data.sessions ?? []) {
-        const chatId = this.toChatId(session.key);
-        if (!chatId) continue;
-        const updatedAt = Date.parse(session.updated_at ?? '') || 0;
-        if (!best || updatedAt > best.updatedAt) best = { chatId, updatedAt };
-      }
-      if (best) {
-        this.defaultChatId = best.chatId;
-        if (!this.transcripts.has(best.chatId)) this.transcripts.set(best.chatId, []);
-        this.announceSessions();
-      }
-    } catch { /* keep the server-assigned default chat */ }
   }
 
   private ensureRun(key: string): string {
