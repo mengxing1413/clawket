@@ -500,6 +500,26 @@ export class ConnectionCoordinator {
     return descriptor;
   }
 
+  /** Local Agent display name; an empty string clears the override. Never sent to the backend. */
+  async setAgentName(connectionId: string, agentName: string): Promise<ConnectionDescriptor> {
+    const name = agentName.trim();
+    const descriptor = await this.store.update(connectionId, { agentName: name || null });
+    await this.enqueue(async () => {
+      const input = this.rosterInputs.get(connectionId);
+      if (!input) return;
+      const rename = (agents: ReadonlyArray<AgentDescriptor>) => applyLocalAgentName(descriptor, agents);
+      try {
+        await this.cache.updateAgents(connectionId, rename);
+      } catch {
+        // The cache is a convenience copy; the next roster listing rewrites it.
+      }
+      const current = this.rosterInputs.get(connectionId);
+      if (current) this.rosterInputs.set(connectionId, { ...current, connection: descriptor, agents: rename(current.agents) });
+      this.publish();
+    });
+    return descriptor;
+  }
+
   /**
    * Local display name only: credentials and transport are untouched, so an
    * OpenClaw socket keeps running. Adapters that name their sole Agent after the
@@ -523,7 +543,7 @@ export class ConnectionCoordinator {
       }
       if (!input || !input.agents.some((agent) => followsLabel || agent.name === previous)) return;
       const rename = (agents: ReadonlyArray<AgentDescriptor>) => agents.map((agent) => (
-        followsLabel || agent.name === previous ? { ...agent, name } : agent
+        followsLabel || agent.name === previous ? { ...agent, name: localAgentName(descriptor) ?? name } : agent
       ));
       try {
         await this.cache.updateAgents(connectionId, rename);
@@ -1021,9 +1041,7 @@ export class ConnectionCoordinator {
       }
       this.rosterInputs.set(connection.id, {
         connection,
-        agents: connectionAgentDefaultName(connection.backendKind)
-          ? (entry?.agents ?? current?.agents ?? EMPTY_AGENTS).map(agent => ({ ...agent, name: connection.label }))
-          : entry?.agents ?? current?.agents ?? EMPTY_AGENTS,
+        agents: applyLocalAgentName(connection, entry?.agents ?? current?.agents ?? EMPTY_AGENTS),
         sessions: entry?.sessions ?? current?.sessions ?? EMPTY_SESSIONS,
         source: 'cache',
         syncedAt: entry?.savedAt ?? current?.syncedAt ?? 0,
@@ -1085,9 +1103,7 @@ export class ConnectionCoordinator {
           // catalog or turn a first-load failure into a missing Agent.
           this.rosterInputs.set(entry.connectionId, {
             connection,
-            agents: cloneAgents(connectionAgentDefaultName(connection.backendKind)
-              ? agents.map(agent => ({ ...agent, name: connection.label }))
-              : agents),
+            agents: cloneAgents(applyLocalAgentName(connection, agents)),
             sessions: current?.sessions ?? EMPTY_SESSIONS,
             source: current?.source ?? 'cache',
             syncedAt: current?.syncedAt ?? 0,
@@ -1105,9 +1121,7 @@ export class ConnectionCoordinator {
       if (!isCurrentRead()) return;
       const connection = this.connectionDescriptor(entry.connectionId);
       if (!connection) return;
-      const agents = connectionAgentDefaultName(connection.backendKind)
-        ? listedAgents.map(agent => ({ ...agent, name: connection.label }))
-        : listedAgents;
+      const agents = applyLocalAgentName(connection, listedAgents);
       const syncedAt = this.now();
       const acceptedSessions = entry.sessionSnapshotRevision === sessionSnapshotRevision
         ? cloneSessions(sessions)
@@ -1135,9 +1149,7 @@ export class ConnectionCoordinator {
       const currentConnection = this.connectionDescriptor(entry.connectionId) ?? connection;
       this.rosterInputs.set(entry.connectionId, {
         connection: currentConnection,
-        agents: connectionAgentDefaultName(currentConnection.backendKind)
-          ? cacheSnapshot.agents.map(agent => ({ ...agent, name: currentConnection.label }))
-          : cacheSnapshot.agents,
+        agents: applyLocalAgentName(currentConnection, cacheSnapshot.agents),
         sessions: cacheSnapshot.sessions,
         source: 'live',
         syncedAt: cacheSnapshot.savedAt,
@@ -1454,6 +1466,21 @@ export class ConnectionCoordinator {
     this.operation = pending.then(() => undefined, () => undefined);
     return pending;
   }
+}
+
+/** Local override for an Agent's display name: a custom alias, else the label for label-named backends. */
+function localAgentName(connection: ConnectionDescriptor): string | undefined {
+  const alias = connection.agentName?.trim();
+  if (alias) return alias;
+  return connectionAgentDefaultName(connection.backendKind) ? connection.label : undefined;
+}
+
+function applyLocalAgentName(
+  connection: ConnectionDescriptor,
+  agents: ReadonlyArray<AgentDescriptor>,
+): ReadonlyArray<AgentDescriptor> {
+  const name = localAgentName(connection);
+  return name ? agents.map((agent) => ({ ...agent, name })) : agents;
 }
 
 const EMPTY_AGENTS = Object.freeze([]) as ReadonlyArray<AgentDescriptor>;
