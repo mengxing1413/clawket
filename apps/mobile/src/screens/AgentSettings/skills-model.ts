@@ -33,17 +33,17 @@ export function skillRequirementIssues(skill: SkillStatusEntry): ReadonlyArray<{
 }> {
   const unique = (values: string[]) => [...new Set(values.map((value) => value.trim()).filter(Boolean))];
   const missing = unique([
-    ...(skill.missing.bins ?? []),
-    ...(skill.missing.env ?? []),
-    ...(skill.missing.config ?? []),
-    ...skill.configChecks.filter((check) => !check.satisfied).map((check) => check.path),
+    ...(skill.missing?.bins ?? []),
+    ...(skill.missing?.env ?? []),
+    ...(skill.missing?.config ?? []),
+    ...(skill.configChecks ?? []).filter((check) => !check.satisfied).map((check) => check.path),
   ]);
   const issues: Array<{ kind: 'blocked' | 'missing' | 'any' | 'os' | 'unavailable'; requirements: string }> = [];
   if (skill.blockedByAllowlist) issues.push({ kind: 'blocked', requirements: '' });
   if (missing.length) issues.push({ kind: 'missing', requirements: missing.join(', ') });
-  const any = unique(skill.missing.anyBins ?? []);
+  const any = unique(skill.missing?.anyBins ?? []);
   if (any.length) issues.push({ kind: 'any', requirements: any.join(', ') });
-  const os = unique(skill.missing.os ?? []);
+  const os = unique(skill.missing?.os ?? []);
   if (os.length) issues.push({ kind: 'os', requirements: os.join(', ') });
   if (!issues.length && !skill.disabled && !skill.eligible) {
     issues.push({ kind: 'unavailable', requirements: '' });
