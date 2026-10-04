@@ -48,6 +48,7 @@ type Props = {
   onPause: () => Promise<unknown>;
   onRemove: () => Promise<unknown>;
   onRename: (label: string) => Promise<unknown>;
+  onRenameAgent?: (name: string) => Promise<unknown>;
   onUseAsFreeConnection?: () => void;
 };
 
@@ -85,6 +86,7 @@ export function ConnectionScreen({
   onPause,
   onRemove,
   onRename,
+  onRenameAgent,
   onUseAsFreeConnection,
 }: Props): React.JSX.Element {
   const { t, i18n } = useTranslation(['config', 'common', 'settings', 'chat']);
@@ -93,6 +95,7 @@ export function ConnectionScreen({
   const serverHost = useConnectionServerHost(connection.id);
   const [confirmation, setConfirmation] = useState<'pause' | 'remove' | null>(null);
   const [renaming, setRenaming] = useState(false);
+  const [renamingAgent, setRenamingAgent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
   const inFlight = useRef(false);
@@ -149,6 +152,9 @@ export function ConnectionScreen({
         <SettingsGroup density="comfortable">
           <SettingsRow testID="connection-name" title={t('Name', { ns: 'common' })} value={connection.label}
             showChevron onPress={() => setRenaming(true)} />
+          <SettingsDivider inset="content" />
+          <SettingsRow testID="connection-agent-name" title={t('Agent name', { ns: 'common' })} value={connection.agentName}
+            showChevron onPress={() => setRenamingAgent(true)} />
         </SettingsGroup>
         <SettingsGroup density="comfortable" testID="connection-details">
           {detailRows.map((row, index) => (
@@ -177,6 +183,9 @@ export function ConnectionScreen({
       </ScrollView>
       <RenameSheet testID="connection-rename" visible={renaming} value={connection.label}
         title={t('Name', { ns: 'common' })} onClose={() => setRenaming(false)} onSubmit={onRename} />
+      <RenameSheet testID="connection-agent-rename" visible={renamingAgent} value={connection.agentName ?? ''}
+        title={t('Agent name', { ns: 'common' })} onClose={() => setRenamingAgent(false)}
+        onSubmit={async (name) => { await onRenameAgent?.(name); }} />
       <ConfirmationModal testID="connection-confirmation" visible={confirmation !== null} destructive={confirmation === 'remove'}
         title={confirmation === 'pause' ? t('Pause this connection?') : t('Remove connection')}
         message={confirmation === 'pause' ? t('All agents on this connection will go offline until you resume.') : t('All local data for this connection will be removed.')}
