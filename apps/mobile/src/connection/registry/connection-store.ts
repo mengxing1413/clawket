@@ -73,6 +73,7 @@ export type ConnectionUpsertResult = Readonly<{
 export type ConnectionRecordPatch = Partial<
   Pick<ConnectionRecord, 'backendKind' | 'transportKind' | 'label' | 'url'>
 > & {
+  agentName?: string | null;
   environment?: ServiceEnvironment | null;
   auth?: ConnectionRecord['auth'] | null;
   bootstrap?: ConnectionRecord['bootstrap'] | null;
@@ -229,6 +230,7 @@ function normalizeConnectionRecord(value: unknown): ConnectionRecord | null {
   const bootstrap = normalizeBootstrap(value.bootstrap);
   const relay = normalizeRelay(value.relay);
   const hermes = normalizeHermes(value.hermes);
+  const agentName = readOptionalString(value.agentName);
   const invalidAuth = value.auth !== undefined && (
     !isObject(value.auth)
     || (value.auth.token !== undefined && !readOptionalString(value.auth.token))
@@ -240,6 +242,7 @@ function normalizeConnectionRecord(value: unknown): ConnectionRecord | null {
     || (value.bootstrap !== undefined && !bootstrap)
     || (value.relay !== undefined && !relay)
     || (value.hermes !== undefined && !hermes)
+    || (value.agentName !== undefined && !agentName)
     || (value.debugMode !== undefined && typeof value.debugMode !== 'boolean')
   ) {
     return null;
@@ -256,6 +259,7 @@ function normalizeConnectionRecord(value: unknown): ConnectionRecord | null {
     ...(bootstrap ? { bootstrap } : {}),
     ...(relay ? { relay } : {}),
     ...(hermes ? { hermes } : {}),
+    ...(agentName ? { agentName } : {}),
     ...(typeof value.debugMode === 'boolean' ? { debugMode: value.debugMode } : {}),
   };
 }
@@ -387,7 +391,7 @@ function cloneRecord(record: ConnectionRecord): ConnectionRecord {
 function patchRecord(record: ConnectionRecord, patch: ConnectionRecordPatch): ConnectionRecord | null {
   const next: Record<string, unknown> = { ...cloneRecord(record) };
   const requiredFields = ['backendKind', 'transportKind', 'label', 'url'] as const;
-  const optionalFields = ['environment', 'auth', 'bootstrap', 'relay', 'hermes', 'debugMode'] as const;
+  const optionalFields = ['agentName', 'environment', 'auth', 'bootstrap', 'relay', 'hermes', 'debugMode'] as const;
   for (const field of requiredFields) {
     if (patch[field] !== undefined) next[field] = patch[field];
   }
@@ -529,6 +533,7 @@ function createDescriptor(
     backendKind: record.backendKind,
     transportKind: record.transportKind,
     label: record.label,
+    ...(record.agentName ? { agentName: record.agentName } : {}),
     ...(record.environment ? { environment: record.environment } : {}),
     createdAt: record.createdAt,
     ...(bridgeOutdated ? { bridgeOutdated: true } : {}),
