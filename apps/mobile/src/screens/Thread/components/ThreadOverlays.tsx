@@ -1,13 +1,11 @@
 import React from 'react';
 import type { UiMessage } from '../../../types/chat';
 import type { ThinkingLevel } from '../../../utils/gateway-settings';
-import type { ModelInfo } from '../../../components/chat/ModelPickerModal';
-import type { ModelProviderInfo } from '../../../components/chat/model-picker-data';
+import { ModelSheet, type ModelSheetProps } from '../../../components/chat/ModelSheet';
 import { ChatSharePosterModal } from '../../../components/chat/ChatSharePosterModal';
 import type { PlatformKind } from '../../../components/ui/PlatformMark';
 import { CommandOptionPickerModal } from '../../../components/chat/CommandOptionPickerModal';
 import { ImagePreviewModal } from '../../../components/chat/ImagePreviewModal';
-import { ModelPickerModal } from '../../../components/chat/ModelPickerModal';
 import { ThinkingLevelPickerModal } from '../../../components/chat/ThinkingLevelPickerModal';
 import { CommandsSheet } from '../../../components/chat/CommandsSheet';
 import type { SlashCommand } from '../../../data/slash-commands';
@@ -17,10 +15,6 @@ type PreviewState = Readonly<{
   visible: boolean;
   uris: string[];
   index: number;
-  width: number;
-  height: number;
-  topInset: number;
-  bottomInset: number;
   onClose: () => void;
   onIndexChange: (index: number) => void;
 }>;
@@ -51,20 +45,8 @@ export type ThreadOverlaysProps = Readonly<{
   shareProductLabel?: string;
   onCloseShare: () => void;
   preview: PreviewState;
-  modelPicker: Readonly<{
-    visible: boolean;
-    loading: boolean;
-    error: string | null;
-    models: ModelInfo[];
-    providers?: ModelProviderInfo[];
-    defaultModel?: string;
-    defaultProvider?: string;
-    configuredDefaultModel?: string;
-    onManage?: () => void;
-    onClose: () => void;
-    onRetry: () => void;
-    onSelect: (model: ModelInfo) => void;
-  }>;
+  /** The conversation's one model sheet, for every backend (A+ model sheet, owner-approved 2026-10-01). */
+  modelSheet: ModelSheetProps;
   commandPicker: Readonly<{
     visible: boolean;
     title: string;
@@ -117,7 +99,7 @@ export function ThreadOverlays({
   shareProductLabel,
   onCloseShare,
   preview,
-  modelPicker,
+  modelSheet,
   commandPicker,
   commandsSheet,
   thinkingPicker,
@@ -159,27 +141,10 @@ export function ThreadOverlays({
         visible={preview.visible}
         uris={preview.uris}
         index={preview.index}
-        screenWidth={preview.width}
-        screenHeight={preview.height}
-        insetsTop={preview.topInset}
-        insetsBottom={preview.bottomInset}
         onClose={preview.onClose}
         onIndexChange={preview.onIndexChange}
       />
-      <ModelPickerModal
-        visible={modelPicker.visible}
-        loading={modelPicker.loading}
-        error={modelPicker.error}
-        models={modelPicker.models}
-        providers={modelPicker.providers}
-        onClose={modelPicker.onClose}
-        onRetry={modelPicker.onRetry}
-        onSelectModel={modelPicker.onSelect}
-        defaultModel={modelPicker.defaultModel}
-        defaultProvider={modelPicker.defaultProvider}
-        configuredDefaultModel={modelPicker.configuredDefaultModel}
-        onManage={modelPicker.onManage}
-      />
+      <ModelSheet {...modelSheet} />
       <CommandOptionPickerModal
         visible={commandPicker.visible}
         title={commandPicker.title}

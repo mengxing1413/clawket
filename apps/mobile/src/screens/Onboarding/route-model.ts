@@ -4,6 +4,7 @@ import type {
   ConnectionState,
 } from '@clawket/agent-protocol';
 import type { RelayServiceEnvironment } from '../../types';
+import type { PairingValidationReason } from '../../connection';
 import {
   PAIRING_COMMAND,
   type OnboardingConnectionPhase,
@@ -30,7 +31,6 @@ export type OnboardingWebsiteBackendKind = Exclude<BackendKind, 'local-model'>;
 export const ONBOARDING_WEBSITE_URLS: Readonly<Record<OnboardingWebsiteBackendKind, string>> = Object.freeze({
   openclaw: 'https://openclaw.ai',
   hermes: 'https://hermes-agent.nousresearch.com',
-  youmind: 'https://youmind.com',
   pi: 'https://pi.dev',
   codex: 'https://learn.chatgpt.com/codex',
   'claude-code': 'https://code.claude.com/docs/en/overview',
@@ -56,6 +56,7 @@ export type OnboardingRouteOperation = Readonly<{
   /** Connection created by this pairing, once it exists; null before then. */
   targetConnectionId?: string | null;
   errorCode?: AdapterErrorCode;
+  pairingReason?: PairingValidationReason;
 }>;
 
 export function normalizePairableBackendKind(
@@ -64,7 +65,6 @@ export function normalizePairableBackendKind(
   const normalized: Readonly<Record<BackendKind, PairableBackendKind>> = {
     openclaw: 'openclaw',
     hermes: 'hermes',
-    youmind: 'openclaw',
     'local-model': 'local-model',
     pi: 'pi',
     codex: 'codex',
@@ -113,7 +113,10 @@ export function resolveOnboardingRouteStatus(input: {
   operation: OnboardingRouteOperation;
 }): OnboardingStatus {
   if (input.operation.errorCode) {
-    return { kind: 'error', code: input.operation.errorCode };
+    return {
+      kind: 'error', code: input.operation.errorCode,
+      ...(input.operation.pairingReason ? { pairingReason: input.operation.pairingReason } : {}),
+    };
   }
   if (!input.initialized && !input.operation.active) return { kind: 'loading' };
   if (!input.operation.active) return { kind: 'idle' };

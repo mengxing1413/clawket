@@ -3,6 +3,7 @@ import type {
   Capabilities,
   SessionActions,
   SessionDescriptor,
+  SessionActivity,
 } from '@clawket/agent-protocol';
 
 import type { RosterConnectionGroup } from '../../connection';
@@ -13,7 +14,7 @@ import {
   type SessionBoardStatus,
 } from './list-model';
 
-export type SessionPanelAction = keyof SessionActions | 'export';
+export type SessionPanelAction = keyof SessionActions | 'export' | 'copy_id';
 export type SessionPanelRenamePayload = Readonly<{
   title: string;
 }>;
@@ -27,12 +28,15 @@ export type SessionPanelPageState =
 
 export type SessionPanelRow = SessionBoardRow & Readonly<{
   project?: SessionDescriptor['project'];
+  sessionId?: string;
+  archived?: boolean;
   id: string;
   connectionId: string;
   agentId: string;
   agentName: string;
   channel: string | null;
   hasActiveRun: boolean;
+  activityState?: SessionActivity['state'];
   attention: Exclude<SessionDescriptor['attention'], undefined>;
   source: Exclude<SessionDescriptor['source'], undefined> | null;
   allowedActions: SessionActions;
@@ -111,6 +115,8 @@ export function buildSessionPanelRows(
   options?: Readonly<{
     now?: number;
     recentFirst?: boolean;
+    live?: boolean;
+    runActivities?: ReadonlyArray<{ connectionId: string; sessionKey: string }>;
     pinnedSessionKeys?: Readonly<Record<string, ReadonlyArray<string>>>;
   }>,
 ): ReadonlyArray<SessionPanelRow> {
@@ -129,13 +135,15 @@ export function buildSessionPanelRows(
       return [{
         ...board,
         project: session.project,
+        sessionId: session.sessionId,
+        archived: session.archived,
         id: `${session.connectionId}:${session.agentId}:${session.key}`,
         connectionId: session.connectionId,
         agentId: session.agentId,
         agentName: summary.agent.name,
         channel: session.channel?.trim() || null,
-        hasActiveRun: session.hasActiveRun,
-        attention: session.attention ?? null,
+        hasActiveRun: (options?.live ?? group.source === 'live') && (session.hasActiveRun || Boolean(options?.runActivities?.some(activity => activity.connectionId === session.connectionId && activity.sessionKey === session.key))),
+        attention: (options?.live ?? group.source === 'live') ? session.attention ?? null : session.attention === 'error' ? 'error' : null,
         source: session.source ?? null,
         allowedActions: { ...session.allowedActions },
         pinned: pinnedKeys.has(session.key),
@@ -244,13 +252,16 @@ export function availableSessionActions(
   capabilities: Pick<
     Capabilities,
     'sessionRename' | 'sessionReset' | 'sessionDelete'
-  >,
+  > & Partial<Pick<Capabilities, 'sessionArchive'>>,
 ): ReadonlyArray<SessionPanelAction> {
-  const actions: SessionPanelAction[] = row.hasActiveRun ? [] : ['export'];
+  const actions: SessionPanelAction[] = row.hasActiveRun || row.archived ? [] : ['export'];
+  if (row.sessionId) actions.push('copy_id');
+  if (!row.hasActiveRun && row.allowedActions.archive && capabilities.sessionArchive) actions.push('archive');
+  if (row.archived) return actions;
   if (row.allowedActions.pin) actions.push('pin');
   if (row.allowedActions.rename && capabilities.sessionRename) actions.push('rename');
   if (row.allowedActions.reset && capabilities.sessionReset) actions.push('reset');
-  if (row.allowedActions.delete && capabilities.sessionDelete) actions.push('delete');
+  if (row.allowedActions.delete && capabilities.sessionDelete && !(row.allowedActions.archive && capabilities.sessionArchive)) actions.push('delete');
   return actions;
 }
 
@@ -291,4 +302,21 @@ export function resolveSessionPanelPageState(input: Readonly<{
     return input.awaitingSessions && opening ? 'loading' : 'empty';
   }
   return 'ready';
+}
+
+/** Fresh activity overlays never modify the catalog, timestamps or persisted descriptors. */
+export function applySessionPanelActivity(rows: ReadonlyArray<SessionPanelRow>, activity: ReadonlyMap<string, SessionActivity>): ReadonlyArray<SessionPanelRow> {
+  return rows.map(row => {
+    const value = activity.get(row.key);
+    if (!value) return row;
+    return { ...row, activityState: value.state,
+      hasActiveRun: value.state === 'unknown' ? row.hasActiveRun : value.state === 'running' || value.state === 'waiting',
+      attention: value.attention ? value.attention : row.attention === 'error' ? 'error'
+        : value.attention === null || value.state === 'idle' || value.state === 'running' ? null : row.attention };
+  });
+}
+
+export function sessionPanelRowWorking(row: SessionPanelRow): boolean {
+  return row.hasActiveRun && row.activityState !== 'unknown' && row.activityState !== 'waiting'
+    && row.attention !== 'input' && row.attention !== 'approval' && !row.archived;
 }

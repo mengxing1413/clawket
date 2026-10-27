@@ -3,6 +3,7 @@ import type { BackendKind, DmScope, SessionKind, TransportKind } from '@clawket/
 import { normalizeAnalyticsEventString } from './event-property-normalizers';
 import { posthogClient, recordPostHogDiagnosticEvent } from './posthog';
 import { getAnalyticsSubscriptionProperties } from './subscription-context';
+import type { ConnectionDiagnosticEvent } from '../connection-diagnostics';
 
 type AnalyticsValue = boolean | number | string | null | undefined;
 type AnalyticsProperties = Record<string, AnalyticsValue>;
@@ -65,7 +66,9 @@ export const ANALYTICS_EVENT_PROPERTY_WHITELIST = Object.freeze({
   connect_phase: ['protocol', 'route', 'phase', 'elapsed_ms', 'phase_ms', 'attempt'],
   connect_ready: ['backend', 'transport', 'elapsed_ms', 'attempt'],
   connect_failed: ['backend', 'transport', 'code', 'stage', 'attempt'],
-  reconnect: ['backend', 'transport', 'reason'],
+  connection_diagnostic: ['backend', 'transport', 'operation', 'environment', 'detected_backend', 'detected_environment', 'outcome', 'phase', 'code', 'http_status', 'elapsed_ms', 'network', 'evidence'],
+  transport_diagnostic: ['backend', 'transport', 'environment', 'event', 'phase', 'code', 'close_code', 'elapsed_ms'],
+  reconnect: ['backend', 'transport', 'reason', 'origin', 'cause'],
   roster_viewed: ['connection_count', 'agent_count', 'pinned_count', 'unread_count', 'attention_count'],
   roster_row_opened: ['kind', 'unread', 'attention', 'locked', 'cached'],
   roster_pin_toggled: ['action', 'kind'],
@@ -180,10 +183,8 @@ export const ANALYTICS_EVENT_PROPERTY_WHITELIST = Object.freeze({
   release_notes_opened: ['release_count'],
   grace_banner_viewed: ['days_left'],
   grace_expired: ['days_left'],
-  youmind_sign_in_tapped: ['method', 'source'],
-  youmind_sign_in_resolved: ['method', 'result', 'source'],
-  sprite_greeting_sent: [],
   app_rating_tapped: ['source', 'result'],
+  app_review_request: ['outcome', 'reason'],
 
   // Existing, still-supported product telemetry referenced by 04-app-screens.
   chat_skill_picker_opened: ['source', 'session_key_present', 'skill_count'],
@@ -217,6 +218,7 @@ export const ANALYTICS_EVENT_PROPERTY_WHITELIST = Object.freeze({
   chat_appearance_opened: ['source'],
   chat_appearance_saved: [
     'source',
+    'wallpaper_kind',
     'has_background_image',
     'bubble_style',
     'bubble_opacity',
@@ -249,6 +251,10 @@ export function sanitizeAnalyticsEventProperties(
   ]);
   return Object.entries(properties).reduce<Record<string, boolean | number | string>>((result, [key, value]) => {
     if (!allowed.has(key) || !isSafeAnalyticsValue(value)) return result;
+    if (event === 'transport_diagnostic' && key === 'close_code'
+      && (typeof value !== 'number' || !Number.isInteger(value) || value < 1000 || value > 4999)) return result;
+    if (event === 'transport_diagnostic' && key === 'elapsed_ms'
+      && (typeof value !== 'number' || value < 0 || value > 86_400_000)) return result;
     result[key] = typeof value === 'string'
       ? normalizeAnalyticsEventString(event, key, value)
       : value;
@@ -275,7 +281,6 @@ function buildPaywallPackageProperties(pkg: PaywallPackageSummary): AnalyticsPro
 
 function legacyBackend(mode: string | undefined): AnalyticsBackend | undefined {
   if (mode === 'hermes') return 'hermes';
-  if (mode === 'https') return 'youmind';
   if (mode === 'relay' || mode === 'local' || mode === 'tailscale' || mode === 'cloudflare' || mode === 'custom') {
     return 'openclaw';
   }
@@ -283,7 +288,7 @@ function legacyBackend(mode: string | undefined): AnalyticsBackend | undefined {
 }
 
 function legacyTransport(mode: string | undefined): AnalyticsTransport | undefined {
-  if (mode === 'relay' || mode === 'local' || mode === 'tailscale' || mode === 'cloudflare' || mode === 'custom' || mode === 'https') {
+  if (mode === 'relay' || mode === 'local' || mode === 'tailscale' || mode === 'cloudflare' || mode === 'custom') {
     return mode;
   }
   return undefined;
@@ -358,6 +363,14 @@ export const analyticsEvents = {
     captureAnalyticsEvent('connect_attempt', properties);
   },
 
+  connectionDiagnostic(properties: ConnectionDiagnosticEvent): void {
+    captureAnalyticsEvent('connection_diagnostic', properties);
+  },
+
+  transportDiagnostic(properties: import('../transport-diagnostics').TransportDiagnosticEvent): void {
+    captureAnalyticsEvent('transport_diagnostic', properties);
+  },
+
   connectReady(properties: {
     backend: AnalyticsBackend;
     transport: AnalyticsTransport;
@@ -381,7 +394,7 @@ export const analyticsEvents = {
     backend: AnalyticsBackend;
     transport: AnalyticsTransport;
     reason: 'tick_timeout' | 'socket_close' | 'probe_failed' | 'seq_gap' | 'foreground';
-  }): void {
+  } & Partial<import('../transport-diagnostics').ReconnectDiagnostic>): void {
     captureAnalyticsEvent('reconnect', properties);
   },
 
@@ -527,7 +540,7 @@ export const analyticsEvents = {
     });
   },
 
-  sessionAction(properties: { action: 'pin' | 'rename' | 'reset' | 'delete' | 'create' | 'export' }): void {
+  sessionAction(properties: { action: 'pin' | 'rename' | 'reset' | 'delete' | 'create' | 'export' | 'copy_id' | 'archive' }): void {
     captureAnalyticsEvent('session_action', properties);
   },
 
@@ -641,20 +654,11 @@ export const analyticsEvents = {
     captureAnalyticsEvent('grace_expired', properties);
   },
 
-  youMindSignInTapped(properties: { method: 'email'; source: string }): void {
-    captureAnalyticsEvent('youmind_sign_in_tapped', properties);
-  },
-
-  youMindSignInResolved(properties: {
-    method: 'email';
-    result: 'success' | 'failure' | 'cancel';
-    source: string;
+  appReviewRequest(properties: {
+    outcome: 'requested' | 'skipped' | 'unavailable' | 'error';
+    reason: 'eligible' | 'experience' | 'stale' | 'cooldown' | 'annual_limit' | 'version' | 'native' | 'operation';
   }): void {
-    captureAnalyticsEvent('youmind_sign_in_resolved', properties);
-  },
-
-  spriteGreetingSent(): void {
-    captureAnalyticsEvent('sprite_greeting_sent');
+    captureAnalyticsEvent('app_review_request', properties);
   },
 
   appRatingTapped(properties: {
@@ -861,6 +865,8 @@ export const analyticsEvents = {
 
   chatAppearanceSaved(properties: {
     source: string;
+    /** `pattern`, `photo` or `plain`. */
+    wallpaper_kind: string;
     has_background_image: boolean;
     bubble_style: string;
     bubble_opacity: number;

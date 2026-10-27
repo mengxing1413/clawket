@@ -2,10 +2,21 @@
 
 The owner approved compact, icon-led tool rows with optional consecutive-call grouping, plus independent scheduled events without the thick rail. This supersedes the old RunCard rail recipe in `05-visual-system.md`; it does not change backend capabilities or tool execution.
 
-## Implementation
+> **Superseded in part by the A+ chat design (owner decision 2026-09-30).** Tool rows and inline expansion are replaced by three centred pills and a work record sheet; see "A+ tool pills" below. Grouping identity and reconciliation rules still apply.
+>
+> **The pills are retired by tool process design C (owner decisions 2026-10-02 and 2026-10-05).** A running turn's steps live in the work dock above the composer, and every finished turn leaves one receipt chip: on its last reply, or in an Agent bubble of its own when it said nothing. No tool or working state is a centred pill in the conversation. Current rules: `apps/mobile/AGENTS.md`.
 
-- `ToolCallRow` owns the 44-point tool row, shared category icons, localized action names, optional single-line argument preview, running/failure feedback, and detail-sheet entry.
-- Consecutive calls have a stable group identity derived from the oldest call. Expanding reveals individual rows; arrivals and completion do not reset expansion. Prose, dates, scheduled results, errors, approvals, and media break groups.
+## A+ tool pills — 2026-09-30
+
+- `groupThreadTools` folds every run of adjacent calls into one `tools` row, including a single call. A failed call, or one carrying media, stands alone; approvals stay messages; prose and dates break runs. The row key stays `tools:<oldest render key>` so live-to-history id swaps keep it.
+- `ToolActivityPill` renders the row as one of three pills: running (spinner, the current step's verb and command/path/query in monospace, elapsed seconds), finished (a verb-first summary of at most two kinds with distinct files counted once, plus the wall-clock span when at least one second), or failed (red, "`command` failed").
+- Every pill opens `WorkRecordSheet` for the turn around it (the calls between the user's prompt before it and the next prompt), oldest first; a step opens `ToolDetailModal` pushed over the sheet. The sheet follows the turn by render key and closes when the turn disappears. Nothing expands inside the timeline, so opening a record never moves the list.
+- Summary logic (`tool-activity-model.ts`) is pure and unit-tested; the phrase tables are registered as dynamic i18n origins.
+
+## Implementation (2026-09-06)
+
+- `ToolCallRow` owned the 44-point tool row, shared category icons, localized action names, optional single-line argument preview, running/failure feedback, and detail-sheet entry. (Replaced by `ToolActivityPill` on 2026-09-30.)
+- Consecutive calls have a stable group identity derived from the oldest call. Expanding revealed individual rows (removed 2026-09-30); arrivals and completion did not reset expansion. Prose, dates, scheduled results, errors, approvals, and media break groups.
 - `RunCard` now presents scheduled/subagent results with category icons and no decorative rail. Full titles may wrap; time, failure text, navigation, and log actions remain available.
 - Gateway history reconciliation deduplicates cached IDs and matches tool call identity independently of missing timestamps. Untimed cached activity precedes the authoritative snapshot instead of being appended after fresh messages. ISO timestamps and OpenClaw history IDs are normalized at the adapter boundary.
 
@@ -13,7 +24,7 @@ The owner approved compact, icon-led tool rows with optional consecutive-call gr
 
 OpenClaw `chat` delta `message.content` contains the whole run so far (confirmed in the local Gateway's `server-chat.ts`); Hermes Bridge emits the next delta. Clearing the visible tail at a tool boundary and guessing from string prefixes made each OpenClaw bubble repeat all earlier paragraphs, while equal Hermes tokens could disappear. Completed presentation preservation then kept the corrupt cumulative rows alongside canonical split history.
 
-Adapters now declare additive `agent_message_chunk.textMode`: OpenClaw `snapshot`, Hermes/YouMind/local-model `delta`. The controller replaces snapshots, appends deltas verbatim, and removes only the ordered committed prefix before displaying a snapshot tail. Undeclared adapters retain legacy handling. Replayed tool starts cannot create another text boundary. Live text and tools use the same current-user-turn reconciliation as completed rows, including partially persisted text and aggregate history; completed turns are not reprocessed on every token. A recovery snapshot rebuilds known text/tool boundaries, leaving the still-growing final message live. Old cumulative local rows are corrected only when that turn's canonical split history confirms the isolated paragraph; actual repeated transcript text remains valid.
+Adapters now declare additive `agent_message_chunk.textMode`: OpenClaw `snapshot`, Hermes/local-model `delta`. The controller replaces snapshots, appends deltas verbatim, and removes only the ordered committed prefix before displaying a snapshot tail. Undeclared adapters retain legacy handling. Replayed tool starts cannot create another text boundary. Live text and tools use the same current-user-turn reconciliation as completed rows, including partially persisted text and aggregate history; completed turns are not reprocessed on every token. A recovery snapshot rebuilds known text/tool boundaries, leaving the still-growing final message live. Old cumulative local rows are corrected only when that turn's canonical split history confirms the isolated paragraph; actual repeated transcript text remains valid.
 
 Regression coverage follows cumulative multi-tool output through every visible stage, active history refresh, final/abort/error, replayed events, shorter corrected snapshots, repeated delta tokens, recovery boundaries and confirmed old-row repair. This is an App-only fix; no Gateway, Hermes source, Bridge, Relay, pairing or connection lifecycle change is required. Device acceptance is tracked as HT-STREAM-0920 in `PROGRESS.md`.
 

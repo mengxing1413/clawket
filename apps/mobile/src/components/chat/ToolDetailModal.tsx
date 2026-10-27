@@ -28,6 +28,10 @@ type Props = {
   startedAtMs?: number;
   finishedAtMs?: number;
   usage?: MessageUsage;
+  /** What the Agent said the call is for (`resolveToolTitle`); heads the sheet over the tool's name. */
+  stepTitle?: string;
+  /** `push` rises over the work record sheet and returns to it on close. */
+  stackBehavior?: 'push' | 'replace' | 'switch';
 };
 
 function PayloadSection({ label, raw, testID }: { label: string; raw: string; testID: string }) {
@@ -76,11 +80,14 @@ export function ToolDetailModal(props: Props): React.JSX.Element {
   const s = visible ? props : snapshot.current;
   const [expanded, setExpanded] = useState(false);
   useEffect(() => { if (visible) setExpanded(false); }, [visible, s.name, s.startedAtMs]);
-  const title = formatToolDisplayName(s.name, t);
+  const toolLabel = formatToolDisplayName(s.name, t);
+  const title = s.stepTitle ?? toolLabel;
+  const tag = s.stepTitle ? toolLabel : undefined;
   const duration = s.status === 'running' ? undefined : formatToolDuration(s.durationMs);
   const statusLabel = s.status === 'running' ? t('Running') : s.status === 'error' ? t('Failed') : s.status === 'unknown' ? t('Result unavailable') : t('Completed');
   const StateIcon = s.status === 'error' || s.status === 'unknown' ? CircleAlert : Check;
-  const stateColor = s.status === 'error' ? theme.colors.bad : theme.colors.inkSecondary;
+  // A failed step reads like any other; its status says so (owner decision 2026-10-06: no red).
+  const stateColor = theme.colors.inkSecondary;
   const date = (ms?: number) => typeof ms === 'number' && Number.isFinite(ms) && ms > 0
     ? new Intl.DateTimeFormat(i18n.language, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(ms)
     : undefined;
@@ -94,7 +101,8 @@ export function ToolDetailModal(props: Props): React.JSX.Element {
     titleContent={<View style={styles.heading}>
       <Text accessibilityRole="header" numberOfLines={1} style={styles.title}>{title}</Text>
       <View style={styles.statusRow} testID="tool-detail-header-status" accessible
-        accessibilityLabel={[statusLabel, duration].filter(Boolean).join(' · ')} accessibilityLiveRegion="polite">
+        accessibilityLabel={[tag, statusLabel, duration].filter(Boolean).join(' · ')} accessibilityLiveRegion="polite">
+        {tag ? <Text numberOfLines={1} style={styles.caption} testID="tool-detail-tool-name">{`${tag} ·`}</Text> : null}
         <View style={styles.state}>
           {s.status === 'running' ? <ActivityIndicator size="small" color={stateColor} /> : <StateIcon size={IconSize.sm} color={stateColor} />}
           <Text style={[styles.caption, styles.stateLabel, { color: stateColor }]}>{statusLabel}</Text>
@@ -102,7 +110,7 @@ export function ToolDetailModal(props: Props): React.JSX.Element {
         {duration ? <Text numberOfLines={1} style={styles.caption} testID="tool-detail-duration">{`· ${duration}`}</Text> : null}
       </View>
     </View>}
-    closeAccessibilityLabel={t('Close', { ns: 'common' })} snapPoints={SNAP_POINTS} testID="tool-detail-sheet">
+    closeAccessibilityLabel={t('Close', { ns: 'common' })} snapPoints={SNAP_POINTS} stackBehavior={props.stackBehavior} testID="tool-detail-sheet">
     <BottomSheetScrollView testID="tool-detail-scroll" contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
       {s.args?.trim() ? <PayloadSection key={`input-${s.name}-${s.startedAtMs}`} label={t('Input')} raw={s.args} testID="tool-detail-input" /> : null}
       {s.detail?.trim() ? <PayloadSection key={`output-${s.name}-${s.startedAtMs}`} label={t('Output')} raw={s.detail} testID="tool-detail-output" />

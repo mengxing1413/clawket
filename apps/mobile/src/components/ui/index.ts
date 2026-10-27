@@ -21,8 +21,6 @@ export { SystemEventRow } from './SystemEventRow';
 export type { SystemEventRowProps } from './SystemEventRow';
 export { Skeleton } from './Skeleton';
 export type { SkeletonProps } from './Skeleton';
-export { TypingDots } from './TypingDots';
-export type { TypingDotsProps } from './TypingDots';
 export { Banner } from './Banner';
 export type { BannerProps, BannerTone } from './Banner';
 export { ConnectionStatusPill } from './ConnectionStatusPill';
@@ -57,6 +55,8 @@ export {
 export type { SheetHeaderProps } from './SheetHeader';
 export { SheetHeaderButton } from './SheetHeaderButton';
 export type { SheetHeaderButtonProps } from './SheetHeaderButton';
+export { SheetHeaderSpinner } from './SheetHeaderSpinner';
+export type { SheetHeaderSpinnerProps } from './SheetHeaderSpinner';
 export { ThemedFullWindowOverlay } from './ThemedFullWindowOverlay';
 export { Button } from './Button';
 export type { ButtonSize, ButtonVariant } from './Button';

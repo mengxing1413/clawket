@@ -1,7 +1,9 @@
+import { originalRunUserIndex } from './turnIdentity';
 import { sameLiveToolCall, withToolMessage } from './liveToolMessages';
-import { hasBackendEcho, rememberUncertainSend, recoverUncertainSends, useUncertainSends } from './sendRecovery';
+import { hasBackendEcho, rememberUncertainSend, recoverUncertainSends, reconcilePromptReceipts, useUncertainSends } from './sendRecovery';
 import { describeReplyFailure, sanitizeReplyFailure } from './reply-failure';
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { triggerSendHaptic, triggerSuccessHaptic, triggerWarningHaptic } from '../services/haptics';
+import { useCallback, useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import {
   AppState,
   AppStateStatus,
@@ -14,9 +16,11 @@ import * as Haptics from "expo-haptics";
 import * as Network from "expo-network";
 import { useTranslation } from "react-i18next";
 import {
+  AdapterError,
   isImageAttachmentMimeType,
   normalizeAttachmentMimeType,
   supportsFileAttachments,
+  LocalSendRejectedError,
   type AgentAdapter,
   type AgentDescriptor,
   type ConnectionState as AdapterConnectionState,
@@ -34,7 +38,7 @@ import * as DocumentPicker from "expo-document-picker";
 
 import { useChatImagePreview } from "../hooks/useChatImagePreview";
 import { analyticsEvents } from "../services/analytics/events";
-import { recordSuccessfulSendForAutomaticReview } from "../services/auto-app-review";
+import { recordCompletedTurnForAutomaticReview } from "../services/auto-app-review";
 import { cacheMessageImages } from "../services/image-cache";
 import { StorageService } from "../services/storage";
 import { ConnectionState, SessionInfo } from "../types";
@@ -50,6 +54,8 @@ import { useChatAutoCache } from "../hooks/useChatAutoCache";
 import { APPROVE_COMMAND, HISTORY_PAGE_SIZE, MAX_IMAGES } from "./constants";
 import type { ChatControllerOptions } from "./types";
 import { useAppContext } from "../contexts/AppContext";
+import { onAdapterPathRecovered, recoverAdapterConnection } from '../connection/adapter-recovery';
+import { onSessionReset } from '../connection/session-reset';
 import {
   AgentActivity,
   agentIdFromSessionKey,
@@ -76,18 +82,24 @@ import {
   liveReplyRenderKey,
   finalReplyTail,
   recoverLiveRunPresentation,
+  extendRecoveredLiveRun,
   finishLiveRunPresentation,
   mergeNewestFirstMessages,
+  replyTextSegments,
   StreamSegment,
 } from "./liveRunThread";
 import {
   clearSessionRunState,
   markSessionRunDelta,
   markSessionRunStarted,
+  rememberSessionRunIdentity,
+  rememberSessionRunTool,
   SessionRunState,
+  settleSessionRunTool,
 } from "./sessionRunState";
 import { shouldAdoptPendingOptimisticRunId } from "./pendingOptimisticRun";
-import { preserveMessagePresentation, preserveOptimisticAssistantMessage, retireAliasedTools } from "./historyMergePolicy";
+import { validTurnIdentity, type RunWorkIdentity } from './turnIdentity';
+import { preserveApprovalRows, preserveMessagePresentation, preserveOptimisticAssistantMessage, preserveToolTiming, reconcileAcceptedSteeringMessage, retireAliasedTools } from "./historyMergePolicy";
 import {
   FOREGROUND_REFRESH_AFTER_RECONNECT_TIMEOUT_MS,
   getForegroundRefreshDelayMs,
@@ -96,6 +108,7 @@ import {
 import {
   formatToolActivity,
   formatToolOneLinerLocalized,
+  unwrapToolCall,
 } from "../utils/tool-display";
 import { useChatVoiceInput } from "./useChatVoiceInput";
 import { useChatModelPicker } from "./useChatModelPicker";
@@ -131,6 +144,9 @@ import {
   type PairApprovalEntry,
 } from "../connection/pair-approval-store";
 
+/** Finished steps whose times this phone measured, newest last; enough for several long turns. */
+const MEASURED_TOOL_LIMIT = 200;
+
 type SilentCommandProbe = {
   sessionKey: string;
   latestText: string;
@@ -158,6 +174,18 @@ function mapAdapterConnectionState(state: AdapterConnectionState): ConnectionSta
   }
 }
 
+/** Conversation haptics play only for the conversation in front of an active app, never from the background. */
+function conversationHapticsAllowed(focusedRef: { current: boolean }): boolean {
+  return focusedRef.current && AppState.currentState === 'active';
+}
+
+/** One closing beat per run: OpenClaw reports a failed run as an error and then as a finished run. */
+function playRunEndHaptic(runId: string, endedRunRef: { current: string | null }, play: () => void): void {
+  if (endedRunRef.current === runId) return;
+  endedRunRef.current = runId;
+  play();
+}
+
 function mapAdapterAgent(agent: AgentDescriptor) {
   return {
     connectionId: agent.connectionId,
@@ -169,6 +197,10 @@ function mapAdapterAgent(agent: AgentDescriptor) {
       avatarUrl: agent.avatarUrl,
     },
   };
+}
+
+function validStreamTimestamp(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 8.64e15 ? value : undefined;
 }
 
 function latestVisibleAssistant(history: SessionHistory): {
@@ -188,9 +220,7 @@ function latestVisibleAssistant(history: SessionHistory): {
 }
 
 function reconnectAdapter(adapter: AgentAdapter | null): void {
-  if (!adapter) return;
-  adapter.disconnect();
-  void adapter.connect().catch(() => undefined);
+  void recoverAdapterConnection(adapter).catch(() => undefined);
 }
 
 function mergeStreamText(previous: string | null, incoming: string, textMode?: 'snapshot' | 'delta'): string {
@@ -231,16 +261,14 @@ function shouldMergeFinalMessage(
 export function useChatController({
   readOnly = false,
   adapter,
+  routeConnectionId,
+  routeAgentId,
   routeSessionKey,
   debugMode,
   showAgentAvatar,
   chatSessionRequest,
   clearChatSessionRequest,
 }: ChatControllerOptions) {
-  const attachmentScope = `${adapter?.connection.id ?? ''}:${routeSessionKey ?? ''}`;
-  const attachmentScopeRef = useRef<string | null>(attachmentScope);
-  attachmentScopeRef.current = attachmentScope;
-  useEffect(() => { attachmentScopeRef.current = attachmentScope; return () => { attachmentScopeRef.current = null; }; }, [attachmentScope]);
   const readOnlyRef = useRef(readOnly);
   readOnlyRef.current = readOnly;
   const appContext = useAppContext();
@@ -248,7 +276,12 @@ export function useChatController({
   const [connectionState, setConnectionState] = useState<ConnectionState>(
     adapter ? mapAdapterConnectionState(adapter.state) : "idle",
   );
-  const [input, setInput] = useState("");
+  const [input, setInputState] = useState("");
+  const inputRevisionRef = useRef(0);
+  const setInput = useCallback((next: SetStateAction<string>) => {
+    inputRevisionRef.current += 1;
+    setInputState(next);
+  }, []);
   const [sendFailure, setSendFailureMessage] = useState<string | null>(null);
   const [sendFailureDetails, setSendFailureDetails] = useState<string | null>(null);
   const uncertainFailureRef = useRef<{ scope: string | null; message: UiMessage } | null>(null);
@@ -278,88 +311,6 @@ export function useChatController({
     useState(false);
   const [staticThinkPickerVisible, setStaticThinkPickerVisible] =
     useState(false);
-  const {
-    pendingImages,
-    setPendingImages,
-    pickImage,
-    attachLocalImages,
-    clearPendingImages,
-    removePendingImage,
-    canAddMoreImages,
-  } = useChatImagePicker(MAX_IMAGES, attachmentScope);
-  const {
-    onPasteFiles,
-    onPasteFailed,
-  } = useChatPasteAttachments({
-    pendingAttachments: pendingImages,
-    setPendingAttachments: setPendingImages,
-    maxAttachments: MAX_IMAGES,
-    capabilities: adapter?.capabilities,
-  });
-
-  const pickFile = useCallback(async () => {
-    if (!supportsFileAttachments(adapter?.capabilities)) return;
-    const result = await DocumentPicker.getDocumentAsync({
-      copyToCacheDirectory: true,
-      multiple: false,
-    });
-    if (result.canceled || !result.assets?.length) return;
-    const asset = result.assets[0];
-    if (!asset.uri) return;
-    try {
-      const b64 = await readFileAsBase64(asset.uri);
-      const img = {
-        uri: asset.uri,
-        base64: b64,
-        mimeType: normalizeAttachmentMimeType(asset.mimeType),
-        fileName: asset.name,
-      };
-      setPendingImages((prev: PendingImage[]) =>
-        [...prev, img].slice(0, MAX_IMAGES),
-      );
-    } catch {
-      /* skip */
-    }
-  }, [adapter?.capabilities, setPendingImages]);
-
-  const takePhoto = useCallback(async () => {
-    const IP = await import("expo-image-picker");
-    if (attachmentScopeRef.current !== attachmentScope || !canAddMoreImages) return;
-    const res = isMacCatalyst
-      ? await IP.launchImageLibraryAsync({
-        mediaTypes: ["images"],
-        allowsMultipleSelection: false,
-        quality: 0.8,
-        base64: true,
-        exif: false,
-      })
-      : await (async () => {
-        const perm = await IP.requestCameraPermissionsAsync();
-        if (!perm.granted || attachmentScopeRef.current !== attachmentScope) return { canceled: true, assets: [] };
-        return IP.launchCameraAsync({
-          quality: 0.8,
-          base64: true,
-          exif: false,
-        });
-      })();
-    if (attachmentScopeRef.current !== attachmentScope) return;
-    if (!res.canceled && res.assets?.[0]?.base64) {
-      const a = res.assets[0];
-      setPendingImages((prev: PendingImage[]) =>
-        [
-          ...prev,
-          {
-            uri: a.uri,
-            base64: a.base64!,
-            mimeType: normalizeAttachmentMimeType(a.mimeType, "image/jpeg"),
-            width: a.width,
-            height: a.height,
-          },
-        ].slice(0, MAX_IMAGES),
-      );
-    }
-  }, [setPendingImages, attachmentScope, canAddMoreImages]);
-
   const preview = useChatImagePreview();
   const showDebug = debugMode ?? false;
   const { logs: debugLog, appendDebugLog: dbg } = useBufferedDebugLog(showDebug);
@@ -373,15 +324,23 @@ export function useChatController({
   const sendPreflightInFlightRef = useRef(false);
   const sendTriggerGuardRef = useRef(false);
 
+  const [nativeRunIdentityEpoch, setNativeRunIdentityEpoch] = useState(0);
   const [chatStream, setChatStream] = useState<string | null>(null);
+  const [chatStreamTimestampMs, setChatStreamTimestampMs] = useState<number | null>(null);
+  const chatStreamTimestampRef = useRef<number | null>(null);
   const [chatStreamSegments, setChatStreamSegments] = useState<StreamSegment[]>(
     [],
   );
   const [chatToolMessages, setChatToolMessages] = useState<UiMessage[]>([]);
   const currentRunIdRef = useRef<string | null>(null);
   const chatStreamRef = useRef<string | null>(null);
+  // The commentary item the live tail shows; null while the tail is reply text.
+  const liveCommentaryItemRef = useRef<string | null>(null);
   const chatStreamSegmentsRef = useRef<StreamSegment[]>([]);
   const chatToolMessagesRef = useRef<UiMessage[]>([]);
+  // Outlives the live rows: Codex, Claude Code and Pi history carries no step
+  // timing, and its reloads land before and after the live rows are cleared.
+  const measuredToolsRef = useRef<UiMessage[]>([]);
   const streamStartedAtRef = useRef<number | null>(null);
   const lastRunSignalAtRef = useRef(0);
   const lastRunRecoveryProbeAtRef = useRef(0);
@@ -439,14 +398,15 @@ export function useChatController({
   const silentCommandProbesRef = useRef<Map<string, SilentCommandProbe>>(new Map());
 
 
-  // Pending run inactivity timeout: if no events arrive for this duration
-  // while isSending is true, force-clear the stuck state.
+  // Quiet runs need verification, never a synthetic completion. A missing
+  // response can mean a disconnected transport or a tool still running.
   const PENDING_RUN_INACTIVITY_MS = 22_000;
   const HISTORY_COMPLETION_IDLE_MS = 8_000;
   const POST_STREAM_HISTORY_REFRESH_DELAY_MS = 300;
   const RUN_RECOVERY_MIN_INTERVAL_MS = 1_500;
   const HISTORY_RELOAD_MIN_INTERVAL_MS = 1_500;
   const ORPHAN_RUNNING_TOOL_GRACE_MS = 20_000;
+  const requestPendingRunRecoveryRef = useRef<((key: string, reason: string) => Promise<void>) | null>(null);
   const SEND_FAST_PROBE_TIMEOUT_MS = 1500;
   const SEND_HEALTH_WINDOW_MS = 3_000;
   const SEND_FORCE_PROBE_GRACE_MS = 8_000;
@@ -486,17 +446,22 @@ export function useChatController({
         return;
       }
       chatStreamRef.current = null;
+      liveCommentaryItemRef.current = null;
       setChatStream(null);
+      chatStreamTimestampRef.current = null;
+      setChatStreamTimestampMs(null);
     },
     [],
   );
 
   const commitCurrentStreamSegment = useCallback((timestampMs?: number) => {
     const currentText = chatStreamRef.current ?? "";
+    const commentaryItemId = liveCommentaryItemRef.current;
+    liveCommentaryItemRef.current = null;
     if (!currentText.trim()) {
       return;
     }
-    const ts = timestampMs ?? Date.now();
+    const ts = timestampMs ?? chatStreamTimestampRef.current ?? Date.now();
     const startedAt = streamStartedAtRef.current;
     const runId = currentRunIdRef.current;
     const previous = chatStreamSegmentsRef.current;
@@ -505,11 +470,17 @@ export function useChatController({
       ...(runId ? { renderKey: liveReplyRenderKey(startedAt, runId, previous.length) } : {}),
       text: currentText, timestampMs: ts,
       afterToolCount: chatToolMessagesRef.current.length,
+      ...(commentaryItemId ? { commentaryItemId } : {}),
     }];
     chatStreamSegmentsRef.current = next;
     setChatStreamSegments(next);
     chatStreamRef.current = null;
     setChatStream(null);
+    chatStreamTimestampRef.current = null;
+    setChatStreamTimestampMs(null);
+    const key = sessionKeyRef.current;
+    const remembered = key ? sessionRunStateRef.current.get(key) : undefined;
+    if (remembered?.runId === runId) remembered.streamTimestampMs = undefined;
   }, []);
 
   const armPendingRunTimeout = useCallback(() => {
@@ -525,23 +496,14 @@ export function useChatController({
         schedule(PENDING_RUN_INACTIVITY_MS - quietMs);
         return;
       }
-      if (showDebug)
-        dbg(
-          `[isSending] → false | reason=pendingRunTimeout (${PENDING_RUN_INACTIVITY_MS}ms inactivity) | runId=${currentRunIdRef.current?.slice(0, 8)}`,
-        );
       const sessionKey = sessionKeyRef.current;
       if (sessionKey) {
-        sessionRunStateRef.current.delete(sessionKey);
-        pendingOptimisticRunIdsRef.current.delete(sessionKey);
+        void requestPendingRunRecoveryRef.current?.(sessionKey, "quiet-run").catch(() => {});
       }
-      currentRunIdRef.current = null;
-      streamStartedAtRef.current = null;
-      clearTransientRunPresentation();
-      setIsSending(false);
-      setActivityLabel(null);
+      schedule(PENDING_RUN_INACTIVITY_MS);
     }, delayMs); };
     schedule(PENDING_RUN_INACTIVITY_MS);
-  }, [clearPendingRunTimeout, clearTransientRunPresentation]);
+  }, [clearPendingRunTimeout]);
 
   const {
     initialChatPreview,
@@ -570,9 +532,106 @@ export function useChatController({
     currentAgentId,
     initialPreview: initialChatPreview,
     routeSessionKey,
+    measuredToolsRef,
   });
 
+  const attachmentScope = JSON.stringify([
+    routeConnectionId ?? gatewayConfigId ?? '',
+    routeAgentId ?? currentAgentId,
+    routeSessionKey ?? history.sessionKey ?? '',
+  ]);
+  const {
+    pendingImages,
+    setPendingImages,
+    pickImage,
+    attachLocalImages,
+    clearPendingImages,
+    removePendingImage,
+    canAddMoreImages,
+    isCurrentAttachmentScope,
+  } = useChatImagePicker(MAX_IMAGES, attachmentScope);
+  const {
+    onPasteFiles,
+    onPasteFailed,
+  } = useChatPasteAttachments({
+    pendingAttachments: pendingImages,
+    setPendingAttachments: setPendingImages,
+    maxAttachments: MAX_IMAGES,
+    capabilities: adapter?.capabilities,
+    isCurrentAttachmentScope,
+  });
+
+  const pickFile = useCallback(async () => {
+    if (!isCurrentAttachmentScope() || !supportsFileAttachments(adapter?.capabilities)) return;
+    const result = await DocumentPicker.getDocumentAsync({
+      copyToCacheDirectory: true,
+      multiple: false,
+    });
+    if (!isCurrentAttachmentScope() || result.canceled || !result.assets?.length) return;
+    const asset = result.assets[0];
+    if (!asset.uri) return;
+    try {
+      const b64 = await readFileAsBase64(asset.uri);
+      if (!isCurrentAttachmentScope()) return;
+      const img = {
+        uri: asset.uri,
+        base64: b64,
+        mimeType: normalizeAttachmentMimeType(asset.mimeType),
+        fileName: asset.name,
+      };
+      setPendingImages((prev: PendingImage[]) =>
+        [...prev, img].slice(0, MAX_IMAGES),
+      );
+    } catch {
+      /* skip */
+    }
+  }, [adapter?.capabilities, isCurrentAttachmentScope, setPendingImages]);
+
+  const takePhoto = useCallback(async () => {
+    if (!isCurrentAttachmentScope() || !canAddMoreImages) return;
+    const IP = await import("expo-image-picker");
+    if (!isCurrentAttachmentScope() || !canAddMoreImages) return;
+    const res = isMacCatalyst
+      ? await IP.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsMultipleSelection: false,
+        quality: 0.8,
+        base64: true,
+        exif: false,
+      })
+      : await (async () => {
+        const perm = await IP.requestCameraPermissionsAsync();
+        if (!perm.granted || !isCurrentAttachmentScope()) return { canceled: true, assets: [] };
+        return IP.launchCameraAsync({
+          quality: 0.8,
+          base64: true,
+          exif: false,
+        });
+      })();
+    if (!isCurrentAttachmentScope()) return;
+    if (!res.canceled && res.assets?.[0]?.base64) {
+      const a = res.assets[0];
+      setPendingImages((prev: PendingImage[]) =>
+        [
+          ...prev,
+          {
+            uri: a.uri,
+            base64: a.base64!,
+            mimeType: normalizeAttachmentMimeType(a.mimeType, "image/jpeg"),
+            width: a.width,
+            height: a.height,
+          },
+        ].slice(0, MAX_IMAGES),
+      );
+    }
+  }, [setPendingImages, isCurrentAttachmentScope, canAddMoreImages]);
+
   const isFocused = useIsFocused();
+  // Conversation haptics (A+) play only for the conversation in front of the user.
+  const hapticsFocusedRef = useRef(isFocused);
+  hapticsFocusedRef.current = isFocused;
+  const approvalHapticIdsRef = useRef(new Set<string>());
+  const endedRunHapticRef = useRef<string | null>(null);
   const voiceSubmitRef = useRef<(text: string) => void>(() => {});
   const {
     startVoiceInput, stopVoiceInput, cancelVoiceInput,
@@ -656,19 +715,58 @@ export function useChatController({
     sessionKey: history.sessionKey,
   });
   const uncertainSends = useUncertainSends(messageQueue.scopeKey, history.messages);
+  const [receiptRecoveryEpoch, setReceiptRecoveryEpoch] = useState(0);
+  const receiptNoticeRef = useRef<{ scope: string; identity: string } | null>(null);
+  useEffect(() => {
+    if (!adapter || connectionState !== 'ready' || !messageQueue.scopeKey || !history.sessionKey
+      || !uncertainSends.length || AppState.currentState === 'background' || AppState.currentState === 'inactive') return;
+    let current = true;
+    void reconcilePromptReceipts(adapter, messageQueue.scopeKey, history.sessionKey, uncertainSends, () => current).then(receipts => {
+      if (!current || !receipts.size) return;
+      history.setMessages(previous => {
+        let changed = false;
+        const next = previous.map(message => {
+          const runId = message.sendUncertain && message.idempotencyKey ? receipts.get(message.idempotencyKey) : undefined;
+          if (!runId || message.bridgeRecordedRunId === runId) return message;
+          changed = true;
+          return { ...message, bridgeRecordedRunId: runId };
+        });
+        return changed ? next : previous;
+      });
+    });
+    return () => { current = false; };
+  }, [adapter, connectionState, messageQueue.scopeKey, history.sessionKey, history.setMessages, uncertainSends, receiptRecoveryEpoch]);
   useEffect(() => {
     const failure = uncertainFailureRef.current;
+    const recovered = failure ? undefined : uncertainSends.findLast(message => message.bridgeRecordedRunId && message.idempotencyKey);
+    if (!sendFailure && recovered?.idempotencyKey && messageQueue.scopeKey
+      && (receiptNoticeRef.current?.scope !== messageQueue.scopeKey || receiptNoticeRef.current.identity !== recovered.idempotencyKey)) {
+      receiptNoticeRef.current = { scope: messageQueue.scopeKey, identity: recovered.idempotencyKey };
+      uncertainFailureRef.current = { scope: messageQueue.scopeKey, message: recovered };
+      setSendFailureMessage(t('Your computer received the message, but execution is unconfirmed. Check the conversation before retrying.'));
+      setSendFailureDetails(null);
+    }
     if (failure?.scope === messageQueue.scopeKey && hasBackendEcho(history.messages, failure.message)) {
       // Clear only the failure for this exact acknowledged send. A reconnect,
       // unrelated reply or matching text is not delivery evidence.
       setSendFailure(null);
+    } else if (failure?.scope === messageQueue.scopeKey
+      && uncertainSends.some(message => message.id === failure.message.id && message.bridgeRecordedRunId)) {
+      // Durable receipt is weaker evidence than native acceptance. Retain both
+      // the uncertain bubble and held queue, without claiming execution began.
+      if (messageQueue.scopeKey && failure.message.idempotencyKey) {
+        receiptNoticeRef.current = { scope: messageQueue.scopeKey, identity: failure.message.idempotencyKey };
+      }
+      setSendFailureMessage(t('Your computer received the message, but execution is unconfirmed. Check the conversation before retrying.'));
+      setSendFailureDetails(null);
     }
-  }, [history.messages, messageQueue.scopeKey, uncertainSends, setSendFailure]);
+  }, [history.messages, messageQueue.scopeKey, uncertainSends, sendFailure, setSendFailure, t]);
   const recoverableMessages = useMemo(
     () => recoverUncertainSends(history.messages, uncertainSends),
     [history.messages, uncertainSends],
   );
   useChatAutoCache({
+    adapter,
     gatewayConfigId,
     agentId: cacheAgentIdentity.agentId,
     agentName: cacheAgentIdentity.agentName,
@@ -692,13 +790,19 @@ export function useChatController({
         sessionRunStateRef.current.delete(key);
         return;
       }
+      const previous = sessionRunStateRef.current.get(key);
+      const codex = adapter?.connection.backendKind === 'codex';
       sessionRunStateRef.current.set(key, {
+        ...(previous?.runId === runId ? previous : {}),
         runId,
-        streamText: chatStreamRef.current,
+        streamText: codex && previous?.runId === runId ? previous.streamText : chatStreamRef.current,
         startedAt: streamStartedAtRef.current ?? Date.now(),
+        streamTimestampMs: chatStreamTimestampRef.current ?? undefined,
+        ...(codex ? { presentation: { owner: adapter!, segments: chatStreamSegmentsRef.current,
+          tools: chatToolMessagesRef.current } } : {}),
       });
     },
-    [],
+    [adapter],
   );
 
   const {
@@ -724,7 +828,7 @@ export function useChatController({
   messageQueueRef.current = messageQueue;
   // A preflight may outlive navigation, an adapter replacement, or unmount.
   // Even returning to the same session must not revive an old continuation.
-  const sendScope = useMemo(() => ({ active: true }), [adapter, messageQueue.scopeKey]);
+  const sendScope = useMemo(() => ({ active: true, reviewRunId: null as string | null }), [adapter, messageQueue.scopeKey]);
   const sendScopeRef = useRef(sendScope);
   sendScopeRef.current = sendScope;
   useEffect(() => {
@@ -774,6 +878,23 @@ export function useChatController({
     ],
   );
 
+  /** Codex restores its tool-bounded rows; other backends restore the cumulative stream. */
+  const restoreRememberedStream = useCallback((remembered: SessionRunState) => {
+    const presentation = adapter?.connection.backendKind === 'codex' && remembered.presentation?.owner === adapter
+      ? remembered.presentation : undefined;
+    if (presentation) {
+      chatStreamSegmentsRef.current = presentation.segments;
+      setChatStreamSegments(presentation.segments);
+      chatToolMessagesRef.current = presentation.tools;
+      setChatToolMessages(presentation.tools);
+    }
+    const streamText = sanitizeVisibleStreamText(presentation
+      ? finalReplyTail(remembered.streamText ?? '', presentation.segments) : remembered.streamText);
+    chatStreamRef.current = streamText;
+    liveCommentaryItemRef.current = null;
+    setChatStream(streamText);
+  }, [adapter]);
+
   const syncDerivedSessionActivity = useCallback(
     (reason: string) => {
       const key = history.sessionKey;
@@ -809,9 +930,9 @@ export function useChatController({
       if (!currentRunIdRef.current && remembered) {
         currentRunIdRef.current = remembered.runId;
         streamStartedAtRef.current = remembered.startedAt;
-        const streamText = sanitizeVisibleStreamText(remembered.streamText);
-        chatStreamRef.current = streamText;
-        setChatStream(streamText);
+        chatStreamTimestampRef.current = remembered.streamTimestampMs ?? null;
+        setChatStreamTimestampMs(chatStreamTimestampRef.current);
+        restoreRememberedStream(remembered);
         lastRunSignalAtRef.current = Math.max(
           lastRunSignalAtRef.current,
           remembered.startedAt,
@@ -859,12 +980,15 @@ export function useChatController({
       history.loadHistory,
       history.messages,
       history.sessionKey,
+      restoreRememberedStream,
       t,
     ],
   );
 
   const revalidateRecoveredRun = useCallback(
     async (sessionKey: string, reason: string) => {
+      const scope = sendScopeRef.current;
+      if (!scope.active || sessionKeyRef.current !== sessionKey) return;
       const remembered = sessionRunStateRef.current.get(sessionKey);
       if (!remembered) {
         if (showDebug)
@@ -883,7 +1007,8 @@ export function useChatController({
         if (!adapter) return;
         const requestedAt = Date.now();
         const historyResult = await adapter.loadSession(sessionKey, { limit: 12 });
-        if (lastAdapterRef.current !== adapter || sessionKeyRef.current !== sessionKey
+        if (!scope.active || sendScopeRef.current !== scope
+          || lastAdapterRef.current !== adapter || sessionKeyRef.current !== sessionKey
           || sessionRunStateRef.current.get(sessionKey)?.runId !== remembered.runId) return;
 
         if (historyResult.hasActiveRun) {
@@ -894,6 +1019,7 @@ export function useChatController({
           return;
         }
         if (lastRunSignalAtRef.current > requestedAt) return;
+        if (historyResult.hasActiveRun !== false) return;
         const latestAssistant = latestVisibleAssistant(historyResult);
         const latestAssistantText = latestAssistant?.text ?? "";
         const latestAssistantTs = latestAssistant?.timestampMs ?? 0;
@@ -903,6 +1029,11 @@ export function useChatController({
             dbg(
               `revalidate:no-assistant session=${sessionKey} reason=${reason}`,
             );
+          // This is an authoritative inactive response, unlike a timed-out or
+          // failed read. Empty-output turns may legitimately have no assistant.
+          if (Date.now() - lastRunSignalAtRef.current >= HISTORY_COMPLETION_IDLE_MS) {
+            clearActiveRunState(sessionKey, `revalidateRecoveredRun:${reason}:inactive`, remembered.runId);
+          }
           return;
         }
         const startedAt = remembered.startedAt || 0;
@@ -918,7 +1049,8 @@ export function useChatController({
           appendIfMissing: true,
           minTimestampMs: startedAt,
         });
-        if (lastAdapterRef.current !== adapter || sessionKeyRef.current !== sessionKey
+        if (!scope.active || sendScopeRef.current !== scope
+          || lastAdapterRef.current !== adapter || sessionKeyRef.current !== sessionKey
           || sessionRunStateRef.current.get(sessionKey)?.runId !== remembered.runId) return;
         const liveRunStillActive = currentRunIdRef.current === remembered.runId;
         const idleMs = Date.now() - lastRunSignalAtRef.current;
@@ -988,16 +1120,26 @@ export function useChatController({
     },
     [dbg, revalidateRecoveredRun, showDebug],
   );
+  requestPendingRunRecoveryRef.current = requestRunRecovery;
 
   const requestVisibleHistoryReload = useCallback(
     async (sessionKey: string, reason: string) => {
+      const scope = sendScopeRef.current;
+      const afterNativeWrite = reason === 'post-stream' || reason === 'steer-accepted';
       const inFlight = historyReloadInFlightRef.current;
       if (inFlight && inFlight.sessionKey === sessionKey) {
-        if (reason === "post-stream") {
-          // A tool-result read can precede native persistence. Completion must
-          // read again after it settles, even inside the normal refresh cooldown.
+        if (afterNativeWrite) {
+          // A tool-result read can precede a completed turn or accepted input.
+          // Both require a read after it settles, inside the normal cooldown.
           await inFlight.promise.catch(() => 0);
-          if (sessionKeyRef.current !== sessionKey || currentRunIdRef.current) return 0;
+          if (sessionKeyRef.current !== sessionKey
+            || (reason === 'post-stream' && currentRunIdRef.current)
+            || (reason === 'steer-accepted' && (!scope.active || sendScopeRef.current !== scope))) return 0;
+          // Multiple accepted inputs may have waited for this same older read.
+          // The first fresh read already follows all of those native writes.
+          const following = historyReloadInFlightRef.current;
+          if (reason === 'steer-accepted' && following?.sessionKey === sessionKey
+            && following.promise !== inFlight.promise) return following.promise;
         } else {
           if (showDebug) dbg(`historyReload:reuse session=${sessionKey} reason=${reason}`);
           return inFlight.promise;
@@ -1006,7 +1148,7 @@ export function useChatController({
 
       const recent = recentHistoryReloadRef.current;
       if (
-        reason !== "post-stream" && recent &&
+        !afterNativeWrite && recent &&
         recent.sessionKey === sessionKey &&
         Date.now() - recent.at < HISTORY_RELOAD_MIN_INTERVAL_MS
       ) {
@@ -1066,14 +1208,14 @@ export function useChatController({
         );
       currentRunIdRef.current = remembered.runId;
       streamStartedAtRef.current = remembered.startedAt;
+      chatStreamTimestampRef.current = remembered.streamTimestampMs ?? null;
+      setChatStreamTimestampMs(chatStreamTimestampRef.current);
       lastRunSignalAtRef.current = Date.now();
       lastRunRecoveryProbeAtRef.current = 0;
-      const streamText = sanitizeVisibleStreamText(remembered.streamText);
-      chatStreamRef.current = streamText;
-      setChatStream(streamText);
+      restoreRememberedStream(remembered);
       setIsSending(true);
     },
-    [clearTransientRunPresentation],
+    [clearTransientRunPresentation, restoreRememberedStream],
   );
 
   useEffect(() => {
@@ -1143,6 +1285,8 @@ export function useChatController({
     history.onRefresh,
     history.sessionKey,
   ]);
+  const autoRefreshRef = useRef(autoRefresh);
+  autoRefreshRef.current = autoRefresh;
 
   const clearForegroundRunRecoveryTimer = useCallback(() => {
     if (!foregroundRunRecoveryTimerRef.current) return;
@@ -1178,7 +1322,7 @@ export function useChatController({
       ) {
         foregroundRefreshTimerRef.current = setTimeout(() => {
           foregroundRefreshTimerRef.current = null;
-          autoRefresh();
+          autoRefreshRef.current();
         }, delayMs);
         return;
       }
@@ -1188,18 +1332,18 @@ export function useChatController({
       foregroundRefreshTimerRef.current = setTimeout(() => {
         foregroundRefreshTimerRef.current = null;
         void (async () => {
-          const ok = await adapter?.probe(
+          const ok = await recoverAdapterConnection(adapter,
             FOREGROUND_REFRESH_AFTER_RECONNECT_TIMEOUT_MS,
+            'foreground',
           );
           if (foregroundRefreshProbeSeqRef.current !== probeSeq) return;
           if (ok) {
-            autoRefresh();
+            autoRefreshRef.current();
           }
         })();
       }, delayMs);
     },
     [
-      autoRefresh,
       clearForegroundRefreshWait,
       connectionState,
       dbg,
@@ -1274,10 +1418,7 @@ export function useChatController({
         dbg(
           `foregroundRecovery:start session=${sessionKeySnapshot} runId=${runIdSnapshot.slice(0, 8)} idleMs=${idleMs}`,
         );
-      void adapter?.probe().then((healthy) => {
-        if (!healthy && lastAdapterRef.current === adapter && currentRunIdRef.current === runIdSnapshot
-          && sessionKeyRef.current === sessionKeySnapshot) reconnectAdapter(adapter);
-      }).catch(() => {});
+      void recoverAdapterConnection(adapter, FOREGROUND_REFRESH_AFTER_RECONNECT_TIMEOUT_MS, 'foreground').catch(() => {});
       void requestRunRecovery(sessionKeySnapshot, "foreground");
 
       setTimeout(() => {
@@ -1309,6 +1450,78 @@ export function useChatController({
     showDebug,
   ]);
 
+  // Render-time callbacks may change as history or draft state updates. They
+  // must not tear down lifecycle listeners and cancel a scheduled recovery.
+  const foregroundLifecycleRef = useRef({
+    connectionState, scheduleForegroundRefresh, requestRunRecovery,
+    recoverForegroundRunIfStuck, sessionKey: history.sessionKey,
+  });
+  foregroundLifecycleRef.current = {
+    connectionState, scheduleForegroundRefresh, requestRunRecovery,
+    recoverForegroundRunIfStuck, sessionKey: history.sessionKey,
+  };
+
+  useEffect(() => {
+    if (!adapter) return;
+    let subscribed = true;
+    const unsubscribe = onSessionReset(adapter, target => {
+      const capturedScope = sendScope;
+      const historyCurrent = history.captureSessionScope(target.key);
+      const isCurrent = () => subscribed && historyCurrent() && capturedScope.active && sendScopeRef.current === capturedScope
+        && target.agentId === currentAgentId && sessionKeyRef.current === target.key;
+      if (!isCurrent()) return null;
+      return { isCurrent, retire() {
+        // Keep all unsent input. Clearing run presentation must not release the outbox.
+        messageQueueRef.current.hold();
+        clearActiveRunState(target.key, 'session-reset');
+        measuredToolsRef.current = [];
+        sessionAbortableRunRef.current = null;
+        lastLiveRunEventRef.current = null;
+        runRecoveryInFlightRef.current = null;
+        recentRunRecoveryRef.current = null;
+        historyReloadInFlightRef.current = null;
+        recentHistoryReloadRef.current = null;
+        clearPendingRunTimeout();
+        clearPostStreamHistoryRefreshTimer();
+        clearForegroundRunRecoveryTimer();
+      } };
+    });
+    return () => { subscribed = false; unsubscribe(); };
+  }, [adapter, currentAgentId, sendScope, history.captureSessionScope, clearActiveRunState, clearPendingRunTimeout,
+    clearPostStreamHistoryRefreshTimer, clearForegroundRunRecoveryTimer]);
+
+  const pathRecoveryRef = useRef(history.refreshCurrentSessionHistory);
+  pathRecoveryRef.current = history.refreshCurrentSessionHistory;
+  useEffect(() => {
+    if (!adapter || !history.sessionKey || !isFocused) return;
+    let current = true;
+    let refreshing = false;
+    let pendingRefresh = false;
+    let lastRecoveryGeneration = -1;
+    const sessionKey = history.sessionKey;
+    const isCurrent = () => current && appStateRef.current === 'active'
+      && sessionKeyRef.current === sessionKey && adapter.state === 'ready';
+    const unsubscribe = onAdapterPathRecovered(adapter, generation => {
+      if (!isCurrent() || generation <= lastRecoveryGeneration) return;
+      lastRecoveryGeneration = generation;
+      pendingRefresh = true;
+      if (refreshing) return;
+      refreshing = true;
+      // Merge authoritative history in place: preserve the draft, rows and
+      // viewport, and let native run/echo evidence reconcile uncertain sends.
+      // One bit retains a newer genuine path recovery during a slow read; no
+      // parallel reads, replay queue or timer retry is introduced.
+      void (async () => {
+        while (pendingRefresh && isCurrent()) {
+          pendingRefresh = false;
+          setReceiptRecoveryEpoch(epoch => epoch + 1);
+          await pathRecoveryRef.current({ afterInFlight: true, isCurrent }).catch(() => undefined);
+        }
+      })().finally(() => { refreshing = false; });
+    });
+    return () => { current = false; unsubscribe(); };
+  }, [adapter, history.sessionKey, isFocused]);
+
   useEffect(() => {
     const showEvt =
       Platform.OS === "ios" ? "keyboardWillShow" : "keyboardDidShow";
@@ -1326,9 +1539,12 @@ export function useChatController({
       (nextState: AppStateStatus) => {
         const prevState = appStateRef.current;
         appStateRef.current = nextState;
+        if (prevState !== nextState) setReceiptRecoveryEpoch(epoch => epoch + 1);
 
         if (nextState === "background" || nextState === "inactive") {
           backgroundedAtRef.current = Date.now();
+          clearForegroundRefreshWait();
+          clearForegroundRunRecoveryTimer();
           return;
         }
         if (nextState !== "active" || prevState === "active") return;
@@ -1337,21 +1553,22 @@ export function useChatController({
           ? Date.now() - backgroundedAtRef.current
           : 0;
         backgroundedAtRef.current = null;
+        // Even a brief network switch invalidates the send fast-path evidence.
+        lastConfirmedTransportAtRef.current = 0;
+        forceSendProbeUntilRef.current = Date.now() + SEND_FORCE_PROBE_GRACE_MS;
         const hasRunningChat = !!currentRunIdRef.current;
+        const latest = foregroundLifecycleRef.current;
         // Refresh visible history after transport freshness has been re-established.
-        scheduleForegroundRefresh(awayMs, hasRunningChat);
+        latest.scheduleForegroundRefresh(awayMs, hasRunningChat);
         if (hasRunningChat) {
-          if (awayMs >= 12_000 || connectionState !== "ready") {
-            void adapter?.probe();
+          if (awayMs >= 12_000 || latest.connectionState !== "ready") {
+            void recoverAdapterConnection(adapter, FOREGROUND_REFRESH_AFTER_RECONNECT_TIMEOUT_MS, 'foreground');
           }
-          if (history.sessionKey) {
-            void requestRunRecovery(history.sessionKey, "app-active");
+          if (latest.sessionKey) {
+            void latest.requestRunRecovery(latest.sessionKey, "app-active");
           }
-          recoverForegroundRunIfStuck();
+          latest.recoverForegroundRunIfStuck();
         }
-        return;
-
-        // unreachable
       },
     );
     return () => {
@@ -1366,12 +1583,8 @@ export function useChatController({
     clearForegroundRefreshWait,
     clearForegroundRunRecoveryTimer,
     clearPendingRunTimeout,
-    connectionState,
     adapter,
     history.sessionKey,
-    recoverForegroundRunIfStuck,
-    requestRunRecovery,
-    scheduleForegroundRefresh,
   ]);
 
   // Auto-refresh when Chat tab gains focus (switching from Console/My tab)
@@ -1429,10 +1642,7 @@ export function useChatController({
           dbg(
             `watchdog:reconnect session=${sessionKey} runId=${runId.slice(0, 8)} idleMs=${idleMs}`,
           );
-        void adapter?.probe().then((healthy) => {
-          if (!healthy && lastAdapterRef.current === adapter && currentRunIdRef.current === runId
-            && sessionKeyRef.current === sessionKey) reconnectAdapter(adapter);
-        }).catch(() => {});
+        void recoverAdapterConnection(adapter).catch(() => {});
       }
     }, 4_000);
 
@@ -1447,6 +1657,44 @@ export function useChatController({
     requestRunRecovery,
     showDebug,
   ]);
+
+  const recoverNativeParagraphs = useCallback((text: string, identity?: SessionRunState) => {
+    if (adapter?.connection.backendKind !== 'codex'
+      || !identity?.turnId || !identity.inputMessageId) return;
+    const recovered = recoverLiveRunPresentation(text, history.messages, identity?.turnId, identity?.inputMessageId, identity?.inputMessageKey);
+    const previous = chatStreamSegmentsRef.current;
+    const extended = extendRecoveredLiveRun(recovered, previous, chatToolMessagesRef.current);
+    if (!extended) return;
+    // Extend only a confirmed ordered prefix. Keep already mounted cells and
+    // don't replace live-only boundaries with an incomplete canonical page.
+    const tail = chatStreamRef.current?.trim();
+    const runId = currentRunIdRef.current;
+    const segments = extended.segments.map((segment, index) => {
+      if (index !== extended.retainedCount || !runId || !tail || !(segment.text.trim().startsWith(tail) || tail.startsWith(segment.text.trim()))) return segment;
+      return { ...segment, renderKey: liveReplyRenderKey(streamStartedAtRef.current, runId, previous.length),
+        timestampMs: chatStreamTimestampRef.current ?? segment.timestampMs };
+    });
+    chatStreamSegmentsRef.current = segments;
+    setChatStreamSegments(segments);
+    chatToolMessagesRef.current = extended.tools;
+    setChatToolMessages(extended.tools);
+    chatStreamTimestampRef.current = validStreamTimestamp(recovered.tailTimestampMs) ?? null;
+    setChatStreamTimestampMs(chatStreamTimestampRef.current);
+    return true;
+  }, [adapter, history.messages]);
+
+  // A history response can land between text chunks (or while tools run).
+  // Refine presentation immediately even if newer live activity fences its
+  // execution snapshot; the next text event may be minutes away.
+  useEffect(() => {
+    const identity = history.sessionKey ? sessionRunStateRef.current.get(history.sessionKey) : undefined;
+    if (!identity || identity.runId !== currentRunIdRef.current || !identity.streamText) return;
+    if (!recoverNativeParagraphs(identity.streamText, identity)) return;
+    const tail = finalReplyTail(identity.streamText, chatStreamSegmentsRef.current);
+    chatStreamRef.current = tail;
+    setChatStream(tail);
+    identity.streamTimestampMs = chatStreamTimestampRef.current ?? undefined;
+  }, [history.sessionKey, recoverNativeParagraphs]);
 
   useEffect(() => {
     const snapshot = history.activitySnapshot;
@@ -1468,26 +1716,45 @@ export function useChatController({
         ?? (previous?.runId === run.runId ? previous.startedAt : null)
         ?? run.startedAtMs ?? Date.now();
       sessionRunStateRef.current.set(snapshot.key, {
-        runId: run.runId, streamText: text,
-        startedAt,
+        ...(previous?.runId === run.runId ? previous : {}),
+        runId: run.runId, streamText: text, startedAt,
+        streamTimestampMs: previous?.runId === run.runId ? previous.streamTimestampMs : undefined,
       });
+      if (rememberSessionRunIdentity(sessionRunStateRef.current, snapshot.key, run.runId, run.turnId, run.inputMessageId, run.inputMessageKey)) setNativeRunIdentityEpoch(epoch => epoch + 1);
+      const identity = sessionRunStateRef.current.get(snapshot.key);
       currentRunIdRef.current = run.runId;
       streamStartedAtRef.current = startedAt;
       sessionAbortableRunRef.current = run.sessionAbortable ? run.runId : null;
+      let recoveredTailTimestamp: number | undefined;
       if (!chatStreamSegmentsRef.current.length && !chatToolMessagesRef.current.length) {
-        const recovered = recoverLiveRunPresentation(text ?? '', history.messages);
+        const recovered = recoverLiveRunPresentation(text ?? '', history.messages, identity?.turnId, identity?.inputMessageId, identity?.inputMessageKey);
         chatStreamSegmentsRef.current = recovered.segments;
         setChatStreamSegments(recovered.segments);
         chatToolMessagesRef.current = recovered.tools;
         setChatToolMessages(recovered.tools);
+        recoveredTailTimestamp = recovered.tailTimestampMs;
       }
-      const tail = text === null ? null : finalReplyTail(text, chatStreamSegmentsRef.current);
-      chatStreamRef.current = tail;
-      setChatStream(tail);
+      recoverNativeParagraphs(text ?? '', identity);
+      const tail = text === null ? null : finalReplyTail(text, replyTextSegments(chatStreamSegmentsRef.current));
+      if (adapter?.connection.backendKind === 'codex') {
+        const clock = validStreamTimestamp(recoveredTailTimestamp) ?? validStreamTimestamp(run.messageTimestampMs)
+          ?? (previous?.runId === run.runId ? validStreamTimestamp(previous.streamTimestampMs) : undefined);
+        chatStreamTimestampRef.current = tail?.trim() ? chatStreamTimestampRef.current ?? clock ?? Date.now() : null;
+        setChatStreamTimestampMs(chatStreamTimestampRef.current);
+      }
+      // Commentary is never in the reply snapshot: it stays the live paragraph
+      // until reply text follows it.
+      if (!liveCommentaryItemRef.current || tail?.trim()) {
+        if (liveCommentaryItemRef.current) commitCurrentStreamSegment();
+        chatStreamRef.current = tail;
+        setChatStream(tail);
+      }
+      const remembered = sessionRunStateRef.current.get(snapshot.key);
+      if (remembered) remembered.streamTimestampMs = chatStreamTimestampRef.current ?? undefined;
       lastRunSignalAtRef.current = Date.now();
     }
     setIsSending(true);
-  }, [history.activitySnapshot, history.sessionKey, clearActiveRunState]);
+  }, [adapter, history.activitySnapshot, history.sessionKey, clearActiveRunState, commitCurrentStreamSegment, recoverNativeParagraphs]);
 
   useEffect(() => {
     syncDerivedSessionActivity("messages-or-session");
@@ -1556,6 +1823,7 @@ export function useChatController({
     }
     const previousRunId = currentRunIdRef.current;
     currentRunIdRef.current = runId;
+    if (previousRunId && sendScopeRef.current.reviewRunId === previousRunId) sendScopeRef.current.reviewRunId = runId;
     pendingOptimisticRunIdsRef.current.delete(sessionKey);
     if (showDebug) {
       dbg(
@@ -1625,6 +1893,7 @@ export function useChatController({
           return true;
         case "run_started":
         case "agent_thought_chunk":
+        case "agent_commentary_chunk":
         case "tool_call":
         case "tool_call_update":
           return true;
@@ -1704,11 +1973,7 @@ export function useChatController({
     if (previous !== "ready") return;
     const sessionKey = sessionKeyRef.current;
     if (sessionKey && currentRunIdRef.current) {
-      sessionRunStateRef.current.set(sessionKey, {
-        runId: currentRunIdRef.current,
-        streamText: chatStreamRef.current,
-        startedAt: streamStartedAtRef.current ?? Date.now(),
-      });
+      persistCurrentRunState(sessionKey);
     }
     agentActivityRef.current.clear();
     childSessionActivityRef.current.clear();
@@ -1727,6 +1992,7 @@ export function useChatController({
     onChildSessionActivityChange,
     resetAgentActiveCount,
     restoreRunStateForSession,
+    persistCurrentRunState,
     setAgents,
     setCurrentAgentId,
   ]);
@@ -1739,6 +2005,7 @@ export function useChatController({
   }, [history.setSessions]);
 
   const handleAdapterUpdate = useCallback((update: AdapterChatUpdate) => {
+    if (update.type === 'session_activity_update') return;
     if (consumeSilentCommandUpdate(update)) return;
     if ('runId' in update && update.runId && 'sessionKey' in update && update.sessionKey
       && sessionKeysMatch(update.sessionKey, sessionKeyRef.current)) {
@@ -1748,6 +2015,8 @@ export function useChatController({
 
     const markActivityStarted = (sessionKey: string, runId: string) => {
       markSessionRunStarted(sessionRunStateRef.current, sessionKey, runId);
+      if ('turnId' in update && 'inputMessageId' in update
+        && rememberSessionRunIdentity(sessionRunStateRef.current, sessionKey, runId, update.turnId, update.inputMessageId, update.inputMessageKey)) setNativeRunIdentityEpoch(epoch => epoch + 1);
       const agentId = agentIdFromSessionKey(sessionKey);
       if (agentId && agentId !== currentAgentId) {
         if (applyRunStart(agentActivityRef.current, agentId)) {
@@ -1788,6 +2057,8 @@ export function useChatController({
       if (!currentRunIdRef.current) {
         currentRunIdRef.current = runId;
         streamStartedAtRef.current = Date.now();
+        chatStreamTimestampRef.current = null;
+        setChatStreamTimestampMs(null);
       }
       setIsSending(true);
       setRunAcknowledged(true);
@@ -1797,13 +2068,19 @@ export function useChatController({
     switch (update.type) {
       case "history_reconciled": {
         if (!matchesCurrentSession(update.sessionKey)) return;
-        history.setMessages((previous) => {
-          const retained = retireAliasedTools(previous, update.messages, update.history.toolCallAliases);
-          return preserveMessagePresentation(retained, preserveOptimisticAssistantMessage(retained, update.messages));
-        });
-        history.historyRawCountRef.current = update.history.messages.length;
-        history.setHistoryLoaded(true);
-        history.setHasMoreHistory(Boolean(update.nextCursor));
+        const cursorHistoryApplied = history.applyReconciledHistory?.({ ...update.history, nextCursor: update.nextCursor });
+        if (!cursorHistoryApplied) {
+          history.setMessages((previous) => {
+            const retained = retireAliasedTools(previous, update.messages, update.history.toolCallAliases);
+            const reconciled = preserveMessagePresentation(retained, preserveOptimisticAssistantMessage(retained, update.messages));
+            // A seq-gap reload keeps what only this phone knows, as a page load does.
+            return preserveToolTiming([...previous, ...measuredToolsRef.current],
+              preserveApprovalRows(previous, reconciled), update.history.toolCallAliases);
+          });
+          history.historyRawCountRef.current = update.history.messages.length;
+          history.setHistoryLoaded(true);
+          history.setHasMoreHistory(Boolean(update.nextCursor));
+        }
         if (!update.hasActiveRun) {
           const activeRunId = currentRunIdRef.current;
           clearSessionRunState(
@@ -1850,7 +2127,11 @@ export function useChatController({
           mergedText,
           undefined,
           update.textMode !== undefined,
+          adapter?.connection.backendKind === 'codex' && update.text.trim()
+            ? (remembered?.runId === update.runId ? validStreamTimestamp(remembered.streamTimestampMs) : undefined)
+              ?? validStreamTimestamp(update.timestampMs) ?? Date.now() : undefined,
         );
+        if (rememberSessionRunIdentity(sessionRunStateRef.current, update.sessionKey, update.runId, update.turnId, update.inputMessageId, update.inputMessageKey)) setNativeRunIdentityEpoch(epoch => epoch + 1);
         const agentId = agentIdFromSessionKey(update.sessionKey);
         if (agentId && agentId !== currentAgentId) {
           applyActivityDelta(agentActivityRef.current, agentId, mergedText);
@@ -1861,11 +2142,24 @@ export function useChatController({
         }
         if (!matchesCurrentSession(update.sessionKey)) return;
         if (!acceptRun(update.sessionKey, update.runId)) return;
-        // OpenClaw snapshots cover the entire run, including text already
-        // committed before tools. Delta backends must retain repeated tokens.
-        const nextText = update.textMode === 'snapshot'
-          ? finalReplyTail(update.text, chatStreamSegmentsRef.current)
+        if (update.textMode === 'snapshot') recoverNativeParagraphs(update.text, sessionRunStateRef.current.get(update.sessionKey));
+        // OpenClaw snapshots cover the entire run's reply text, including text
+        // committed before tools, but never commentary. Delta backends must
+        // retain repeated tokens.
+        const replyTail = () => update.textMode === 'snapshot'
+          ? finalReplyTail(update.text, replyTextSegments(chatStreamSegmentsRef.current))
           : mergeStreamText(chatStreamRef.current, update.text, update.textMode);
+        if (liveCommentaryItemRef.current) {
+          // A live commentary paragraph ends only when reply text follows it.
+          if (!replyTail().trim()) return;
+          commitCurrentStreamSegment();
+        }
+        const nextText = replyTail();
+        if (adapter?.connection.backendKind === 'codex' && nextText.trim() && chatStreamTimestampRef.current === null) {
+          chatStreamTimestampRef.current = validStreamTimestamp(update.timestampMs) ?? Date.now();
+          setChatStreamTimestampMs(chatStreamTimestampRef.current);
+        }
+        if (adapter?.connection.backendKind === 'codex') sessionRunStateRef.current.get(update.sessionKey)!.streamTimestampMs = chatStreamTimestampRef.current ?? undefined;
         chatStreamRef.current = nextText;
         setChatStream(nextText);
         setActivityLabel(null);
@@ -1879,24 +2173,57 @@ export function useChatController({
           acceptRun(update.sessionKey, update.runId);
         }
         return;
+      case "agent_commentary_chunk": {
+        if (lastAdapterStateRef.current !== "ready") return;
+        markRunSignal();
+        markActivityStarted(update.sessionKey, update.runId);
+        if (!matchesCurrentSession(update.sessionKey)) return;
+        if (!acceptRun(update.sessionKey, update.runId) || !update.text.trim()) return;
+        // Each commentary item is its own paragraph. A late update refreshes the
+        // row that already shows it instead of opening a second one.
+        const outdated = (shown: string) => shown === update.text || shown.startsWith(update.text);
+        const settled = chatStreamSegmentsRef.current.findIndex((segment) => segment.commentaryItemId === update.itemId);
+        if (settled >= 0) {
+          if (outdated(chatStreamSegmentsRef.current[settled]!.text)) return;
+          const next = chatStreamSegmentsRef.current.map((segment, index) => index === settled ? { ...segment, text: update.text } : segment);
+          chatStreamSegmentsRef.current = next;
+          setChatStreamSegments(next);
+          return;
+        }
+        if (liveCommentaryItemRef.current !== update.itemId) {
+          // Reply text that turns out to be this commentary continues in place.
+          const shown = chatStreamRef.current?.trim() ?? "";
+          if (liveCommentaryItemRef.current || !shown || !update.text.startsWith(shown)) commitCurrentStreamSegment();
+          liveCommentaryItemRef.current = update.itemId;
+        } else if (outdated(chatStreamRef.current ?? "")) return;
+        chatStreamRef.current = update.text;
+        setChatStream(update.text);
+        setActivityLabel(null);
+        return;
+      }
       case "tool_call": {
         if (lastAdapterStateRef.current !== "ready") return;
         markRunSignal();
         markActivityStarted(update.sessionKey, update.runId);
         const agentId = agentIdFromSessionKey(update.sessionKey);
         const toolName = update.message.toolName ?? "tool";
-        if (agentId && agentId !== currentAgentId) {
+        const running = update.message.toolStatus === "running";
+        if (running && agentId && agentId !== currentAgentId) {
           applyActivityToolStart(agentActivityRef.current, agentId, toolName);
         }
-        if (update.sessionKey.includes(":subagent:")) {
+        if (running && update.sessionKey.includes(":subagent:")) {
           applyChildToolStart(childSessionActivityRef.current, update.sessionKey, toolName);
           onChildSessionActivityChange();
         }
-        if (!matchesCurrentSession(update.sessionKey)) return;
+        if (!matchesCurrentSession(update.sessionKey)) {
+          if (adapter?.connection.backendKind === 'codex') rememberSessionRunTool(sessionRunStateRef.current, update.sessionKey, update.runId, adapter,
+            { ...update.message, toolSummary: formatToolOneLinerLocalized(toolName, update.message.toolArgs, t) });
+          return;
+        }
         if (!acceptRun(update.sessionKey, update.runId)) return;
         if (chatToolMessagesRef.current.some(message => sameLiveToolCall(message, update.message))) return;
         commitCurrentStreamSegment();
-        setActivityLabel(formatToolActivity(toolName, t));
+        if (running) setActivityLabel(formatToolActivity(unwrapToolCall(toolName, update.message.toolArgs).name, t));
         const message = {
           ...update.message,
           toolSummary: formatToolOneLinerLocalized(toolName, update.message.toolArgs, t),
@@ -1909,35 +2236,64 @@ export function useChatController({
         if (lastAdapterStateRef.current !== "ready") return;
         markRunSignal();
         markSessionRunStarted(sessionRunStateRef.current, update.sessionKey, update.runId);
-        if (!matchesCurrentSession(update.sessionKey)) return;
+        if (rememberSessionRunIdentity(sessionRunStateRef.current, update.sessionKey, update.runId, update.turnId, update.inputMessageId, update.inputMessageKey)) setNativeRunIdentityEpoch(epoch => epoch + 1);
+        // The producer's native run time wins; otherwise measure between this phone's clocks.
+        const settleTool = (previousMessage: UiMessage | undefined): UiMessage => {
+          const toolName = previousMessage?.toolName ?? "tool";
+          const finishedAt = update.message.toolFinishedAt;
+          const startedAt = update.message.toolStartedAt ?? previousMessage?.toolStartedAt;
+          const localizedSummary = formatToolOneLinerLocalized(toolName, previousMessage?.toolArgs, t);
+          return {
+            ...previousMessage,
+            ...update.message,
+            toolName,
+            toolSummary: update.message.toolStatus === "error"
+              ? t("Failed {{name}}", { name: localizedSummary })
+              : update.message.toolStatus === "success"
+                ? t("Completed {{name}}", { name: localizedSummary })
+                : localizedSummary,
+            toolDurationMs: update.message.toolDurationMs
+              ?? (finishedAt && startedAt ? Math.max(0, finishedAt - startedAt) : undefined),
+          };
+        };
+        if (!matchesCurrentSession(update.sessionKey)) {
+          if (adapter?.connection.backendKind === 'codex') settleSessionRunTool(sessionRunStateRef.current, update.sessionKey, update.runId, adapter, update.message, settleTool);
+          return;
+        }
         if (!acceptRun(update.sessionKey, update.runId)) return;
         const previousMessage = chatToolMessagesRef.current.find(
           (message) => sameLiveToolCall(message, update.message),
         );
         const toolName = previousMessage?.toolName ?? "tool";
-        const finishedAt = update.message.toolFinishedAt;
-        const durationMs = finishedAt && previousMessage?.toolStartedAt
-          ? Math.max(0, finishedAt - previousMessage.toolStartedAt)
-          : undefined;
-        const localizedSummary = formatToolOneLinerLocalized(
-          toolName,
-          previousMessage?.toolArgs,
-          t,
-        );
-        const message: UiMessage = {
-          ...previousMessage,
-          ...update.message,
-          toolName,
-          toolSummary: update.message.toolStatus === "error"
-            ? t("Failed {{name}}", { name: localizedSummary })
-            : update.message.toolStatus === "success"
-              ? t("Completed {{name}}", { name: localizedSummary })
-              : localizedSummary,
-          toolDurationMs: durationMs,
-        };
+        const message = settleTool(previousMessage);
+        const durationMs = message.toolDurationMs;
         chatToolMessagesRef.current = withToolMessage(chatToolMessagesRef.current, message);
         setChatToolMessages(chatToolMessagesRef.current);
-        if (update.message.toolStatus === "running") return;
+        if (update.message.toolStatus === "running" || update.message.toolStatus === "unknown") {
+          measuredToolsRef.current = measuredToolsRef.current.filter((measured) => !sameLiveToolCall(measured, message));
+          clearToolSettledRecoveryTimer();
+        }
+        if (update.message.toolStatus === "running") {
+          setActivityLabel(formatToolActivity(unwrapToolCall(toolName, previousMessage?.toolArgs).name, t));
+          return;
+        }
+        // Only confirmed running steps describe execution. Unknown clears an
+        // obsolete label but does not produce completion timing or recovery.
+        const settledLabel = formatToolActivity(unwrapToolCall(toolName, previousMessage?.toolArgs).name, t);
+        const stillRunning = chatToolMessagesRef.current.findLast(
+          (candidate) => candidate.toolStatus === "running" && !candidate.approval,
+        );
+        setActivityLabel((current) => current !== settledLabel ? current
+          : stillRunning
+            ? formatToolActivity(unwrapToolCall(stillRunning.toolName ?? "tool", stillRunning.toolArgs).name, t)
+            : null);
+        if (update.message.toolStatus === "unknown") return;
+        if (durationMs !== undefined) {
+          measuredToolsRef.current = [
+            ...measuredToolsRef.current.filter((measured) => !sameLiveToolCall(measured, message)),
+            message,
+          ].slice(-MEASURED_TOOL_LIMIT);
+        }
         clearToolSettledRecoveryTimer();
         requestVisibleHistoryReload(update.sessionKey, "tool-result").catch(() => {});
         toolSettledRecoveryTimerRef.current = setTimeout(() => {
@@ -1953,6 +2309,9 @@ export function useChatController({
       case "run_finished": {
         if (recoveredActiveSessionRef.current === update.sessionKey) recoveredActiveSessionRef.current = null;
         markRunSignal();
+        const finishedIdentity = sessionRunStateRef.current.get(update.sessionKey)?.runId === update.runId
+          ? sessionRunStateRef.current.get(update.sessionKey) : undefined;
+        const finishedTurnId = finishedIdentity?.turnId;
         markActivityFinished(update.sessionKey, update.runId, {
           text: update.finalMessage?.text ?? update.systemMessage?.text,
           failed: update.stopReason === "error" || update.stopReason === "cancelled",
@@ -1972,40 +2331,65 @@ export function useChatController({
           setSendFailure(t('The task finished before using this input. Your draft is restored.'));
         }
         const activeRunStartedAt = streamStartedAtRef.current;
+        // A reply watched live ends with Success, a failed one with Warning; a stop is the user's own act.
+        if (activeRunStartedAt !== null && update.stopReason !== "cancelled" && conversationHapticsAllowed(hapticsFocusedRef)) {
+          playRunEndHaptic(update.runId, endedRunHapticRef, update.stopReason === "error" ? triggerWarningHaptic : triggerSuccessHaptic);
+        }
+        // Commentary still live at the end stays its own row, never the final reply.
+        if (liveCommentaryItemRef.current) commitCurrentStreamSegment();
         const streamText = chatStreamRef.current ?? "";
         const segments = chatStreamSegmentsRef.current;
         const tools = chatToolMessagesRef.current;
+        const hasFinalAttachments = Boolean(update.finalMessage?.artifactAttachments?.length || update.finalMessage?.imageUris?.length || update.finalMessage?.fileAttachments?.length);
+        const completedText = hasFinalAttachments ? update.finalMessage!.text : (update.finalMessage?.text || streamText);
+        const reviewScope = sendScopeRef.current;
+        if (reviewScope.reviewRunId === update.runId) {
+          reviewScope.reviewRunId = null;
+          if (reviewScope.active && update.stopReason === "end_turn" && !update.unappliedInput
+            && (completedText.trim() || hasFinalAttachments || replyTextSegments(segments).some(segment => segment.text.trim()))
+            && !isAssistantSilentReplyMessage({ role: "assistant", text: completedText })
+            && !isAssistantDeliveryMirrorMessage(update.finalMessage)
+            && AppState.currentState === "active") {
+            void recordCompletedTurnForAutomaticReview();
+          }
+        }
         if (segments.length > 0 || tools.length > 0) {
           const completed = update.stopReason !== "cancelled" && update.stopReason !== "error";
           const finalText = completed
-            ? (update.finalMessage?.text || streamText) : streamText;
+            ? completedText : streamText;
           const rows = finishLiveRunPresentation({
-            segments, tools, tail: finalReplyTail(finalText, segments, streamText),
-            runId: update.runId, startedAt: activeRunStartedAt,
+            segments, tools, tail: finalReplyTail(finalText, replyTextSegments(segments), streamText),
+            runId: update.runId, startedAt: activeRunStartedAt, turnId: finishedTurnId,
             finalMessage: completed ? update.finalMessage : undefined,
             cancelled: update.stopReason === "cancelled",
           });
           // Any history fetched during tools is reconciled inside this turn,
           // then all live rows move into history together before clearing them.
-          history.setMessages((previous) => preserveOptimisticAssistantMessage(
-            [...previous.filter(message => !rows.some(row => row.id === message.id)), ...rows], previous,
-          ));
+          history.setMessages((previous) => {
+            const original = originalRunUserIndex(previous, finishedIdentity?.turnId, finishedIdentity?.inputMessageId, finishedIdentity?.inputMessageKey);
+            const anchored = previous.map((message, index) => index === original ? { ...message, turnId: finishedTurnId } : message);
+            return preserveOptimisticAssistantMessage([
+              ...anchored.filter(message => !rows.some(row => row.id === message.id)), ...rows,
+            ], anchored);
+          });
         } else if (update.stopReason === "cancelled") {
           if (streamText.trim()) history.setMessages((previous) => appendUniqueMessage(previous, {
             id: `abort_${update.runId}`,
             renderKey: liveReplyRenderKey(activeRunStartedAt, update.runId, 0),
-            role: "assistant", text: streamText, timestampMs: Date.now(),
+            role: "assistant", text: streamText, timestampMs: Date.now(), ...(finishedTurnId ? { turnId: finishedTurnId } : {}),
           }));
         } else if (update.stopReason !== "error") {
-          const finalText = update.finalMessage?.text || streamText;
-          if (finalText.trim()) {
+          const finalText = completedText;
+          if (finalText.trim() || hasFinalAttachments) {
             const finalMessage: UiMessage = {
               ...(update.finalMessage ?? { id: `final_${update.runId}`, role: "assistant" as const, timestampMs: Date.now() }),
               text: finalText, renderKey: liveReplyRenderKey(activeRunStartedAt, update.runId, 0),
+              ...(finishedTurnId ? { turnId: finishedTurnId } : {}),
             };
             history.setMessages((previous) => {
               if (previous.some((message) => message.id === finalMessage.id)) return previous;
               for (let index = previous.length - 1; index >= 0; index -= 1) {
+                if (previous[index].role === "user") break;
                 if (!shouldMergeFinalMessage(previous[index], finalText, activeRunStartedAt)) continue;
                 const next = [...previous];
                 next[index] = { ...previous[index], ...finalMessage };
@@ -2067,6 +2451,12 @@ export function useChatController({
           history.setMessages((previous) =>
             appendUniqueMessage(previous, update.message!),
           );
+          const approvalHaptics = approvalHapticIdsRef.current;
+          if (!approvalHaptics.has(update.message.id) && conversationHapticsAllowed(hapticsFocusedRef)) {
+            approvalHaptics.add(update.message.id);
+            if (approvalHaptics.size > 512) approvalHaptics.delete(approvalHaptics.values().next().value!);
+            triggerWarningHaptic();
+          }
         }
         return;
       case "approval_resolved":
@@ -2124,6 +2514,7 @@ export function useChatController({
           );
         }
         if (update.runId) {
+          if (conversationHapticsAllowed(hapticsFocusedRef)) playRunEndHaptic(update.runId, endedRunHapticRef, triggerWarningHaptic);
           const failure = describeReplyFailure(update.errorMessage, update.code);
           setSendFailure(t(failure.summaryKey));
           setSendFailureDetails(failure.details || null);
@@ -2139,6 +2530,7 @@ export function useChatController({
   }, [
     adoptPendingRunId,
     adapter,
+    recoverNativeParagraphs,
     clearActiveRunState,
     clearToolSettledRecoveryTimer,
     clearTransientRunPresentation,
@@ -2294,8 +2686,8 @@ export function useChatController({
         if (!adapter) return false;
         const ok =
           connectionState === "ready"
-            ? await adapter.probe(SEND_FAST_PROBE_TIMEOUT_MS)
-            : await adapter.probe();
+            ? await recoverAdapterConnection(adapter, SEND_FAST_PROBE_TIMEOUT_MS)
+            : await recoverAdapterConnection(adapter);
         if (!isCurrent()) return false;
         if (ok) {
           markTransportConfirmed();
@@ -2335,6 +2727,38 @@ export function useChatController({
     releaseSendTriggerGuard();
   }, [isPreparingSend, isSending, releaseSendTriggerGuard]);
 
+  const {
+    recentModels, modelScope,
+    hasRuntimeSettings, runtimeSettingsBusy, runtimeSettingsPendingRef, runtimeSettingsUnconfirmed, runtimeSettingsUnconfirmedRef,
+    fastMode, permissions, permissionPickerVisible, setPermissionPickerVisible,
+    onSelectFastMode, onSelectPermissions, openPermissionPicker, requirePermissionsConfirmation,
+    availableModels,
+    availableProviders,
+    configuredDefaultModel,
+    currentModel,
+    currentModelHeaderLabel,
+    currentModelDisplayName,
+    currentModelSupportsImages,
+    selectNativeThinkingLevel,
+    nativeThinkingLevel,
+    nativeThinkingLevels,
+    currentModelProvider,
+    modelPickerError,
+    modelPickerLoading,
+    modelPickerVisible,
+    onSelectModel,
+    openModelPicker,
+    retryModelPickerLoad,
+    setModelPickerVisible,
+  } = useChatModelPicker({
+    connectionState,
+    adapter,
+    sessionKey: history.sessionKey,
+    sessionMetadata: history.sessions.find((session) => session.key === history.sessionKey),
+    setInput,
+    setSessions: history.setSessions,
+    setThinkingLevel: history.setThinkingLevel,
+  });
   const getUserMessageText = useCallback((text: string, images: readonly PendingImage[]) => {
       const fallbackKey = resolveAttachmentOnlyFallbackKey(images);
       const attachmentFallbackCopy = {
@@ -2356,12 +2780,15 @@ export function useChatController({
       const submittedAt = Date.now();
       const submissionScope = sendScopeRef.current;
       const localTimestamp = queued?.createdAt ?? submittedAt;
+      const idempotencyKey = `${submittedAt}_${Math.random().toString(36).slice(2, 10)}`;
+      const effectiveText = getUserMessageText(text, images);
+      const prompt = { text: effectiveText || " ", attachments: buildPromptAttachments(images), idempotencyKey };
+      // Validate the prepared payload while its original outbox item still owns every attachment.
+      adapter.validatePrompt?.(sessionKey, prompt);
       setMessageSubmittedAt(submittedAt);
       if (!queued) setScrollToBottomRequestAt(submittedAt);
       setSendFailure(null);
-      const idempotencyKey = `${submittedAt}_${Math.random().toString(36).slice(2, 10)}`;
       const realImages = images.filter((image) => isImageAttachmentMimeType(image.mimeType));
-      const effectiveText = getUserMessageText(text, images);
       const uiMsg = buildUserUiMessage({
         // A queued message keeps its id so its bubble settles in place once sent.
         id: options?.messageId ?? `usr_${localTimestamp}`,
@@ -2372,18 +2799,24 @@ export function useChatController({
       });
       uiMsg.renderKey = uiMsg.id;
       if (!shouldHideMessage(uiMsg)) {
-        history.setMessages((prev) => [...prev, uiMsg]);
+        history.setMessages((prev) => {
+          const existing = prev.findIndex(message => message.id === uiMsg.id);
+          if (existing < 0) return [...prev, uiMsg];
+          const next = [...prev]; next[existing] = uiMsg; return next;
+        });
         setUnconfirmedMessageIds((previous) => new Set(previous).add(uiMsg.id));
       }
 
       const claimsActiveRun = !currentRunIdRef.current;
       if (claimsActiveRun) {
+        submissionScope.reviewRunId = effectiveText.trimStart().startsWith("/") ? null : idempotencyKey;
         setRunAcknowledged(false);
         clearTransientRunPresentation({ preserveCurrentStream: true });
         currentRunIdRef.current = idempotencyKey;
         streamStartedAtRef.current = submittedAt;
         lastRunSignalAtRef.current = submittedAt;
         chatStreamRef.current = "";
+        liveCommentaryItemRef.current = null;
         setChatStream("");
         sessionRunStateRef.current.set(sessionKey, {
           runId: idempotencyKey,
@@ -2417,16 +2850,13 @@ export function useChatController({
           .catch((err) => dbg(`cache write failed: ${String(err)}`));
       }
 
-      const attachments = buildPromptAttachments(images);
-
       adapter
-        .prompt(sessionKey, { text: effectiveText || " ", attachments, idempotencyKey })
+        .prompt(sessionKey, prompt)
         .then(({ runId: serverRunId }) => {
           if (submissionScope.active && sendScopeRef.current === submissionScope && sessionKeyRef.current === sessionKey) {
             setMessageAcceptedAt(submittedAt);
             setAcceptedSubmission({ at: submittedAt, text: effectiveText, attachmentUris: images.map((image) => image.uri) });
           }
-          void recordSuccessfulSendForAutomaticReview();
           markTransportConfirmed();
           setUnconfirmedMessageIds((previous) => {
             if (!previous.has(uiMsg.id)) return previous;
@@ -2446,6 +2876,9 @@ export function useChatController({
             serverRunId !== idempotencyKey &&
             currentRunIdRef.current === idempotencyKey
           ) {
+            if (submissionScope.active && sendScopeRef.current === submissionScope && submissionScope.reviewRunId === idempotencyKey) {
+              submissionScope.reviewRunId = serverRunId;
+            }
             currentRunIdRef.current = serverRunId;
             const existing = sessionRunStateRef.current.get(sessionKey);
             if (existing && existing.runId === idempotencyKey) {
@@ -2457,6 +2890,7 @@ export function useChatController({
           }
         })
         .catch((error: unknown) => {
+          if (submissionScope.reviewRunId === idempotencyKey) submissionScope.reviewRunId = null;
           setUnconfirmedMessageIds((previous) => {
             if (!previous.has(uiMsg.id)) return previous;
             const next = new Set(previous);
@@ -2477,6 +2911,36 @@ export function useChatController({
             sessionRunStateRef.current.delete(sessionKey);
           }
           sourceQueue.store.update(sourceQueue.scopeKey, holdMessageQueue);
+          if (adapter.capabilities.sessionPermissions && error instanceof AdapterError
+            && error.recoveryAction === 'confirm_permissions') {
+            requirePermissionsConfirmation(adapter, sessionKey);
+            // This fixed native guard rejects before dispatch. Keep the original
+            // input reviewable and paused, without labelling it uncertain or replaying it.
+            const restoredQueue = queued ? sourceQueue.store.update(sourceQueue.scopeKey, current => holdMessageQueue(
+              !current.items.some(item => item.id === queued.id) && canEnqueueMessage(current)
+                ? { ...current, items: [queued, ...current.items] } : current,
+            )) : null;
+            if (submissionScope.active && sendScopeRef.current === submissionScope && sessionKeyRef.current === sessionKey) {
+              history.setMessages(previous => previous.map(message => message.id === uiMsg.id
+                ? { ...message, delivery: restoredQueue?.items.some(item => item.id === uiMsg.id) ? 'held' : undefined } : message));
+              setSendFailure(null);
+              setSendFailureDetails(null);
+            }
+            return;
+          }
+          if (error instanceof LocalSendRejectedError) {
+            const item = queued ?? { id: uiMsg.id, text, images, createdAt: localTimestamp };
+            const held = sourceQueue.store.update(sourceQueue.scopeKey, current => holdMessageQueue(
+              current.items.some(row => row.id === item.id) || !canEnqueueMessage(current)
+                ? current : { ...current, items: [item, ...current.items] },
+            ));
+            if (submissionScope.active && sendScopeRef.current === submissionScope && sessionKeyRef.current === sessionKey) {
+              if (held.items.some(row => row.id === item.id)) history.setMessages(previous => previous.filter(message => message.id !== uiMsg.id));
+              setSendFailure(t('Message too large to send'));
+              setSendFailureDetails(null);
+            }
+            return;
+          }
           rememberUncertainSend(sourceQueue.scopeKey, uiMsg);
           if (messageQueueRef.current.scopeKey !== sourceQueue.scopeKey) return;
           setSendFailure(t('Sending failed. Check the conversation before trying again.'));
@@ -2486,7 +2950,7 @@ export function useChatController({
           // Preserve one recoverable bubble; refilling the composer invites duplicate sends.
         });
     },
-    [adapter, dbg, getUserMessageText, history, messageQueue.store, messageQueue.scopeKey, markTransportConfirmed, t],
+    [adapter, dbg, getUserMessageText, history, messageQueue.store, messageQueue.scopeKey, markTransportConfirmed, requirePermissionsConfirmation, setSendFailure, t],
   );
 
   const submitMessageWithConnectionCheck = useCallback(
@@ -2542,8 +3006,8 @@ export function useChatController({
         return true;
       } catch (error) {
         if (isCurrent()) {
-          setSendFailure(t('Sending failed. Check the conversation before trying again.'));
-          setSendFailureDetails(sanitizeReplyFailure(error instanceof Error ? error.message : String(error)) || null);
+          setSendFailure(t(error instanceof LocalSendRejectedError ? 'Message too large to send' : 'Sending failed. Check the conversation before trying again.'));
+          setSendFailureDetails(error instanceof LocalSendRejectedError ? null : sanitizeReplyFailure(error instanceof Error ? error.message : String(error)) || null);
         }
         return false;
       } finally {
@@ -2567,38 +3031,16 @@ export function useChatController({
     ],
   );
 
-  const {
-    availableModels,
-    availableProviders,
-    configuredDefaultModel,
-    currentModel,
-    currentModelHeaderLabel,
-    currentModelDisplayName,
-    currentModelSupportsImages,
-    selectNativeThinkingLevel,
-    nativeThinkingLevel,
-    currentModelProvider,
-    modelPickerError,
-    modelPickerLoading,
-    modelPickerVisible,
-    onSelectModel,
-    openModelPicker,
-    retryModelPickerLoad,
-    setModelPickerVisible,
-  } = useChatModelPicker({
-    connectionState,
-    adapter,
-    sessionKey: history.sessionKey,
-    sessionMetadata: history.sessions.find((session) => session.key === history.sessionKey),
-    setInput,
-    setSessions: history.setSessions,
-    setThinkingLevel: history.setThinkingLevel,
-  });
+  // The levels the backend reports for the session's current model come first
+  // (OpenClaw 2026.x); a static list would offer levels the model refuses.
   const thinkingLevelOptions = useMemo(
     () => adapter?.capabilities.thinkingLevels
-      ? (availableModels.find(model => model.id === currentModel)?.reasoningLevels ?? adapter.management?.models?.listThinkingLevels?.() ?? [])
+      ? (nativeThinkingLevels
+        ?? availableModels.find(model => model.id === currentModel)?.reasoningLevels
+        ?? adapter.management?.models?.listThinkingLevels?.()
+        ?? [])
       : [],
-    [adapter, availableModels, currentModel],
+    [adapter, availableModels, currentModel, nativeThinkingLevels],
   );
 
   const runSilentCommandProbe = useCallback(
@@ -2678,7 +3120,7 @@ export function useChatController({
   });
 
   const onSend = useCallback((voiceText?: string) => {
-    if (readOnlyRef.current || sendPreflightInFlightRef.current) return;
+    if (readOnlyRef.current || sendPreflightInFlightRef.current || runtimeSettingsPendingRef.current || runtimeSettingsUnconfirmedRef.current) return;
     void (async () => {
       const text = (voiceText ?? input).trim();
       const images = [...pendingImages];
@@ -2763,7 +3205,7 @@ export function useChatController({
         const queued = messageQueue.enqueue({ text, images });
         releaseSendTriggerGuard();
         if (!queued) return;
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        triggerSendHaptic();
         analyticsEvents.chatMessageQueued({
           backend: adapter?.connection.backendKind,
           queue_length: messageQueue.readCurrent().items.length,
@@ -2774,8 +3216,7 @@ export function useChatController({
         return;
       }
 
-      // Haptic feedback — crisp impact
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Rigid);
+      triggerSendHaptic();
 
       // Local acceptance is synchronous. Network checks and image preparation
       // happen behind the visible bubble, with the existing delivery safeguards.
@@ -2810,6 +3251,8 @@ export function useChatController({
     openCommandPicker,
     openModelPicker,
     currentModelSupportsImages,
+    runtimeSettingsPendingRef,
+    runtimeSettingsUnconfirmedRef,
     t,
     pendingImages,
     releaseSendTriggerGuard,
@@ -2824,6 +3267,8 @@ export function useChatController({
   // the post-reply history refresh; the sending marker keeps its bubble in
   // place until history adopts the optimistic message with the same id.
   const steeringBusyRef = useRef(false);
+  const steeringSequenceRef = useRef(0);
+  const [steeringPending, setSteeringPending] = useState(false);
   const onSteer = useCallback((expectedRunId?: string) => {
     const key = history.sessionKey;
     const runId = currentRunIdRef.current;
@@ -2835,24 +3280,44 @@ export function useChatController({
     if (readOnly || steeringBusyRef.current || !key || !runId || !text || pendingImages.length
       || !adapter?.capabilities.steer || !adapter.steer || connectionState !== 'ready') return;
     const scope = sendScopeRef.current;
+    const dispatchedMessages = [...history.messages];
+    const dispatchedAt = Date.now();
+    const codex = adapter.connection.backendKind === 'codex';
+    const steeringSequence = codex ? ++steeringSequenceRef.current : undefined;
+    const draftRevision = inputRevisionRef.current;
+    const rememberedRun = sessionRunStateRef.current.get(key);
+    const steeredTurnId = adapter.connection.backendKind === 'codex' && rememberedRun?.runId === runId ? rememberedRun.turnId : undefined;
     steeringBusyRef.current = true;
+    setSteeringPending(true);
     setSendFailure(null);
     void adapter.steer(key, runId, text).then(() => {
       if (!scope.active || sendScopeRef.current !== scope || sessionKeyRef.current !== key) return;
-      const timestampMs = Date.now();
-      history.setMessages((messages) => [...messages, { id: `usr_${timestampMs}_steer_${runId}`, role: 'user', sentLocally: true, text, timestampMs }]);
-      setInput((current) => current === input ? '' : current);
-      setMessageSubmittedAt(timestampMs);
-      setMessageAcceptedAt(timestampMs);
-      setAcceptedSubmission({ at: timestampMs, text, attachmentUris: [] });
+      const timestampMs = codex ? dispatchedAt : Date.now();
+      const accepted: UiMessage = { id: `usr_${timestampMs}_steer_${runId}${codex ? `_${steeringSequence}` : ''}`, role: 'user', sentLocally: true, text, timestampMs, ...(steeredTurnId ? { turnId: steeredTurnId } : {}) };
+      if (codex) accepted.renderKey = accepted.id;
+      history.setMessages((messages) => codex
+        ? reconcileAcceptedSteeringMessage(dispatchedMessages, messages, accepted)
+        : [...messages, accepted]);
+      if (inputRevisionRef.current === draftRevision) {
+        setInput((current) => current === input ? '' : current);
+      }
+      if (!codex || currentRunIdRef.current === runId) {
+        setMessageSubmittedAt(timestampMs);
+        setMessageAcceptedAt(timestampMs);
+        setAcceptedSubmission({ at: timestampMs, text, attachmentUris: [] });
+      }
+      if (codex) void requestVisibleHistoryReload(key, 'steer-accepted').catch(() => undefined);
     }).catch((error: unknown) => {
       if (!scope.active || sendScopeRef.current !== scope) return;
       setSendFailure(t('Sending failed. Check the conversation before trying again.'));
       setSendFailureDetails(sanitizeReplyFailure(error instanceof Error ? error.message : String(error)) || null);
-    }).finally(() => { steeringBusyRef.current = false; });
-  }, [adapter, connectionState, history.sessionKey, history.setMessages, input, pendingImages.length, readOnly, t]);
+    }).finally(() => {
+      steeringBusyRef.current = false;
+      if (sendScopeRef.current.active) setSteeringPending(false);
+    });
+  }, [adapter, connectionState, history.messages, history.sessionKey, history.setMessages, input, pendingImages.length, readOnly, requestVisibleHistoryReload, t]);
 
-  const queueDeliveryReady = !readOnly
+  const queueDeliveryReady = !readOnly && !runtimeSettingsBusy && !runtimeSettingsUnconfirmed
     && history.historyLoaded
     && canSendMessage({
       connectionState,
@@ -2867,7 +3332,7 @@ export function useChatController({
     : null;
   const queueDeliveryInFlightRef = useRef(false);
   useEffect(() => {
-    if (!nextQueuedMessage || queueDeliveryInFlightRef.current) return;
+    if (!nextQueuedMessage || queueDeliveryInFlightRef.current || runtimeSettingsPendingRef.current || runtimeSettingsUnconfirmedRef.current) return;
     const item = nextQueuedMessage;
     const { scopeKey, store } = messageQueue;
     const stillQueued = () => store.read(scopeKey).items.some((entry) => entry.id === item.id);
@@ -2898,7 +3363,7 @@ export function useChatController({
         }
       }
     })();
-  }, [adapter, messageQueue, nextQueuedMessage, submitMessageWithConnectionCheck]);
+  }, [adapter, messageQueue, nextQueuedMessage, submitMessageWithConnectionCheck, runtimeSettingsPendingRef, runtimeSettingsUnconfirmedRef]);
 
   const editQueuedMessage = useCallback((id: string) => {
     const item = messageQueue.remove(id);
@@ -2917,7 +3382,7 @@ export function useChatController({
   }, [adapter, messageQueue]);
 
   const sendQueuedMessageNow = useCallback((id: string) => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Rigid);
+    triggerSendHaptic();
     messageQueue.promote(id);
   }, [messageQueue]);
 
@@ -3202,6 +3667,15 @@ export function useChatController({
   // are unchanged, otherwise an empty streaming row survives the final reply.
   const presentationRunId = currentRunIdRef.current;
   const presentationStartedAt = streamStartedAtRef.current;
+  const rememberedPresentationRun = history.sessionKey ? sessionRunStateRef.current.get(history.sessionKey) : undefined;
+  const runWorkIdentity: RunWorkIdentity | undefined = adapter?.connection.backendKind === 'codex'
+    && lastAdapterRef.current === adapter && sendScope.active && history.sessionKey
+    && sessionKeyRef.current === history.sessionKey && (!routeSessionKey || routeSessionKey === history.sessionKey) && rememberedPresentationRun?.runId === presentationRunId
+    && validTurnIdentity(rememberedPresentationRun.turnId) && validTurnIdentity(rememberedPresentationRun.inputMessageId)
+    ? { scope: sendScope, sessionKey: history.sessionKey, runId: rememberedPresentationRun.runId,
+      turnId: rememberedPresentationRun.turnId!, inputMessageId: rememberedPresentationRun.inputMessageId!,
+      inputMessageKey: rememberedPresentationRun.inputMessageKey, startedAt: rememberedPresentationRun.startedAt }
+    : undefined;
   const listData = useMemo((): UiMessage[] => {
     const sessionMessages = buildLiveRunListData({
       historyMessages: recoverableMessages,
@@ -3209,7 +3683,14 @@ export function useChatController({
       toolMessages: chatToolMessages,
       liveStreamText: chatStream,
       liveStreamStartedAt: presentationStartedAt,
+      liveMessageTimestampMs: chatStreamTimestampMs,
       activeRunId: presentationRunId,
+      ...(adapter?.connection.backendKind === 'codex' && history.sessionKey
+        && sessionRunStateRef.current.get(history.sessionKey)?.runId === presentationRunId ? {
+          activeTurnId: sessionRunStateRef.current.get(history.sessionKey)?.turnId,
+          inputMessageId: sessionRunStateRef.current.get(history.sessionKey)?.inputMessageId,
+          inputMessageKey: sessionRunStateRef.current.get(history.sessionKey)?.inputMessageKey,
+        } : {}),
       includePlaceholder: true,
     });
     const pairApprovals = pairApprovalProjection.adapter === adapter
@@ -3224,6 +3705,9 @@ export function useChatController({
     }));
     const merged = mergeNewestFirstMessages(sessionMessages, pairMessages);
     if (messageQueue.state.items.length === 0) return merged;
+    const queuedIds = new Set(messageQueue.state.items.map(item => item.id));
+    const withDelivery = merged.map(message => queuedIds.has(message.id) && !message.sendUncertain
+      ? { ...message, delivery: queuedMessageDelivery(messageQueue.state, message.id) } : message);
     // Queued bubbles sit below everything else; an item whose
     // optimistic message already entered history is rendered from history.
     const known = new Set(history.messages.map((message) => message.id));
@@ -3237,8 +3721,8 @@ export function useChatController({
         delivery: queuedMessageDelivery(messageQueue.state, item.id),
       }), renderKey: item.id }))
       .reverse();
-    return queued.length > 0 ? [...queued, ...merged] : merged;
-  }, [adapter, chatStream, chatStreamSegments, chatToolMessages, getUserMessageText, history.messages, messageQueue.state, pairApprovalProjection, presentationRunId, presentationStartedAt, recoverableMessages]);
+    return queued.length > 0 ? [...queued, ...withDelivery] : withDelivery;
+  }, [adapter, chatStream, chatStreamTimestampMs, chatStreamSegments, chatToolMessages, nativeRunIdentityEpoch, getUserMessageText, history.messages, messageQueue.state, pairApprovalProjection, presentationRunId, presentationStartedAt, recoverableMessages]);
 
   useEffect(() => {
     const list = adapter?.management?.approvals?.listExec;
@@ -3349,11 +3833,14 @@ export function useChatController({
 
   const handleRefresh = useCallback(async () => {
     if (connectionState !== "ready") {
-      const ok = await adapter?.probe();
+      const ok = await recoverAdapterConnection(adapter);
       if (!ok) return;
     }
     await history.onRefresh();
   }, [adapter, connectionState, history]);
+
+  const canChooseRunInput = Boolean(adapter?.capabilities.steer && adapter.steer && isSending
+    && currentRunIdRef.current && !pendingImages.length && input.trim());
 
   return {
     draftReady,
@@ -3377,6 +3864,8 @@ export function useChatController({
     refreshingSessions: history.refreshingSessions,
     hasMoreHistory: history.hasMoreHistory,
     loadingMoreHistory: history.loadingMoreHistory,
+    historyLoadMoreError: history.historyLoadMoreError,
+    retryLoadMoreHistory: history.retryLoadMoreHistory,
     historyLoaded: history.historyLoaded,
     scrollToBottomRequestAt,
     messageSubmittedAt,
@@ -3402,16 +3891,14 @@ export function useChatController({
     showAgentAvatar: showAgentAvatar ?? false,
     onRefresh: handleRefresh,
     onLoadMoreHistory: history.onLoadMoreHistory,
-    canSend,
+    canSend: canSend && !runtimeSettingsBusy && !runtimeSettingsUnconfirmed,
     onSend,
     onSteer,
     activeRunId: currentRunIdRef.current,
-    // The identity the live reply row will carry, so a placeholder shown before
-    // the first row reaches the list never remounts when that row lands.
-    pendingReplyRenderKey: currentRunIdRef.current
-      ? liveReplyRenderKey(streamStartedAtRef.current, currentRunIdRef.current, chatStreamSegments.length)
-      : null,
-    canSteer: Boolean(adapter?.capabilities.steer && adapter.steer && isSending && currentRunIdRef.current && !pendingImages.length && input.trim()),
+    runWorkIdentity,
+    canChooseRunInput,
+    canSteer: canChooseRunInput && !steeringPending,
+    steeringPending,
     startVoiceInput, stopVoiceInput, cancelVoiceInput,
     voiceInputSupported,
     recoverVoiceInput, voiceRecoveryCount, voiceRecordingSaved,
@@ -3424,6 +3911,10 @@ export function useChatController({
     showSlashSuggestions,
     onSelectSlashCommand,
     dismissSlashSuggestions,
+    hasRuntimeSettings, runtimeSettingsBusy, runtimeSettingsUnconfirmed, fastMode, permissions,
+    permissionPickerVisible, setPermissionPickerVisible, onSelectFastMode, onSelectPermissions, openPermissionPicker,
+    recentModels,
+    modelScope,
     modelPickerVisible,
     setModelPickerVisible,
     modelPickerLoading,
@@ -3439,7 +3930,7 @@ export function useChatController({
     currentModelDisplayName,
     currentModelSupportsImages,
     currentModelProvider,
-    thinkingLevel: nativeThinkingLevel ?? history.thinkingLevel,
+    thinkingLevel: hasRuntimeSettings ? nativeThinkingLevel : nativeThinkingLevel ?? history.thinkingLevel,
     openThinkPicker: openStaticThinkPicker,
     staticThinkPickerVisible,
     closeStaticThinkPicker,
@@ -3466,6 +3957,8 @@ export function useChatController({
     canAbortCurrentRun: adapter?.capabilities.abort === true,
     queuedMessages: messageQueue.state.items,
     queueHeld: messageQueue.state.held,
+    /** A local send is leaving the device and its run has not started yet. */
+    sendInFlight: messageQueue.state.sendingId !== null,
     canSendQueuedNow: queueDeliveryReady && messageQueue.state.held,
     editQueuedMessage,
     removeQueuedMessage: removeQueuedMessageById,

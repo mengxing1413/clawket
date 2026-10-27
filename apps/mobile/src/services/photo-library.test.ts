@@ -1,3 +1,5 @@
+import { manipulateAsync } from 'expo-image-manipulator';
+jest.mock('expo-image-manipulator', () => ({ manipulateAsync: jest.fn(), SaveFormat: { JPEG: 'jpeg' } }));
 jest.mock('expo-asset', () => ({
   Asset: {
     loadAsync: jest.fn(),
@@ -36,6 +38,7 @@ jest.mock('expo-file-system', () => {
 });
 
 import { Asset } from 'expo-asset';
+import { Platform } from 'react-native';
 import * as MediaLibrary from 'expo-media-library/legacy';
 import {
   saveBundledImageToPhotoLibrary,
@@ -43,6 +46,28 @@ import {
   type SaveBundledImageToPhotoLibraryResult,
   type SaveImageUriToPhotoLibraryResult,
 } from './photo-library';
+import { requestPhotoLibraryWritePermission } from './photo-library-permissions';
+
+const originalPlatform = { OS: Platform.OS, Version: Platform.Version };
+afterEach(() => { Object.assign(Platform, originalPlatform); });
+
+describe('photo write permissions', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it.each([33, 34, 36])('saves on Android API %s without requesting permission to read media', async (version) => {
+    Object.assign(Platform, { OS: 'android', Version: version });
+    await expect(saveImageUriToPhotoLibrary('file:///original.png', 'chat-image')).resolves.toBe('saved');
+    expect(MediaLibrary.requestPermissionsAsync).not.toHaveBeenCalled();
+    expect(MediaLibrary.saveToLibraryAsync).toHaveBeenCalled();
+  });
+
+  it.each([24, 29, 32])('requests only legacy write access on Android API %s', async (version) => {
+    Object.assign(Platform, { OS: 'android', Version: version });
+    (MediaLibrary.requestPermissionsAsync as jest.Mock).mockResolvedValueOnce({ granted: true });
+    await expect(requestPhotoLibraryWritePermission()).resolves.toBe(true);
+    expect(MediaLibrary.requestPermissionsAsync).toHaveBeenCalledWith(true, ['photo']);
+  });
+});
 
 describe('saveBundledImageToPhotoLibrary', () => {
   beforeEach(() => {
@@ -135,9 +160,14 @@ describe('saveBundledImageToPhotoLibrary', () => {
   it('waits for the SDK 57 asynchronous copy before reading its destination', async () => {
     (MediaLibrary.requestPermissionsAsync as jest.Mock).mockResolvedValueOnce({ granted: true });
     let finishCopy!: () => void;
-    copyMock.mockReturnValueOnce(new Promise<void>((resolve) => { finishCopy = resolve; }));
+    let announceCopy!: () => void;
+    const copyStarted = new Promise<void>((resolve) => { announceCopy = resolve; });
+    copyMock.mockImplementationOnce(() => {
+      announceCopy();
+      return new Promise<void>((resolve) => { finishCopy = resolve; });
+    });
     const saving = saveImageUriToPhotoLibrary('file:///tmp/original.png', 'chat-image');
-    await Promise.resolve();
+    await copyStarted;
     expect(copyMock).toHaveBeenCalledTimes(1);
     expect(MediaLibrary.saveToLibraryAsync).not.toHaveBeenCalled();
     finishCopy();
@@ -151,4 +181,22 @@ describe('saveBundledImageToPhotoLibrary', () => {
     await expect(saveImageUriToPhotoLibrary('file:///tmp/original.png', 'chat-image')).rejects.toThrow('disk full');
     expect(MediaLibrary.saveToLibraryAsync).not.toHaveBeenCalled();
   });
+});
+
+it('saves inline images through a temporary local file with write-only photo permission', async () => {
+  jest.clearAllMocks();
+  (MediaLibrary.requestPermissionsAsync as jest.Mock).mockResolvedValueOnce({ granted: true });
+  (manipulateAsync as jest.Mock).mockResolvedValueOnce({ uri: 'file:///inline.jpg' });
+  await expect(saveImageUriToPhotoLibrary('data:image/png;base64,aA==', 'chat-image')).resolves.toBe('saved');
+  expect(MediaLibrary.requestPermissionsAsync).toHaveBeenCalledWith(true, ['photo']);
+  expect(manipulateAsync).toHaveBeenCalled();
+  expect(downloadFileAsyncMock).not.toHaveBeenCalled();
+  expect(deleteMock).toHaveBeenCalledTimes(2);
+});
+it('cleans image save scratch files after a library write failure', async () => {
+  jest.clearAllMocks();
+  (MediaLibrary.requestPermissionsAsync as jest.Mock).mockResolvedValueOnce({ granted: true });
+  (MediaLibrary.saveToLibraryAsync as jest.Mock).mockRejectedValueOnce(new Error('full'));
+  await expect(saveImageUriToPhotoLibrary('file:///original.png', 'chat-image')).rejects.toThrow('full');
+  expect(deleteMock).toHaveBeenCalledTimes(1);
 });

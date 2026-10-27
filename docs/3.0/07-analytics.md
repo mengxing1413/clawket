@@ -73,13 +73,12 @@ PostHog 项目 337268；SDK 与集中式 `src/services/analytics/events.ts` 沿�
 | `app_update_announcement_entry_tapped` | `version`, `entry`（条目 id 枚举）, `action: open_url|open_paywall` | 只有链接与 Pro 条目可点 |
 | `release_notes_opened` | `release_count` | 账户设置 → 更新日志页打开 |
 | `grace_banner_viewed` / `grace_expired` | `days_left` | |
-| `youmind_sign_in_tapped` / `youmind_sign_in_resolved`（现有） | `method` 固定 email | |
-| `sprite_greeting_sent` | — | 首次开场 |
-| `app_rating_tapped`（现有） | | |
+| `app_rating_tapped`（现有） | `source`, `result` | iOS 手动入口直接打开商店；`store_page` 仅表示打开调用成功，不证明评分提交。Android 保留现有行为。 |
+| `app_review_request` | `outcome: requested/skipped/unavailable/error`, `reason: eligible/experience/stale/cooldown/annual_limit/version/native/operation` | iOS 从线程回首页的空闲机会；requested 仅指持久化后调用原生 API，不是展示或评分成功；未知字符串归 other，无消息、身份、星数。 |
 
 ## 4. 删除的事件
 
-`live_session_opened`、`office_*`、`console_entry_tapped`（由 `settings_row_opened` 替代）、`discover_*`（并入 `settings_row_opened{ row: skills_discover }` 与 `skill_install_tapped`）、`clawhub_*`（同上）、`youmind_material_*`、`youmind_*`（除登录两项）、`chat_reply_notification_*`（本地回复通知随 2026-09-19 的设置清理一并删除）、`lifetime_upgrade_announcement_*`、`chat_exec_approval_resolved` 与 `pair_request_resolved`（合并）。
+`live_session_opened`、`office_*`、`console_entry_tapped`（由 `settings_row_opened` 替代）、`discover_*`（并入 `settings_row_opened{ row: skills_discover }` 与 `skill_install_tapped`）、`clawhub_*`（同上）、`chat_reply_notification_*`（本地回复通知随 2026-09-19 的设置清理一并删除）、`lifetime_upgrade_announcement_*`、`chat_exec_approval_resolved` 与 `pair_request_resolved`（合并）。
 
 ## 5. 看板（人在 PostHog 建，规格只定义）
 

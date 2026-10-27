@@ -25,10 +25,10 @@ const ANALYTICS_MODEL_PROVIDERS = new Set([
   'together',
   'venice',
   'xai',
-  'youmind',
 ]);
 
 const CONNECTION_ERROR_CODES = new Set([
+  'unknown',
   'aborted',
   'bad_token',
   'bootstrap_handoff_failed',
@@ -51,6 +51,11 @@ const CONNECTION_ERROR_CODES = new Set([
   'not_connected',
   'pairing_expired',
   'pairing_required',
+  'pairing_invalid_backend',
+  'pairing_backend_mismatch',
+  'pairing_preview_requires_debug_mode',
+  'pairing_official_environment_mismatch',
+  'pairing_saved_connection_mismatch',
   'rate_limited',
   'request_timeout',
   'server',
@@ -212,11 +217,55 @@ export function normalizeAnalyticsEventString(
   property: string,
   value: string,
 ): string {
+  if (event === 'app_review_request') {
+    const values: Record<string, readonly string[]> = {
+      outcome: ['requested', 'skipped', 'unavailable', 'error'],
+      reason: ['eligible', 'experience', 'stale', 'cooldown', 'annual_limit', 'version', 'native', 'operation'],
+    };
+    return values[property]?.includes(value) ? value : 'other';
+  }
+  if (event === 'reconnect') {
+    const values: Record<string, readonly string[]> = {
+      backend: ['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code'],
+      transport: ['local', 'relay', 'tailscale', 'cloudflare', 'custom'],
+      reason: ['tick_timeout', 'socket_close', 'probe_failed', 'seq_gap', 'foreground'],
+      origin: ['foreground', 'health_probe', 'transport', 'adapter'],
+      cause: ['unknown', 'socket_close', 'heartbeat_timeout', 'socket_open_timeout', 'handshake_timeout', 'health_failed', 'not_ready', 'seq_gap'],
+    };
+    return values[property]?.includes(value) ? value : 'other';
+  }
+  if (event === 'transport_diagnostic' && property !== 'code') {
+    const values: Record<string, readonly string[]> = {
+      backend: ['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code'],
+      transport: ['local', 'relay', 'tailscale', 'cloudflare', 'custom'],
+      environment: ['production', 'preview', 'custom', 'unknown'],
+      event: ['error', 'close'],
+      phase: ['idle', 'connecting', 'handshaking', 'ready', 'reconnecting', 'closed'],
+    };
+    return values[property]?.includes(value) ? value : 'other';
+  }
+  if (event === 'connection_diagnostic' && property !== 'code') {
+    const values: Record<string, readonly string[]> = {
+      backend: ['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code', 'unknown'],
+      transport: ['local', 'relay', 'tailscale', 'cloudflare', 'custom'],
+      operation: ['connect', 'foreground_recovery', 'pair_claim', 'pair_claim_code', 'pair_validation'],
+      environment: ['production', 'preview', 'custom', 'unknown'],
+      detected_backend: ['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code', 'unknown'],
+      detected_environment: ['production', 'preview', 'custom', 'unknown'],
+      outcome: ['success', 'error', 'timeout'],
+      phase: ['socket', 'handshake', 'ready', 'fetch', 'body', 'pair_payload', 'pair_claim_result', 'pair_saved_connection'],
+      network: ['offline', 'wifi', 'cellular', 'ethernet', 'other', 'unknown', 'not_sampled'],
+      evidence: ['http_response', 'os_offline', 'unconfirmed', 'completed', 'local_validation'],
+    };
+    if (values[property]) return values[property].includes(value) ? value : 'other';
+    // Numeric diagnostic fields must never become a free-text escape hatch.
+    if (['http_status', 'elapsed_ms'].includes(property)) return 'other';
+  }
   if (event === 'agent_file_activity') {
     const allowed: Record<string, readonly string[]> = {
       action: ['edit', 'saved', 'failed'],
       document: ['agents', 'soul', 'identity', 'user', 'bootstrap', 'memory'],
-      backend: ['openclaw', 'hermes', 'youmind', 'local-model', 'pi', 'codex', 'claude-code'],
+      backend: ['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code'],
     };
     return allowed[property]?.includes(value) ? value : 'other';
   }

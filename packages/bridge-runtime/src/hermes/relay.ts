@@ -1,4 +1,7 @@
+import { RelayOwnerCadence, relayOwnerClientCount } from '../relay-owner-cadence.js';
 import { relayNetworkOptions } from '../relay-network.js';
+import { advertiseRelayOwnerPong, RelayOwnerPong } from '../relay-owner-pong.js';
+import { advertiseRelayTransfer } from '../relay-transfer-lease.js';
 import WebSocket, { type RawData } from 'ws';
 import { RelaySessionState } from '../relay-session.js';
 import type { HermesRelayConfig } from '@clawket/bridge-core';
@@ -73,8 +76,9 @@ export class HermesRelayRuntime {
   private bridgeStatusTimer: NodeJS.Timeout | null = null;
   private bridgeHealthProbeTimer: NodeJS.Timeout | null = null;
   private relayStabilityTimer: NodeJS.Timeout | null = null;
-  private relayPingTimer: NodeJS.Timeout | null = null;
-  private pendingRelayPing: { nonce: string; timeout: NodeJS.Timeout } | null = null;
+  private relayPingTimer: RelayOwnerCadence | null = null;
+  private pendingRelayPing: { nonce: string; timeout: NodeJS.Timeout | null } | null = null;
+  private ownerPong: RelayOwnerPong | null = null;
   private relayPingSeq = 0;
   private readonly relaySession = new RelaySessionState();
   private readonly bridgeSession = new RelaySessionState();
@@ -82,7 +86,8 @@ export class HermesRelayRuntime {
   private bridgeAttempt = 0;
   private stopped = true;
   private bridgeStatusProbe: AbortController | null = null;
-  private readonly pendingBridgeMessages: Array<{ text?: string; data?: Buffer }> = [];
+  private readonly pendingBridgeMessages: Array<{ text?: string; data?: Buffer; source: WebSocket; bytes: number }> = [];
+  private pendingBridgeBytes = 0;
   private bridgeHealthProbeSeq = 0;
   private relayMessageSeq = 0;
   private relayActivityAfterOpen = false;
@@ -136,7 +141,7 @@ export class HermesRelayRuntime {
     this.bridgeSocket?.close();
     this.relaySocket = null;
     this.bridgeSocket = null;
-    this.pendingBridgeMessages.length = 0;
+    this.clearPendingBridgeMessages();
     this.updateSnapshot({
       running: false,
       relayConnected: false,
@@ -154,12 +159,34 @@ export class HermesRelayRuntime {
       return;
     }
     const attempt = this.relaySession.beginConnectAttempt();
+    this.clearPendingBridgeMessages();
     this.relayAttempt = attempt;
     const relay = this.createWebSocket(buildHermesRelayWsUrl(this.options.config), {
       ...this.relayNetwork,
       headers: buildHermesRelayWsHeaders(this.options.config),
     });
     this.relaySocket = relay;
+    this.ownerPong = new RelayOwnerPong({
+      timeoutMs: this.options.relayPongTimeoutMs,
+      send: frame => { if (this.relaySocket === relay && !this.stopped) this.sendFrame(relay, frame, 'relay_out'); },
+      onConfirmed: () => {
+        if (this.relaySocket !== relay || this.stopped) return;
+        if (this.pendingRelayPing?.timeout) clearTimeout(this.pendingRelayPing.timeout);
+        this.pendingRelayPing = null;
+        this.scheduleRelayPing(relay);
+      },
+      onTimeout: () => {
+        if (this.relaySocket !== relay || this.stopped) return;
+        const maximumRetryDelayMs = this.ownerPong?.takeReconnectDelay(Infinity, 1006);
+        this.recycleRelaySocket('relay transport pong timed out', maximumRetryDelayMs);
+        relay.terminate();
+      },
+      log: line => this.log(line),
+    });
+    this.relayPingTimer = new RelayOwnerCadence({ idleIntervalMs: this.options.relayPingIntervalMs ?? 15_000,
+      negotiated: () => this.ownerPong?.negotiated === true, repeat: false,
+      onTick: () => this.sendRelayPing(relay),
+    });
     this.log(`relay connect attempt=${attempt}`);
 
     relay.once('open', () => {
@@ -180,13 +207,15 @@ export class HermesRelayRuntime {
 
     relay.on('pong', (data: Buffer) => {
       if (this.relaySocket !== relay || data.toString() !== this.pendingRelayPing?.nonce) return;
-      clearTimeout(this.pendingRelayPing.timeout);
+      if (this.ownerPong && !this.ownerPong.confirmTransportPong(data.toString())) return;
+      if (this.pendingRelayPing.timeout) clearTimeout(this.pendingRelayPing.timeout);
       this.pendingRelayPing = null;
       this.scheduleRelayPing(relay);
     });
 
     relay.on('message', (data: RawData, isBinary: boolean) => {
       if (this.relaySocket !== relay || this.stopped) return;
+      this.ownerPong?.noteFrameReceived(getWebSocketFrameByteLength(data));
       this.handleRelayMessage(data, isBinary);
     });
 
@@ -206,6 +235,7 @@ export class HermesRelayRuntime {
         return;
       }
       this.relaySocket = null;
+      this.clearPendingBridgeMessages();
       // The Relay deliberately elected a different socket for this owner.
       // Retrying this connection would evict that winner again, allowing two
       // runtimes with the same persisted instanceId to fight indefinitely.
@@ -218,6 +248,7 @@ export class HermesRelayRuntime {
         this.log(message);
         return;
       }
+      const maximumRetryDelayMs = this.ownerPong?.takeReconnectDelay(Infinity, code);
       this.clearRelayPing();
       this.clearRelayStabilityReset();
       this.updateSnapshot({
@@ -233,7 +264,7 @@ export class HermesRelayRuntime {
       this.clearBridgeStatusProbe();
       this.clearBridgeHealthProbeSchedule();
       this.clearPendingBridgeHealthProbe();
-      this.scheduleRelayReconnect();
+      this.scheduleRelayReconnect(maximumRetryDelayMs);
     });
   }
 
@@ -297,6 +328,7 @@ export class HermesRelayRuntime {
 
   private handleRelayMessage(data: RawData, isBinary: boolean): void {
     const relay = this.relaySocket;
+    if (!relay || relay.readyState !== WebSocket.OPEN) return;
     if (relay && this.rejectOversizedFrame(relay, data, 'relay_in')) return;
     this.relayActivityAfterOpen = true;
     if (this.relaySession.confirmHealth()) {
@@ -304,7 +336,7 @@ export class HermesRelayRuntime {
       this.log('relay health confirmed; reconnect backoff reset');
     }
     if (isBinary) {
-      this.forwardOrQueueBridgeMessage({ data: normalizeBinary(data) });
+      this.forwardOrQueueBridgeMessage({ data: normalizeBinary(data) }, relay);
       return;
     }
     const text = normalizeText(data);
@@ -314,15 +346,18 @@ export class HermesRelayRuntime {
       this.handleRelayControl(text);
       return;
     }
-    this.forwardOrQueueBridgeMessage({ text });
+    this.forwardOrQueueBridgeMessage({ text }, relay);
   }
 
   private handleRelayControl(text: string): void {
     try {
       const parsed = JSON.parse(text.slice(RELAY_CONTROL_PREFIX.length)) as { event?: unknown; ts?: unknown; count?: unknown };
-      if (['client_count', 'client_connected', 'client_disconnected'].includes(String(parsed?.event))
-        && typeof parsed.count === 'number' && Number.isSafeInteger(parsed.count) && parsed.count >= 0) {
-        this.relayClientCount = parsed.count;
+      const consumed = this.ownerPong?.handleControl(parsed);
+      this.relayPingTimer?.observe(parsed);
+      if (consumed) return;
+      const clientCount = relayOwnerClientCount(parsed);
+      if (clientCount !== null) {
+        this.relayClientCount = clientCount;
         return;
       }
       if (parsed?.event !== 'gateway_ping') {
@@ -370,20 +405,30 @@ export class HermesRelayRuntime {
     this.sendFrame(relay, text, 'relay_out');
   }
 
-  private forwardOrQueueBridgeMessage(message: { text?: string; data?: Buffer }): void {
+  private forwardOrQueueBridgeMessage(message: { text?: string; data?: Buffer }, source: WebSocket): void {
+    if (this.relaySocket !== source || source.readyState !== WebSocket.OPEN || this.stopped) return;
     const bridge = this.bridgeSocket;
     if (!bridge || bridge.readyState !== WebSocket.OPEN) {
       if (message.text !== undefined) {
         this.traceRelayFrame('bridge_queue', message.text);
       }
-      if (this.pendingBridgeMessages.length < 256) {
-        this.pendingBridgeMessages.push(message);
+      if (this.relaySocket !== source || source.readyState !== WebSocket.OPEN || this.stopped) return;
+      // Count UTF-8 wire bytes, including binary frames. Never silently drop
+      // requests or carry them into a replacement cloud client generation.
+      const bytes = getWebSocketFrameByteLength(message.text ?? message.data!);
+      if (this.pendingBridgeMessages.length >= 256
+        || this.pendingBridgeBytes + bytes > WEBSOCKET_FRAME_LIMIT_BYTES) {
+        this.recycleRelaySocket('bridge_queue_capacity');
+        return;
       }
+      this.pendingBridgeMessages.push({ ...message, source, bytes });
+      this.pendingBridgeBytes += bytes;
       this.connectBridge();
       return;
     }
     if (message.text !== undefined) {
       this.traceRelayFrame('bridge_send', message.text);
+      if (this.relaySocket !== source || this.bridgeSocket !== bridge || this.stopped) return;
       this.sendFrame(bridge, message.text, 'bridge_out');
       return;
     }
@@ -394,17 +439,32 @@ export class HermesRelayRuntime {
 
   private flushPendingBridgeMessages(): void {
     const bridge = this.bridgeSocket;
+    const relay = this.relaySocket;
     if (!bridge || bridge.readyState !== WebSocket.OPEN) return;
     while (this.pendingBridgeMessages.length > 0) {
       const next = this.pendingBridgeMessages.shift();
       if (!next) break;
-      if (next.text !== undefined) {
-        this.traceRelayFrame('bridge_flush', next.text);
-        this.sendFrame(bridge, next.text, 'bridge_out');
-      } else if (next.data) {
-        this.sendFrame(bridge, next.data, 'bridge_out');
+      this.pendingBridgeBytes -= next.bytes;
+      if (next.source !== relay || this.relaySocket !== relay || relay?.readyState !== WebSocket.OPEN
+        || this.bridgeSocket !== bridge || bridge.readyState !== WebSocket.OPEN || this.stopped) {
+        this.clearPendingBridgeMessages();
+        return;
       }
+      if (next.text !== undefined) this.traceRelayFrame('bridge_flush', next.text);
+      // Diagnostic callbacks are not allowed to revive a retired batch.
+      if (this.relaySocket !== relay || this.bridgeSocket !== bridge || this.stopped) {
+        // Replacement/stop already clears the retired queue. A synchronous
+        // observer may have queued successor work; do not clear that batch.
+        return;
+      }
+      try { this.sendFrame(bridge, next.text ?? next.data!, 'bridge_out'); }
+      catch { this.recycleRelaySocket('bridge_queue_send_failed'); return; }
     }
+  }
+
+  private clearPendingBridgeMessages(): void {
+    this.pendingBridgeMessages.length = 0;
+    this.pendingBridgeBytes = 0;
   }
 
   private traceRelayFrame(direction: 'relay_in' | 'bridge_send' | 'bridge_queue' | 'bridge_flush' | 'bridge_in', text: string): void {
@@ -439,14 +499,14 @@ export class HermesRelayRuntime {
     }
   }
 
-  private scheduleRelayReconnect(): void {
+  private scheduleRelayReconnect(maximumDelayMs = Infinity): void {
     if (this.stopped || this.reconnectTimer) return;
     const baseDelayMs = this.options.reconnectBaseDelayMs ?? 1_000;
     const maxDelayMs = this.options.reconnectMaxDelayMs ?? 15_000;
-    const delayMs = Math.max(
+    const delayMs = Math.min(maximumDelayMs, Math.max(
       this.relaySession.reconnectDelayMs(baseDelayMs, maxDelayMs),
       computeBackoff(this.relayAttempt, baseDelayMs, maxDelayMs),
-    );
+    ));
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connectRelay();
@@ -625,11 +685,12 @@ export class HermesRelayRuntime {
     this.pendingBridgeHealthProbe = null;
   }
 
-  private recycleRelaySocket(reason: string): void {
+  private recycleRelaySocket(reason: string, maximumRetryDelayMs = Infinity): void {
     const relay = this.relaySocket;
     if (!relay) return;
 
     this.relaySocket = null;
+    this.clearPendingBridgeMessages();
     this.clearRelayPing();
     this.clearRelayStabilityReset();
     this.clearBridgeStatusProbe();
@@ -647,7 +708,7 @@ export class HermesRelayRuntime {
     }
 
     if (!this.stopped) {
-      this.scheduleRelayReconnect();
+      this.scheduleRelayReconnect(maximumRetryDelayMs);
     }
   }
 
@@ -655,31 +716,39 @@ export class HermesRelayRuntime {
   // ping/pong keeps that leg live even when Relay application heartbeats sleep.
   // Pong proves transport reachability only; it must not mark the backend ready.
   private scheduleRelayPing(relay: WebSocket): void {
-    if (this.stopped || this.relaySocket !== relay || this.relayPingTimer || this.pendingRelayPing) return;
-    this.relayPingTimer = setTimeout(() => {
-      this.relayPingTimer = null;
-      if (this.stopped || this.relaySocket !== relay || relay.readyState !== WebSocket.OPEN) return;
-      const nonce = `clawket-${++this.relayPingSeq}`;
-      const timeout = setTimeout(() => {
-        if (this.relaySocket !== relay || this.pendingRelayPing?.nonce !== nonce) return;
-        this.log('relay transport pong timed out; recycling cloud socket');
-        this.recycleRelaySocket('relay transport pong timed out');
-        // A half-open connection cannot complete a graceful close handshake.
-        relay.terminate();
-      }, this.options.relayPongTimeoutMs ?? 10_000);
-      this.pendingRelayPing = { nonce, timeout };
-      try {
-        relay.ping(nonce);
-      } catch {
-        this.recycleRelaySocket('relay transport ping failed');
-        relay.terminate();
-      }
-    }, this.options.relayPingIntervalMs ?? 15_000);
+    if (this.stopped || this.relaySocket !== relay || this.pendingRelayPing) return;
+    this.relayPingTimer?.schedule();
+  }
+
+  private sendRelayPing(relay: WebSocket): void {
+    if (this.stopped || this.relaySocket !== relay || relay.readyState !== WebSocket.OPEN) return;
+    const nonce = `clawket-${++this.relayPingSeq}`;
+    const negotiated = this.ownerPong?.negotiated === true;
+    const timeout = negotiated ? null : setTimeout(() => {
+      if (this.relaySocket !== relay || this.pendingRelayPing?.nonce !== nonce) return;
+      if (this.ownerPong?.request()) return;
+      this.log('relay transport pong timed out; recycling cloud socket');
+      this.recycleRelaySocket('relay transport pong timed out');
+      // A half-open connection cannot complete a graceful close handshake.
+      relay.terminate();
+    }, this.options.relayPongTimeoutMs ?? 10_000);
+    // A transfer check may already own this socket. Its confirmation schedules
+    // the next ping; never dispatch an untracked protocol nonce.
+    if (negotiated && !this.ownerPong!.startProtocolPing(this.options.relayPongTimeoutMs ?? 10_000, nonce)) return;
+    this.pendingRelayPing = { nonce, timeout };
+    try {
+      relay.ping(nonce);
+    } catch {
+      this.recycleRelaySocket('relay transport ping failed');
+      relay.terminate();
+    }
   }
 
   private clearRelayPing(): void {
-    if (this.relayPingTimer) clearTimeout(this.relayPingTimer);
-    if (this.pendingRelayPing) clearTimeout(this.pendingRelayPing.timeout);
+    this.ownerPong?.dispose();
+    this.ownerPong = null;
+    this.relayPingTimer?.dispose();
+    if (this.pendingRelayPing?.timeout) clearTimeout(this.pendingRelayPing.timeout);
     this.relayPingTimer = null;
     this.pendingRelayPing = null;
   }
@@ -735,6 +804,7 @@ export class HermesRelayRuntime {
   private sendFrame(socket: WebSocket, data: WebSocketFrameData, direction: string): boolean {
     if (this.rejectOversizedFrame(socket, data, direction)) return false;
     socket.send(data as WebSocket.Data);
+    if (socket === this.relaySocket) this.ownerPong?.noteTransfer(getWebSocketFrameByteLength(data));
     return true;
   }
 
@@ -757,6 +827,8 @@ export function buildHermesRelayWsUrl(config: HermesRelayConfig): string {
   base.searchParams.set('bridgeId', config.bridgeId);
   base.searchParams.set('role', 'gateway');
   base.searchParams.set('clientId', config.instanceId);
+  advertiseRelayOwnerPong(base);
+  advertiseRelayTransfer(base);
   return base.toString();
 }
 

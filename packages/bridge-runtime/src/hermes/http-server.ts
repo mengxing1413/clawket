@@ -26,6 +26,7 @@ export type HermesHttpContextSnapshot = {
 };
 
 export abstract class HermesHttpServerMethods {
+  declare projectArtifactContent: (key: string, content: unknown) => unknown;
   declare getBridgeCapabilities: () => string[];
   declare apiBaseUrl: string;
   declare apiKey: string | null;
@@ -40,7 +41,8 @@ export abstract class HermesHttpServerMethods {
   async handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const pathname = readRequestPathname(req.url);
     if (req.method === 'GET' && (pathname === '/health' || pathname === '/v1/hermes/health')) {
-      const reachable = await probeHermesApi(this.apiBaseUrl, this.apiKey);
+      const apiStatus = await inspectHermesApi(this.apiBaseUrl, this.apiKey);
+      const reachable = apiStatus === 'ready';
       this.writeJson(res, 200, {
         ok: true,
         running: this.snapshot.running,
@@ -50,6 +52,8 @@ export abstract class HermesHttpServerMethods {
         wsPath: '/v1/hermes/ws',
         hermesApiBaseUrl: this.apiBaseUrl,
         hermesApiReachable: reachable,
+        // A fixed cause lets pairing explain a degraded Bridge without exposing logs.
+        ...(reachable ? {} : { hermesApiIssue: apiStatus === 'unauthorized' ? 'credential_mismatch' : 'unreachable' }),
         capabilities: this.getBridgeCapabilities(),
         ...(this.bridgeVersion ? { bridgeVersion: this.bridgeVersion } : {}),
       });
@@ -189,6 +193,10 @@ export abstract class HermesHttpServerMethods {
   }
 
   broadcastEvent(event: string, payload: unknown): void {
+    const chat = payload as { state?: string; sessionKey?: string; message?: { role?: string; content?: unknown } } | null;
+    if (event === 'chat' && chat?.state === 'final' && typeof chat.sessionKey === 'string' && chat.message?.role === 'assistant') {
+      payload = { ...chat, message: { ...chat.message, content: this.projectArtifactContent(chat.sessionKey, chat.message.content) } };
+    }
     for (const client of this.clients) {
       this.sendEvent(client.socket, event, payload);
     }

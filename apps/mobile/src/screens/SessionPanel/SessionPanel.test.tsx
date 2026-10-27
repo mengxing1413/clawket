@@ -4,6 +4,7 @@ import {
   fireEvent,
   render,
   waitFor,
+  within,
 } from '@testing-library/react-native';
 import type {
   AgentDescriptor,
@@ -13,7 +14,8 @@ import type {
 
 import { useConnections, useRoster, type RosterConnectionGroup } from '../../connection';
 import { analyticsEvents } from '../../services/analytics/events';
-import { FontSize, StatusSize } from '../../theme/tokens';
+import { FontSize, Motion, Space, StatusSize } from '../../theme/tokens';
+import { CONNECTION_STATUS_FLOATING_CLEARANCE } from '../../components/ui/ConnectionStatusPill';
 import {
   SessionPanel,
   SessionPanelView,
@@ -73,8 +75,10 @@ jest.mock('react-native', () => {
     ),
   );
   return {
+    ...require('../../../__mocks__/native-animated'),
     Platform: { OS: 'android', select: (options: Record<string, unknown>) => options.android ?? options.default },
     Keyboard: { dismiss: jest.fn() },
+    AppState: { currentState: 'active', addEventListener: () => ({ remove: jest.fn() }) },
     Pressable: host('Pressable'),
     ScrollView: host('ScrollView'),
     useWindowDimensions: () => ({ width: 393, height: 852, fontScale: 1 }),
@@ -155,6 +159,8 @@ jest.mock('../../components/ui/FloatingButton', () => {
   const { Pressable } = require('react-native');
   return {
     FloatingButton: (props: Record<string, unknown>) => ReactRuntime.createElement(Pressable, props),
+    createFloatingSurfaceStyle: () => ({ backgroundColor: 'floating' }),
+    FLOATING_BUTTON_STROKE_WIDTH: 1.75,
   };
 });
 
@@ -399,6 +405,26 @@ describe('SessionPanelView', () => {
     consoleErrorSpy.mockRestore();
   });
 
+  it('renders only the first screen of sessions while the panel slides up, then widens the list window', () => {
+    jest.useFakeTimers();
+    try {
+      const view = render(<SessionPanelView {...props()} />);
+      const windowSize = () => view.getByTestId('session-panel-scroll').props.windowSize;
+      // Rows the list renders ahead would mount during the slide and drop its frames.
+      expect(windowSize()).toBe(1);
+      act(() => jest.advanceTimersByTime(Motion.duration.slow + 79));
+      expect(windowSize()).toBe(1);
+      act(() => jest.advanceTimersByTime(1));
+      expect(windowSize()).toBe(5);
+      // Each opening starts on its first screen again.
+      view.rerender(<SessionPanelView {...props({ visible: false })} />);
+      view.rerender(<SessionPanelView {...props()} />);
+      expect(windowSize()).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('shows the current Agent in the header pill with roster-style rows and chips', () => {
     const view = render(<SessionPanelView {...props()} />);
     expect(mockedAnalyticsEvents.sessionPanelOpened).toHaveBeenCalledWith({ session_count: rows.length });
@@ -533,6 +559,38 @@ describe('SessionPanelView', () => {
     expect(view.getByText('Main session')).toBeTruthy();
   });
 
+  it('opens the lone Agent profile from the pill and closes the panel first', () => {
+    const builderOnly = source.agents[1]!;
+    const onClose = jest.fn();
+    const onOpenAgentProfile = jest.fn();
+    const single = {
+      rows: rows.filter((row) => row.agentId === 'builder' && row.kind === 'main'),
+      agents: [builderOnly.agent],
+      currentAgentId: 'builder',
+      currentSessionKey: 'agent:builder:main',
+    };
+    const view = render(<SessionPanelView {...props({ ...single, onClose, onOpenAgentProfile })} />);
+    expect(view.getByLabelText('Agent settings')).toBeTruthy();
+    fireEvent.press(view.getByTestId('session-panel-agent-pill'));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onOpenAgentProfile).toHaveBeenCalledWith(builderOnly.agent);
+    expect(onClose.mock.invocationCallOrder[0]).toBeLessThan(onOpenAgentProfile.mock.invocationCallOrder[0]!);
+
+    // Without the handler, or while sessions need permission, the pill stays a label.
+    view.rerender(<SessionPanelView {...props({ ...single, onClose })} />);
+    expect(view.queryByLabelText('Agent settings')).toBeNull();
+    view.rerender(<SessionPanelView {...props({ ...single, state: 'permission', onClose, onOpenAgentProfile })} />);
+    expect(view.queryByLabelText('Agent settings')).toBeNull();
+  });
+
+  it('keeps the Agent switcher on the pill when several Agents share the panel', () => {
+    const onOpenAgentProfile = jest.fn();
+    const view = render(<SessionPanelView {...props({ onOpenAgentProfile })} />);
+    fireEvent.press(view.getByTestId('session-panel-agent-pill'));
+    expect(view.getByTestId('session-panel-agent-menu')).toBeTruthy();
+    expect(onOpenAgentProfile).not.toHaveBeenCalled();
+  });
+
   it('selects sessions and reports the panel as the source', async () => {
     const onSelectSession = jest.fn(async () => undefined);
     const onClose = jest.fn();
@@ -559,6 +617,92 @@ describe('SessionPanelView', () => {
     fireEvent.press(row);
     expect(onSelectSession).not.toHaveBeenCalled();
     expect(view.getByTestId('session-panel-action-export')).toBeTruthy();
+  });
+
+  it.each(['reset', 'delete'] as const)('shows a rejected %s and leaves its conversation available for retry', async (action) => {
+    const onSessionAction = jest.fn().mockRejectedValueOnce(new Error('Stop the task and wait for it to finish first'))
+      .mockResolvedValueOnce(undefined);
+    const row = { ...rowById('agent:main:main'), hasActiveRun: true };
+    const view = render(<SessionPanelView {...props({ rows: [row], platform: 'codex', onSessionAction })} />);
+    const confirm = async () => {
+      fireEvent(view.getByTestId(`session-panel-row-${row.id}`), 'longPress');
+      chooseAfterDismiss(view, action);
+      await act(async () => { fireEvent.press(view.getByLabelText(action === 'reset' ? 'Reset' : 'Delete')); });
+    };
+    await confirm();
+    expect(onSessionAction).toHaveBeenCalledWith(row, action);
+    expect(view.getByText('Save Failed')).toBeTruthy();
+    expect(view.getByTestId(`session-panel-row-${row.id}`)).toBeTruthy();
+    await confirm();
+    expect(onSessionAction).toHaveBeenCalledTimes(2);
+    expect(view.queryByText('Save Failed')).toBeNull();
+  });
+
+  it.each(['reset', 'delete'] as const)('discards an old %s failure after changing the connection scope', async (action) => {
+    let reject!: (reason: Error) => void;
+    const onSessionAction = jest.fn(() => new Promise<void>((_resolve, rejectResult) => { reject = rejectResult; }));
+    const row = rowById('agent:main:main');
+    const view = render(<SessionPanelView {...props({ rows: [row], archiveScope: 'before', onSessionAction })} />);
+    fireEvent(view.getByTestId(`session-panel-row-${row.id}`), 'longPress');
+    chooseAfterDismiss(view, action);
+    await act(async () => { fireEvent.press(view.getByLabelText(action === 'reset' ? 'Reset' : 'Delete')); });
+    view.rerender(<SessionPanelView {...props({ rows: [row], archiveScope: 'after', onSessionAction })} />);
+    await act(async () => { reject(new Error('Old connection rejected the action')); });
+    expect(view.queryByText('Save Failed')).toBeNull();
+    expect(view.getByTestId(`session-panel-row-${row.id}`)).toBeTruthy();
+  });
+
+  it('keeps a newer successful confirmation when an earlier action rejects later', async () => {
+    let reject!: (reason: Error) => void;
+    const onSessionAction = jest.fn()
+      .mockImplementationOnce(() => new Promise<void>((_resolve, rejectResult) => { reject = rejectResult; }))
+      .mockResolvedValueOnce(undefined);
+    const row = rowById('agent:main:main');
+    const view = render(<SessionPanelView {...props({ rows: [row], onSessionAction })} />);
+    for (const action of ['reset', 'delete'] as const) {
+      fireEvent(view.getByTestId(`session-panel-row-${row.id}`), 'longPress');
+      chooseAfterDismiss(view, action);
+      await act(async () => { fireEvent.press(view.getByLabelText(action === 'reset' ? 'Reset' : 'Delete')); });
+    }
+    expect(onSessionAction).toHaveBeenCalledTimes(2);
+    await act(async () => { reject(new Error('The old reset failed after delete succeeded')); });
+    expect(view.queryByText('Save Failed')).toBeNull();
+  });
+
+  it('honors Codex action restrictions until its native terminal descriptor restores them', () => {
+    const row = { ...rowById('agent:main:main'), hasActiveRun: true,
+      allowedActions: { pin: true, rename: true, reset: false, delete: false } };
+    const view = render(<SessionPanelView {...props({ rows: [row], platform: 'codex' })} />);
+    const openActions = () => fireEvent(view.getByTestId(`session-panel-row-${row.id}`), 'longPress');
+    openActions();
+    expect(view.queryByTestId('session-panel-action-reset')).toBeNull();
+    expect(view.queryByTestId('session-panel-action-delete')).toBeNull();
+    view.rerender(<SessionPanelView {...props({ rows: [{ ...row, hasActiveRun: false }], platform: 'codex' })} />);
+    openActions();
+    expect(view.queryByTestId('session-panel-action-reset')).toBeNull();
+    view.rerender(<SessionPanelView {...props({ rows: [{ ...row, hasActiveRun: false,
+      allowedActions: { ...row.allowedActions, reset: true, delete: true } }], platform: 'codex' })} />);
+    openActions();
+    expect(view.getByTestId('session-panel-action-reset')).toBeTruthy();
+    expect(view.getByTestId('session-panel-action-delete')).toBeTruthy();
+  });
+
+  it.each(['openclaw', 'hermes', 'pi'] as const)('retains backend-authorized active actions for %s', (platform) => {
+    const row = { ...rowById('agent:main:main'), hasActiveRun: true };
+    const view = render(<SessionPanelView {...props({ rows: [row], platform })} />);
+    fireEvent(view.getByTestId(`session-panel-row-${row.id}`), 'longPress');
+    expect(view.getByTestId('session-panel-action-reset')).toBeTruthy();
+    expect(view.getByTestId('session-panel-action-delete')).toBeTruthy();
+  });
+
+  it('shows a synchronous reset failure through the same retryable notice', async () => {
+    const onSessionAction = jest.fn(() => { throw new Error('Unavailable'); });
+    const row = rowById('agent:main:main');
+    const view = render(<SessionPanelView {...props({ rows: [row], onSessionAction })} />);
+    fireEvent(view.getByTestId(`session-panel-row-${row.id}`), 'longPress');
+    chooseAfterDismiss(view, 'reset');
+    await act(async () => { fireEvent.press(view.getByLabelText('Reset')); });
+    expect(view.getByText('Save Failed')).toBeTruthy();
   });
 
   it('runs home toggle, reset and delete after the action sheet dismisses and labels shown rows as Hide', async () => {
@@ -708,6 +852,12 @@ describe('SessionPanelView', () => {
     expect(view.getByTestId('session-panel-reconnecting')).toBeTruthy();
     expect(view.queryByTestId('session-panel-offline')).toBeNull();
     expect(view.getByText('Main session')).toBeTruthy();
+    // Connection state floats over the bottom of the list instead of leading it, and the last row can
+    // still scroll above it.
+    const list = view.getByTestId('session-panel-scroll');
+    expect(list.findAll((node) => node.props.testID === 'session-panel-reconnecting')).toHaveLength(0);
+    expect(flattenStyle(view.getByTestId('session-panel-reconnecting').props.style)).toMatchObject({ position: 'absolute', bottom: Space.sm });
+    expect(flattenStyle(list.props.contentContainerStyle).paddingBottom).toBe(Space.xxl + CONNECTION_STATUS_FLOATING_CLEARANCE);
 
     view.rerender(<SessionPanelView {...props({ state: 'permission' })} />);
     expect(view.getByTestId('session-panel-permission')).toBeTruthy();
@@ -749,7 +899,7 @@ it('does not offer session creation without a handler or an Agent', () => {
    const onCreateSession = jest.fn(() => new Promise<void>(resolve => { finish = resolve; }));
    const onClose = jest.fn();
    const view = render(<SessionPanelView {...props({ onCreateSession, onClose })} />);
-   expect(view.getByTestId('session-panel').props.snapPoints).toEqual(['95%']);
+   expect(view.getByTestId('session-panel').props.snapPoints).toEqual(['98%']);
    const create = view.getByTestId('session-panel-create');
    fireEvent.press(create);
    fireEvent.press(create);
@@ -759,6 +909,18 @@ it('does not offer session creation without a handler or an Agent', () => {
    await act(async () => finish());
    expect(onClose).toHaveBeenCalledTimes(1);
  });
+
+it('does not dismiss or show a failure when creation belongs to a retired presentation', async () => {
+  const onCreateSession = jest.fn(() => Promise.resolve(false as const));
+  const onClose = jest.fn();
+  const view = render(<SessionPanelView {...props({ onCreateSession, onClose })} />);
+  fireEvent.press(view.getByTestId('session-panel-create'));
+  await act(async () => Promise.resolve());
+  expect(onCreateSession).toHaveBeenCalledTimes(1);
+  expect(onClose).not.toHaveBeenCalled();
+  expect(view.queryByText('Save Failed')).toBeNull();
+  expect(view.getByTestId('session-panel-create').props.disabled).toBe(false);
+});
 
 
 describe('project refresh lifecycle', () => {
@@ -824,4 +986,218 @@ describe('project refresh lifecycle', () => {
     tree.rerender(<SessionPanel {...props} visible />);
     expect(tree.queryByTestId('session-panel-create')).toBeNull();
   });
+});
+
+it('loads archives only on request and restores without opening a writable chat', async () => {
+  const archived = { ...rowById('agent:main:main'), archived: true, sessionId: 'native-id', allowedActions: { archive: true, rename: false, reset: false, delete: false, pin: false }, hasActiveRun: false };
+  const onLoadArchived = jest.fn().mockResolvedValue([archived]);
+  const onSessionAction = jest.fn().mockResolvedValue(undefined);
+  const onSelectSession = jest.fn();
+  const view = render(<SessionPanelView {...props({ capabilities: { ...capabilities, sessionArchive: true }, onLoadArchived, onSessionAction, onSelectSession })} />);
+  expect(onLoadArchived).not.toHaveBeenCalled();
+  await act(async () => { fireEvent.press(view.getByTestId('session-panel-archived')); });
+  fireEvent.press(view.getByTestId(`session-panel-row-${archived.id}`));
+  expect(onSelectSession).not.toHaveBeenCalled();
+  expect(view.getByText('Restore conversation')).toBeTruthy();
+  expect(view.queryByTestId('session-panel-action-delete')).toBeNull();
+  await act(async () => { chooseAfterDismiss(view, 'archive'); });
+  expect(onSessionAction).toHaveBeenCalledWith(archived, 'archive');
+  expect(view.queryByTestId(`session-panel-row-${archived.id}`)).toBeNull();
+});
+
+it('shows archive failure and keeps the original conversation available', async () => {
+  const original = { ...rowById('agent:main:main'), sessionId: 'native-id', allowedActions: { archive: true, rename: false, reset: false, delete: false, pin: false }, hasActiveRun: false };
+  const onSessionAction = jest.fn().mockRejectedValue(new Error('Owner rejected archive'));
+  const view = render(<SessionPanelView {...props({ rows: [original], capabilities: { ...capabilities, sessionArchive: true }, onSessionAction })} />);
+  fireEvent(view.getByTestId(`session-panel-row-${original.id}`), 'longPress');
+  await act(async () => { chooseAfterDismiss(view, 'archive'); });
+  expect(view.getByText('Save Failed')).toBeTruthy();
+  expect(view.getByTestId(`session-panel-row-${original.id}`)).toBeTruthy();
+});
+
+it.each(['resolve', 'reject'] as const)('ignores an old connection restore %s after opening another archive scope', async outcome => {
+  const archived = { ...rowById('agent:main:main'), archived: true, sessionId: 'native-id', allowedActions: { archive: true, rename: false, reset: false, delete: false, pin: false }, hasActiveRun: false };
+  let resolve!: () => void;
+  let reject!: (reason: Error) => void;
+  const onSessionAction = jest.fn(() => new Promise<void>((done, fail) => { resolve = done; reject = fail; }));
+  const shared = { capabilities: { ...capabilities, sessionArchive: true }, onLoadArchived: jest.fn().mockResolvedValue([archived]), onSessionAction };
+  const view = render(<SessionPanelView {...props({ ...shared, archiveScope: 'first' })} />);
+  await act(async () => { fireEvent.press(view.getByTestId('session-panel-archived')); });
+  fireEvent.press(view.getByTestId(`session-panel-row-${archived.id}`));
+  act(() => { chooseAfterDismiss(view, 'archive'); });
+  view.rerender(<SessionPanelView {...props({ ...shared, archiveScope: 'second' })} />);
+  await act(async () => { fireEvent.press(view.getByTestId('session-panel-archived')); });
+  await act(async () => { if (outcome === 'resolve') resolve(); else reject(new Error('Old restore failed')); });
+  expect(view.queryByText('Save Failed')).toBeNull();
+  expect(view.getByTestId(`session-panel-row-${archived.id}`)).toBeTruthy();
+});
+
+describe('project and archive scope chips', () => {
+  const work = { id: 'work', name: 'clawket', path: '/work/clawket', available: true };
+  const lab = { id: 'lab', name: 'workspace-ui-operator', path: '/lab/ui', available: true };
+  const direct = { ...rowById('agent:main:direct:Lucy'), project: work };
+  const design = { ...rowById('agent:main:channel:Design'), project: work };
+  const operations = { ...rowById('agent:main:channel:Operations'), project: lab };
+  const archived = {
+    ...rowById('agent:main:cron:Daily report'),
+    project: lab,
+    archived: true,
+    sessionId: 'native-id',
+    hasActiveRun: false,
+    allowedActions: { archive: true, rename: false, reset: false, delete: false, pin: false },
+  };
+  function scoped(patch: Partial<SessionPanelViewProps> = {}): SessionPanelViewProps {
+    return props({
+      rows: [direct, design, operations],
+      projects: [work, lab],
+      capabilities: { ...capabilities, sessionArchive: true },
+      onLoadArchived: jest.fn().mockResolvedValue([archived]),
+      ...patch,
+    });
+  }
+  function selected(view: ReturnType<typeof render>, testID: string): unknown {
+    return view.getByTestId(testID).props.accessibilityState?.selected;
+  }
+
+  beforeEach(() => {
+    mockTheme = { scheme: 'light', colors: lightColors };
+  });
+
+  it('keeps the project filter and the archive switch in one quiet chip row', () => {
+    const view = render(<SessionPanelView {...scoped()} />);
+    const scope = view.getByTestId('session-panel-scope');
+    expect(within(scope).getByText('All projects')).toBeTruthy();
+    expect(within(scope).getByText('Archived')).toBeTruthy();
+    expect(view.getByTestId('session-panel-archived').props.accessibilityLabel).toBe('Archived conversations');
+    expect(selected(view, 'codex-project-filter')).toBe(false);
+    expect(selected(view, 'session-panel-archived')).toBe(false);
+    expect(flattenStyle(view.getByTestId('codex-project-filter').props.style))
+      .toEqual(expect.objectContaining({ backgroundColor: lightColors.surface }));
+    // Projects replace the channel chips; the old stacked text links are gone.
+    expect(view.queryByTestId('session-panel-chips')).toBeNull();
+    expect(view.queryByText('Back to conversations')).toBeNull();
+
+    // A project backend without archive support keeps only the project chip.
+    view.rerender(<SessionPanelView {...scoped({ capabilities, onLoadArchived: undefined })} />);
+    expect(within(view.getByTestId('session-panel-scope')).getByTestId('codex-project-filter')).toBeTruthy();
+    expect(view.queryByTestId('session-panel-archived')).toBeNull();
+  });
+
+  it('marks the chosen project in ink and counts conversations in the picker', () => {
+    const view = render(<SessionPanelView {...scoped()} />);
+    fireEvent.press(view.getByTestId('codex-project-filter'));
+    const picker = view.getByTestId('codex-project-picker');
+    // The checked row shows no count; the others say how many conversations the choice would list.
+    expect(within(picker).getByTestId('codex-project-all')).toBeTruthy();
+    expect(within(picker).queryByText('3')).toBeNull();
+    expect(within(picker).getByText('2')).toBeTruthy();
+    expect(within(picker).getByText('1')).toBeTruthy();
+
+    fireEvent.press(within(picker).getByTestId('codex-project-work'));
+    expect(view.queryByTestId('codex-project-picker')).toBeNull();
+    const chip = view.getByTestId('codex-project-filter');
+    expect(selected(view, 'codex-project-filter')).toBe(true);
+    expect(within(chip).getByText('clawket')).toBeTruthy();
+    expect(flattenStyle(chip.props.style)).toEqual(expect.objectContaining({ backgroundColor: lightColors.ink }));
+    expect(view.getByTestId(`session-panel-row-${direct.id}`)).toBeTruthy();
+    expect(view.queryByTestId(`session-panel-row-${operations.id}`)).toBeNull();
+    expect(view.queryByTestId(`session-panel-row-${direct.id}-project`)).toBeNull();
+  });
+
+  it('selects the archive at once and a second press returns to the live list', async () => {
+    let finish!: (value: ReadonlyArray<SessionPanelRow>) => void;
+    const onLoadArchived = jest.fn(() => new Promise<ReadonlyArray<SessionPanelRow>>((resolve) => { finish = resolve; }));
+    const view = render(<SessionPanelView {...scoped({ onLoadArchived, onCreateSession: jest.fn() })} />);
+    expect(view.getByTestId('session-panel-create')).toBeTruthy();
+
+    fireEvent.press(view.getByTestId('session-panel-archived'));
+    expect(selected(view, 'session-panel-archived')).toBe(true);
+    expect(view.getByTestId('session-panel-loading')).toBeTruthy();
+    expect(view.queryByTestId('session-panel-create')).toBeNull();
+
+    fireEvent.press(view.getByTestId('session-panel-archived'));
+    expect(selected(view, 'session-panel-archived')).toBe(false);
+    expect(view.getByTestId(`session-panel-row-${direct.id}`)).toBeTruthy();
+    expect(view.getByTestId('session-panel-create')).toBeTruthy();
+    // The cancelled load cannot switch the list afterwards.
+    await act(async () => finish([archived]));
+    expect(selected(view, 'session-panel-archived')).toBe(false);
+    expect(view.queryByTestId(`session-panel-row-${archived.id}`)).toBeNull();
+  });
+
+  it('explains a failed archive load and retries from the notice', async () => {
+    const onLoadArchived = jest.fn()
+      .mockRejectedValueOnce(new Error('Bridge unavailable'))
+      .mockResolvedValueOnce([archived]);
+    const view = render(<SessionPanelView {...scoped({ onLoadArchived })} />);
+    await act(async () => { fireEvent.press(view.getByTestId('session-panel-archived')); });
+    expect(view.getByText('Could not load archived conversations')).toBeTruthy();
+    expect(view.queryByText('Save Failed')).toBeNull();
+    expect(selected(view, 'session-panel-archived')).toBe(false);
+    expect(view.getByTestId(`session-panel-row-${direct.id}`)).toBeTruthy();
+
+    await act(async () => { fireEvent.press(view.getByTestId('session-panel-archive-error-action')); });
+    expect(onLoadArchived).toHaveBeenCalledTimes(2);
+    expect(view.queryByTestId('session-panel-archive-error')).toBeNull();
+    expect(selected(view, 'session-panel-archived')).toBe(true);
+    expect(view.getByTestId(`session-panel-row-${archived.id}`)).toBeTruthy();
+  });
+
+  it('keeps the chosen project while browsing the archive', async () => {
+    const view = render(<SessionPanelView {...scoped()} />);
+    fireEvent.press(view.getByTestId('codex-project-filter'));
+    fireEvent.press(view.getByTestId('codex-project-work'));
+    await act(async () => { fireEvent.press(view.getByTestId('session-panel-archived')); });
+    expect(view.getByText('No archived conversations')).toBeTruthy();
+
+    fireEvent.press(view.getByTestId('codex-project-filter'));
+    fireEvent.press(view.getByTestId('codex-project-lab'));
+    expect(view.getByTestId(`session-panel-row-${archived.id}`)).toBeTruthy();
+    expect(selected(view, 'session-panel-archived')).toBe(true);
+  });
+
+  it('appends the archive switch to channel chips on a backend without projects', () => {
+    const view = render(<SessionPanelView {...props({
+      capabilities: { ...capabilities, sessionArchive: true },
+      onLoadArchived: jest.fn().mockResolvedValue([]),
+    })} />);
+    expect(within(view.getByTestId('session-panel-chips')).getByTestId('session-panel-archived')).toBeTruthy();
+    expect(view.queryByTestId('session-panel-scope')).toBeNull();
+  });
+});
+
+
+it('shows the same working arc on ordinary Codex tiles while retaining unread and accessibility status', () => {
+  const direct = rows.find(row => row.kind === 'direct')!;
+  const working = { ...direct, hasActiveRun: true, unread: true, attention: null, kind: 'direct' as const };
+  const view = render(<SessionPanelView {...props({ rows: [working], currentSessionKey: 'other', platform: 'codex' })} />);
+  expect(view.getByTestId(`session-panel-row-${working.id}-running`, { includeHiddenElements: true })).toBeTruthy();
+  expect(view.getByTestId(`session-panel-row-${working.id}-unread`)).toBeTruthy();
+  expect(view.getByTestId(`session-panel-row-${working.id}`).props.accessibilityLabel).toContain('Working');
+  view.rerender(<SessionPanelView {...props({ rows: [working], currentSessionKey: 'other', activityLive: false })} />);
+  expect(view.queryByTestId(`session-panel-row-${working.id}-running`, { includeHiddenElements: true })).toBeNull();
+});
+it('clears a live roster arc when its connection is no longer the active connection', () => {
+  const activeAdapter = { state: 'ready', connection: { id: 'connection' }, capabilities };
+  const snapshot = { initialized: true, activeConnectionId: 'connection', activeAdapter, activeState: 'ready', error: null };
+  jest.mocked(useConnections).mockReturnValue(snapshot as unknown as ReturnType<typeof useConnections>);
+  jest.mocked(useRoster).mockReturnValue([source]);
+  const panelProps = { connectionId: 'connection', visible: true, currentAgentId: 'main', currentSessionKey: 'agent:main:main', onClose: jest.fn(), onSelectSession: jest.fn() };
+  const view = render(<SessionPanel {...panelProps} />);
+  const id = `session-panel-row-${rows.find(row => row.hasActiveRun)!.id}-running`;
+  expect(view.getByTestId(id, { includeHiddenElements: true })).toBeTruthy();
+  jest.mocked(useConnections).mockReturnValue({ ...snapshot, activeConnectionId: 'other', activeAdapter: { ...activeAdapter, connection: { id: 'other' } } } as unknown as ReturnType<typeof useConnections>);
+  view.rerender(<SessionPanel {...panelProps} />);
+  expect(view.queryByTestId(id, { includeHiddenElements: true })).toBeNull();
+});
+it('shows approval/input/ambiguous waiting distinctly from running', () => {
+  const original = rows.find(row => row.kind === 'direct')!;
+  for (const [attention, text] of [['approval', 'Waiting for your approval'], ['input', 'Agent needs your input'], [null, 'Needs attention']] as const) {
+    const waiting = { ...original, hasActiveRun: true, activityState: 'waiting' as const, attention };
+    const view = render(<SessionPanelView {...props({ rows: [waiting] })} />);
+    expect(view.queryByTestId(`session-panel-row-${waiting.id}-running`, { includeHiddenElements: true })).toBeNull();
+    expect(view.getByText(text)).toBeTruthy();
+    expect(view.getByTestId(`session-panel-row-${waiting.id}`).props.accessibilityLabel).toContain(text);
+    view.unmount();
+  }
 });

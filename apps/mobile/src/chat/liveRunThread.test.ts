@@ -1,7 +1,158 @@
 import { UiMessage } from '../types/chat';
-import { buildLiveRunListData, finalReplyTail, finishLiveRunPresentation, liveReplyRenderKey, mergeNewestFirstMessages, recoverLiveRunPresentation } from './liveRunThread';
+import { buildLiveRunListData, extendRecoveredLiveRun, finalReplyTail, finishLiveRunPresentation, liveReplyRenderKey, mergeNewestFirstMessages, recoverLiveRunPresentation } from './liveRunThread';
+
+describe('canonical live paragraph refinement', () => {
+  const tool = (id: string): UiMessage => ({ id: `toolcall_${id}`, role: 'tool', text: '', toolName: 'exec', toolStatus: 'success' });
+  const segments = [
+    { id: 'a', text: 'Repeated.', timestampMs: 2000, afterToolCount: 0 },
+    { id: 'b', text: 'Repeated.', timestampMs: 3000, afterToolCount: 1 },
+    { id: 'c', text: 'Last.', timestampMs: 4000, afterToolCount: 1 },
+  ];
+  const recovered = { segments, tools: [tool('one'), tool('two')], tail: '', tailTimestampMs: undefined };
+  it('splits an exact rollup with native clocks and keeps its existing cell on the first paragraph', () => {
+    const result = extendRecoveredLiveRun(recovered, [{ id: 'local', renderKey: 'mounted',
+      text: 'Repeated.\n\nRepeated.\n\nLast.', timestampMs: 9000, afterToolCount: 0 }], recovered.tools)!;
+    expect(result.segments.map(row => [row.text, row.timestampMs, row.afterToolCount])).toEqual([
+      ['Repeated.', 2000, 0], ['Repeated.', 3000, 1], ['Last.', 4000, 1],
+    ]);
+    expect(result.segments[0].renderKey).toBe('mounted');
+    expect(result.segments[1].id).toBe('b');
+  });
+  it.each(['Changed.', 'Repeated.\n\nMissing.', 'Repeated.\n\nRepeated.\n\nLast.\n\nLive-only.'])('does not discard unmatched committed text (%s)', text => {
+    expect(extendRecoveredLiveRun(recovered, [{ id: 'local', text, timestampMs: 9000 }], recovered.tools)).toBeUndefined();
+  });
+  it.each([{ tools: [tool('one'), tool('live-only')] }, { tools: [tool('two'), tool('one')] }])('does not erase or reorder independently observed tools', ({ tools }) => {
+    expect(extendRecoveredLiveRun(recovered, [segments[0]], tools)).toBeUndefined();
+  });
+  it('retains a current tool result while learning new canonical boundaries', () => {
+    const current = { ...tool('one'), toolDetail: 'Live result', toolFinishedAt: 5000 };
+    expect(extendRecoveredLiveRun(recovered, [segments[0]], [current])!.tools[0]).toBe(current);
+  });
+});
 
 describe('buildLiveRunListData', () => {
+  const sameRunHistory = (): UiMessage[] => [
+    { id: 'main', role: 'user', text: 'Main task', idempotencyKey: 'main-key', turnId: 'native-main' },
+    { id: 'a', role: 'assistant', text: 'Checking.', timestampMs: 1000, turnId: 'native-main' },
+    { id: 'toolcall_1', role: 'tool', text: '', toolName: 'exec', toolStatus: 'success', turnId: 'native-main' },
+    { id: 'guide1', role: 'user', text: 'Keep waiting', turnId: 'native-main' },
+    { id: 'b', role: 'assistant', text: 'Continuing.', timestampMs: 2000, turnId: 'native-main' },
+    { id: 'toolcall_2', role: 'tool', text: '', toolName: 'exec', toolStatus: 'running', turnId: 'native-main' },
+    { id: 'guide2', role: 'user', text: 'Keep waiting', turnId: 'native-main' },
+    { id: 'c', role: 'assistant', text: 'Still waiting.', timestampMs: 3000, turnId: 'native-main' },
+  ];
+
+  it('keeps two same-turn guides between the original live paragraphs and tools without duplication', () => {
+    const history = sameRunHistory();
+    const rows = buildLiveRunListData({ historyMessages: history,
+      streamSegments: [{ id: 'a', text: 'Checking.', timestampMs: 1000, afterToolCount: 0 },
+        { id: 'b', text: 'Continuing.', timestampMs: 2000, afterToolCount: 1 }],
+      toolMessages: history.filter(message => message.role === 'tool'),
+      liveStreamText: 'Still waiting. More text.', liveStreamStartedAt: 1000,
+      activeRunId: 'bridge-main', activeTurnId: 'native-main', inputMessageId: 'main' }).reverse();
+    expect(rows.map(row => row.text)).toEqual(['Main task', 'Checking.', '', 'Keep waiting',
+      'Continuing.', '', 'Keep waiting', 'Still waiting. More text.']);
+    expect(new Set(rows.map(row => row.renderKey ?? row.id)).size).toBe(rows.length);
+    expect(rows.filter(row => row.role === 'user').map(row => row.id)).toEqual(['main', 'guide1', 'guide2']);
+  });
+
+  it('recovers the original task across two guides using its explicit native turn', () => {
+    const recovered = recoverLiveRunPresentation('Checking.\nContinuing.\nStill waiting.', sameRunHistory(), 'native-main', 'main');
+    expect(recovered.tools.map(tool => tool.id)).toEqual(['toolcall_1', 'toolcall_2']);
+    expect(recovered.segments.map(segment => [segment.id, segment.afterToolCount, segment.timestampMs]))
+      .toEqual([['a', 0, 1000], ['b', 1, 2000]]);
+    expect(recovered.tail).toBe('Still waiting.');
+  });
+
+  it('does not attach old live content to an identical next-turn send', () => {
+    const history = [...sameRunHistory(), { id: 'next', role: 'user' as const, text: 'Keep waiting',
+      idempotencyKey: 'next-key', turnId: 'native-next' },
+    { id: 'next-answer', role: 'assistant' as const, text: 'Next turn answer.', turnId: 'native-next' }];
+    const recovered = recoverLiveRunPresentation('Checking.\nContinuing.\nStill waiting.', history, 'native-main', 'main');
+    expect(recovered.tools.map(tool => tool.id)).toEqual(['toolcall_1', 'toolcall_2']);
+    const rows = buildLiveRunListData({ historyMessages: history,
+      streamSegments: recovered.segments, toolMessages: recovered.tools,
+      liveStreamText: recovered.tail, liveStreamStartedAt: 1000,
+      activeRunId: 'bridge-main', activeTurnId: 'native-main', inputMessageId: 'main' }).reverse();
+    expect(rows.at(-2)?.id).toBe('next');
+    expect(rows.at(-1)?.id).toBe('next-answer');
+    expect(rows.filter(row => row.text === 'Checking.')).toHaveLength(1);
+  });
+
+  it('keeps same-run guides between canonical paragraphs even when no tool separates them', () => {
+    const history = sameRunHistory().filter(row => row.role !== 'tool');
+    const text = 'Checking.\n\nContinuing.\n\nStill waiting.';
+    const recovered = recoverLiveRunPresentation(text, history, 'native-main', 'main');
+    expect(recovered.segments.map(row => row.id)).toEqual(['a', 'b']);
+    expect(recovered.tailTimestampMs).toBe(3000);
+    expect(recovered.tail).toBe('Still waiting.');
+    const rows = buildLiveRunListData({ historyMessages: history, streamSegments: [], toolMessages: [],
+      liveStreamText: text, liveStreamStartedAt: 1000, activeRunId: 'bridge-main', activeTurnId: 'native-main', inputMessageId: 'main', includePlaceholder: true }).reverse();
+    expect(rows.map(row => row.text)).toEqual(['Main task', 'Checking.', 'Keep waiting', 'Continuing.', 'Keep waiting', 'Still waiting.']);
+    expect(rows.filter(row => row.role === 'assistant').map(row => row.timestampMs)).toEqual([1000, 2000, 3000]);
+    expect(rows.at(-1)?.renderKey).toBe(liveReplyRenderKey(1000, 'bridge-main', 2));
+  });
+
+  it('keeps distinct native paragraphs without tools or guides out of the growing cumulative bubble', () => {
+    const history = sameRunHistory().filter(row => row.role === 'assistant' || row.id === 'main');
+    const text = 'Checking.\n\nContinuing.\n\nStill waiting. More text.';
+    const recovered = recoverLiveRunPresentation(text, history, 'native-main', 'main');
+    expect(recovered.segments.map(row => row.id)).toEqual(['a', 'b']);
+    expect(recovered.tail).toBe('Still waiting. More text.');
+    const rows = buildLiveRunListData({ historyMessages: history, streamSegments: [], toolMessages: [],
+      liveStreamText: text, liveStreamStartedAt: 1000, activeRunId: 'bridge-main',
+      activeTurnId: 'native-main', inputMessageId: 'main' }).reverse();
+    expect(rows.map(row => row.text)).toEqual(['Main task', 'Checking.', 'Continuing.', 'Still waiting. More text.']);
+  });
+
+  it('retains intentional repeated native prose as separate paragraphs within the confirmed turn', () => {
+    const history: UiMessage[] = [{ id: 'main', role: 'user', text: 'Task', turnId: 'turn' },
+      { id: 'a', role: 'assistant', text: 'Still checking.', turnId: 'turn' },
+      { id: 'b', role: 'assistant', text: 'Still checking.', turnId: 'turn' }];
+    const text = 'Still checking.\n\nStill checking. More text.';
+    const recovered = recoverLiveRunPresentation(text, history, 'turn', 'main');
+    expect(recovered.segments.map(row => row.id)).toEqual(['a']);
+    expect(recovered.tail).toBe('Still checking. More text.');
+  });
+
+  it.each([undefined, 0, Number.NaN])('keeps an unreported or invalid canonical tail clock on the established fallback (%s)', timestampMs => {
+    const history = sameRunHistory().filter(row => row.role !== 'tool');
+    history.at(-1)!.timestampMs = timestampMs;
+    const text = 'Checking.\n\nContinuing.\n\nStill waiting.';
+    expect(recoverLiveRunPresentation(text, history, 'native-main', 'main').tailTimestampMs).toBeUndefined();
+    const rows = buildLiveRunListData({ historyMessages: history, streamSegments: [], toolMessages: [],
+      liveStreamText: text, liveStreamStartedAt: 1000, activeRunId: 'bridge-main', activeTurnId: 'native-main', inputMessageId: 'main' }).reverse();
+    expect(rows.at(-1)?.timestampMs).toBe(1000);
+  });
+
+  it('anchors a warm optimistic main only through its proven native client key', () => {
+    const history = sameRunHistory();
+    history[0] = { id: 'optimistic-main', role: 'user', text: 'Main task', idempotencyKey: 'main-key' };
+    const recovered = recoverLiveRunPresentation('Checking.\nContinuing.\nStill waiting.', history, 'native-main', 'native-original', 'main-key');
+    expect(recovered.tools.map(tool => tool.id)).toEqual(['toolcall_1', 'toolcall_2']);
+    const rows = buildLiveRunListData({ historyMessages: history, streamSegments: recovered.segments,
+      toolMessages: recovered.tools, liveStreamText: recovered.tail, liveStreamStartedAt: 1000,
+      activeRunId: 'bridge-main', activeTurnId: 'native-main', inputMessageId: 'native-original', inputMessageKey: 'main-key' }).reverse();
+    expect(rows.filter(row => row.text === 'Checking.')).toHaveLength(1);
+    expect(rows.filter(row => row.role === 'user').map(row => row.id)).toEqual(['optimistic-main', 'guide1', 'guide2']);
+  });
+
+  it('does not mistake the first visible guide in a partial page for the main input', () => {
+    const history = sameRunHistory().slice(3);
+    const recovered = recoverLiveRunPresentation('Checking.\nContinuing.\nStill waiting.', history, 'native-main', 'main');
+    expect(recovered.segments).toEqual([]);
+    expect(recovered.tools).toEqual([]);
+    expect(recovered.tail).toBe('Checking.\nContinuing.\nStill waiting.');
+  });
+
+  it('keeps the legacy latest-user boundary when turn evidence is missing', () => {
+    const history = sameRunHistory().map(({ turnId: _turnId, ...message }) => message);
+    const recovered = recoverLiveRunPresentation('Checking.\nContinuing.\nStill waiting.', history);
+    expect(recovered.tools).toEqual([]);
+    expect(recovered.segments).toEqual([]);
+    expect(recovered.tail).toBe('Checking.\nContinuing.\nStill waiting.');
+  });
+
   it('recovers only current-turn snapshot prefixes and tool order', () => {
     const history: UiMessage[] = [
       { id: 'old', role: 'assistant', text: 'Earlier reply.' },

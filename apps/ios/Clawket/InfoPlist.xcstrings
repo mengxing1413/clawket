@@ -1,0 +1,483 @@
+{
+  "sourceLanguage": "en",
+  "strings": {
+    "NSCameraUsageDescription": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scan a pairing QR code or take a photo to attach."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "扫描配对二维码，或拍摄照片作为附件。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "掃描配對 QR 碼，或拍攝照片作為附件。"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ペアリング用のQRコードをスキャンするか、添付する写真を撮影します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "페어링 QR 코드를 스캔하거나 첨부할 사진을 촬영합니다."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scanne einen Kopplungs-QR-Code oder nimm ein Foto als Anhang auf."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scannez un code QR de jumelage ou prenez une photo à joindre."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escanea un código QR de enlace o haz una foto para adjuntarla."
+          }
+        },
+        "es-419": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escanea un código QR de vinculación o toma una foto para adjuntarla."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scansiona un codice QR di abbinamento o scatta una foto da allegare."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Escaneie um código QR de emparelhamento ou tire uma foto para anexar."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Leia um código QR de emparelhamento ou tire uma fotografia para anexar."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Отсканируйте QR-код сопряжения или сделайте фото для вложения."
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Скануйте QR-код сполучення або зробіть фотографію для вкладення."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bir eşleme QR kodunu tarayın veya eklemek için fotoğraf çekin."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Quét mã QR ghép nối hoặc chụp ảnh để đính kèm."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "สแกนคิวอาร์โค้ดสำหรับจับคู่ หรือถ่ายรูปเพื่อแนบ"
+          }
+        },
+        "hi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "पेयरिंग QR कोड स्कैन करें या अटैच करने के लिए फ़ोटो लें।"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "امسح رمز QR للإقران أو التقط صورة لإرفاقها."
+          }
+        }
+      }
+    },
+    "NSLocalNetworkUsageDescription": {
+      "extractionState": "manual",
+      "comment": "System permission purpose. Explain this real capability; do not promise broader access or translate Agent names.",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connect to agents running on your local network."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "连接你本地网络中运行的 Agent。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "連線你區域網路中執行的 Agent。"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ローカルネットワークで稼働中のエージェントに接続します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "로컬 네트워크에서 실행 중인 에이전트에 연결합니다."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Verbinde dich mit Agenten, die in deinem lokalen Netzwerk laufen."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Se connecter aux Agents qui fonctionnent sur votre réseau local."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conectar con Agentes que se ejecutan en tu red local."
+          }
+        },
+        "es-419": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conectar con Agentes que se ejecutan en tu red local."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Collega gli Agent in esecuzione sulla tua rete locale."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conectar aos Agents em execução na sua rede local."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ligar aos Agents em execução na sua rede local."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Подключаться к агентам, работающим в вашей локальной сети."
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Підключатися до агентів, що працюють у вашій локальній мережі."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Yerel ağınızda çalışan Agent’lara bağlanın."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Kết nối tới các Agent đang chạy trên mạng cục bộ của bạn."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "เชื่อมต่อ Agent ที่ทำงานอยู่ในเครือข่ายภายในของคุณ"
+          }
+        },
+        "hi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "अपने लोकल नेटवर्क पर चल रहे Agent से कनेक्ट करें।"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "الاتصال بالوكلاء العاملين على شبكتك المحلية."
+          }
+        }
+      }
+    },
+    "NSPhotoLibraryAddUsageDescription": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Save images you choose to your photo library."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "将你选择的图像存储到照片图库。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "將你選擇的影像儲存到照片圖庫。"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "選択した画像を写真ライブラリに保存します。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "선택한 이미지를 사진 보관함에 저장합니다."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sichere die von dir ausgewählten Bilder in deiner Fotomediathek."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enregistrez les images de votre choix dans votre photothèque."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guarda las imágenes que elijas en tu fototeca."
+          }
+        },
+        "es-419": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guarda las imágenes que elijas en tu fototeca."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salva le immagini che scegli nella tua libreria foto."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Salve as imagens que escolher na sua fototeca."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Guarde as imagens que escolher na sua fototeca."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Сохранение выбранных вами изображений в медиатеку."
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Збереження вибраних вами зображень у фототеці."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seçtiğiniz görüntüleri fotoğraf arşivinize kaydedin."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Lưu những hình ảnh bạn chọn vào thư viện ảnh."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "บันทึกภาพที่คุณเลือกลงในคลังรูปภาพ"
+          }
+        },
+        "hi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "अपनी चुनी हुई इमेज अपनी फ़ोटो लाइब्रेरी में सहेजें।"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "حفظ الصور التي تختارها في مكتبة الصور."
+          }
+        }
+      }
+    },
+    "NSMicrophoneUsageDescription": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Allow Clawket to use your microphone for voice input. Audio is sent to Alibaba Cloud for transcription."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允许 Clawket 使用麦克风进行语音输入。音频会发送至阿里云进行转写。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "允許 Clawket 使用麥克風進行語音輸入。音訊會傳送至阿里雲進行轉錄。"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "音声入力のために Clawket にマイクの使用を許可してください。音声は文字起こしのために Alibaba Cloud に送信されます。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "음성 입력을 위해 Clawket의 마이크 사용을 허용하세요. 오디오는 전사를 위해 Alibaba Cloud로 전송됩니다."
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Erlaube Clawket, dein Mikrofon für die Spracheingabe zu verwenden. Audiodaten werden zur Transkription an Alibaba Cloud gesendet."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Autorisez Clawket à utiliser votre microphone pour la saisie vocale. L’audio est envoyé à Alibaba Cloud pour transcription."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permite que Clawket use tu micrófono para la entrada de voz. El audio se envía a Alibaba Cloud para transcribirlo."
+          }
+        },
+        "es-419": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permite que Clawket use tu micrófono para la entrada de voz. El audio se envía a Alibaba Cloud para transcribirlo."
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Consenti a Clawket di usare il microfono per l’input vocale. L’audio viene inviato ad Alibaba Cloud per la trascrizione."
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permita que o Clawket use seu microfone para a entrada de voz. O áudio é enviado para a Alibaba Cloud para transcrição."
+          }
+        },
+        "pt-PT": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Permita que o Clawket utilize o microfone para a entrada de voz. O áudio é enviado para a Alibaba Cloud para transcrição."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Разрешите Clawket использовать микрофон для голосового ввода. Аудио отправляется в Alibaba Cloud для расшифровки."
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Дозвольте Clawket використовувати мікрофон для голосового введення. Аудіо надсилається до Alibaba Cloud для транскрипції."
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sesli giriş için Clawket’in mikrofonunuzu kullanmasına izin verin. Ses, transkripsiyon için Alibaba Cloud’a gönderilir."
+          }
+        },
+        "vi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cho phép Clawket sử dụng micrô để nhập liệu bằng giọng nói. Âm thanh được gửi đến Alibaba Cloud để chép lời."
+          }
+        },
+        "th": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "อนุญาตให้ Clawket ใช้ไมโครโฟนเพื่อป้อนข้อมูลด้วยเสียง เสียงจะถูกส่งไปยัง Alibaba Cloud เพื่อถอดเป็นข้อความ"
+          }
+        },
+        "hi": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "वॉइस इनपुट के लिए Clawket को आपका माइक्रोफ़ोन इस्तेमाल करने दें। ऑडियो ट्रांसक्रिप्शन के लिए Alibaba Cloud को भेजा जाता है।"
+          }
+        },
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "اسمح لتطبيق Clawket باستخدام الميكروفون للإدخال الصوتي. يُرسل الصوت إلى Alibaba Cloud لتحويله إلى نص."
+          }
+        }
+      }
+    }
+  },
+  "version": "1.0"
+}

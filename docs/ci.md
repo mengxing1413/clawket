@@ -1,0 +1,45 @@
+# Required CI checks
+
+`.github/workflows/required-checks.yml` runs on pull requests and pushes to `main`. New PR pushes cancel obsolete runs; every main push completes. Keep all four protected check names: the aggregate gate, Windows Bridge/Relay compatibility, macOS Bridge/Relay compatibility, and the Git-history secret scan.
+
+The aggregate gate requires typecheck, three in-band Mobile test shards, the remaining self-contained tests/static checks, and v1 replay. Dependency advisory review runs independently below. The desktop selector fails closed and runs both platforms for desktop-affecting PRs and every main push. A shared OS matrix uses `fail-fast: false` so a Windows failure cannot hide the macOS result. Mobile/docs-only decisions still expand both protected OS labels on lightweight Ubuntu runners and skip the desktop steps. Do not skip the matrix job itself: GitHub otherwise emits an unresolved `${{ matrix.os }}` check name, leaving both protected checks missing even when all actual tests are green. Failed selectors or missing matrix output fall back to the full Windows/macOS suites. Malformed decisions run both platforms; malformed serialized JSON blocks the workflow rather than silently skipping verification. Typechecks, tests, coverage thresholds, v1 replay and secret scanning remain required.
+
+## Independent dependency security review
+
+Owner decision 2026-10-07: newly indexed dependency advisories must not block ordinary PR merges. `.github/workflows/dependency-audit.yml` runs on main each Monday at 09:23 Asia/Tokyo (00:23 UTC; scheduled runs may be delayed) and supports manual dispatch from Actions. It has read-only repository permissions and audits committed lockfiles without installing dependencies. Findings, expired/unused exceptions and malformed reports still fail this independent workflow, keeping ordinary GitHub Actions failure notifications and a job summary; it is not a protected check or a dependency of the required gate. PR and main-push checks no longer use live advisory findings as a merge gate; npm may still print informational audit output during installation.
+
+Before an authorized release, run `npm run security:audit` on the fixed candidate and save the current report. Review findings against the actual delivered product: Bridge package provenance/bundle externals, App bundled/native production dependencies, or deployed Worker dependencies. A development-tool finding alone is not evidence that the shipped product contains it. Record relevant fixes or the owner's accepted risk and rationale in the release evidence; do not silently treat a failed/incomplete audit as clean. The checker remains strict for report accuracy, but its exit code is not an automatic release decision. A report exception still names one advisory/package, reason and expiry with owner approval. This review never authorizes packaging, deployment or publication.
+
+## Native Apple checks
+
+`.github/workflows/native-apple.yml` independently builds and tests `packages/apple` on macOS for native package/App, native-contract, historical-fixture and workflow changes; it also supports manual dispatch. The Swift 6 package preserves iOS 16.4/macOS 13 support. Discovery must produce a nonempty list, prints the verified test scope, and failures block that workflow. Tests include deterministic socket/clock regressions and a real loopback URLSession WebSocket roundtrip; they require no maintainer credentials, live Bridge or production service. The selected runner Xcode/Swift versions are printed; this gate does not require the owner's Xcode 27 installation. Existing protected checks and `check:required` keep their current composition. Before merging a matching PR, wait for this native check as well as the protected checks.
+
+Local Swift builds/tests use the `heavy` lease, at most two compiler jobs, and one affected test file at a time. Native package tests are not phone/Relay/inference acceptance or release authorization.
+
+## Build and checkout costs
+
+The CLI's standalone build and typecheck commands already compile Bridge Core and Runtime. Root wrappers delegate to them once. Ubuntu source-test and replay jobs need only Core's built entry; CLI tests build their own runtime dependencies, and historical replay builds its pinned Bridges independently. Relative to the previous desktop-affecting workflow, this removes twelve duplicate/unneeded TypeScript compiler invocations and two unused CLI bundle builds. Typecheck, Mobile and self-contained test jobs use shallow checkout; secret scanning, change detection and historical replay retain full history.
+
+## Local test reliability
+
+The compatibility harness defaults to `--inspector-port 0`, letting the OS bind a free inspector port atomically. Live OpenClaw/Hermes replay no longer probes and releases four inspector ports before starting parallel children. Explicit inspector ports remain available to other harness callers. Parallel backend startup and partial-start cleanup have real local-server tests.
+
+Bridge Runtime uses at most two Vitest workers. Windows test/hook budgets are 15 seconds because native Python/SQLite process startup can exceed the previous five-second test budget; POSIX retains its existing time budgets. v1 client replay uses the normal 35-second Bridge owner deadline instead of a five-second deadline with 250-ms probes. The independent client liveness assertions retain the 300-ms tick, 1.2-second negotiated expiry and legacy idle-client exemption. Production timers are unchanged.
+
+## Failure investigation, 2026-10-06
+
+QQ mailbox notifications were matched to the latest 100 Clawket Actions runs: 72 successful, 19 failed, seven cancelled and two running at collection time. A failed run and its later successful replacement can both belong to the same PR; failure-only email does not show the successful replacement.
+
+| Failed runs | Cause | Status at investigation |
+|---|---|---|
+| 11 | Dependency audit: six `braces` runs; five stale branches with `source-map-js` / `tinypool` advisories | Current main has patched pins and the two existing owner-approved, expiring exceptions. Both lockfile audits pass with zero blocking advisories. |
+| 5 | Mobile assertion, ESM mock, missing protocol branch coverage, updater launch mock, Windows child-exit assertion race | Subsequent PR revisions pass; preserve these gates. The newest child-exit correction belongs to PR #197. |
+| 3 | Windows Python/SQLite five-second timeout; Wrangler `bind(): Address already in use`; legacy replay socket closed during idle assertion | Address test startup contention, inspector allocation and replay owner timing. The closed-socket log did not establish a production connection failure or identify its close reason. |
+
+Representative evidence: [Windows timeout](https://github.com/p697/clawket/actions/runs/37406746005), [local port conflict](https://github.com/p697/clawket/actions/runs/37336882662), [legacy idle replay](https://github.com/p697/clawket/actions/runs/37306063105), [stale dependency pins](https://github.com/p697/clawket/actions/runs/37400433775), and [successful replacement for the newest failed PR run](https://github.com/p697/clawket/actions/runs/37421230237).
+
+Keep failure notifications enabled. Genuine regression, new vulnerability, expired exception or runner failure must remain visible. These changes reduce avoidable failures and repeated work; they cannot guarantee that future PRs never fail.
+
+On 2026-10-07, [Mobile 3.1.2's first CI run](https://github.com/p697/clawket/actions/runs/37574383974) passed typechecks, all Mobile shards, static tests, v1 replay and both desktop suites but failed the audit on three advisories newly indexed on October 6. Update the Claude Agent SDK's MCP SDK peer to 1.31.0, shell-quote to 1.11.0 in both install entry points, and Mobile's direct sharp build tool to 0.35.5. Miniflare still pins sharp 0.35.4 (including latest 5.20261006.0-alpha); the owner approved GHSA-wq5f-xc86-pv6w for that package through 2026-11-01. Keep the upstream Miniflare native dependency intact and remove this exception once the upstream fix removes the finding. Existing node-forge/braces exceptions and every other audit finding retain their gates.
+
+Follow-up: [main run 37422232668](https://github.com/p697/clawket/actions/runs/37422232668) failed in the macOS supervisor concurrent-start test after the initial sample was collected. A deterministic real-socket regression reproduces start failure when the credential read belongs to the old owner and the new owner rejects it; the old implementation fails, and bounded generation-aware retry passes. Control credentials are published atomically; unchanged malformed responses still fail. Short fixture-directory prefixes also keep canonical macOS Unix socket paths within the OS limit. This fixes the reproduced lifecycle race rather than weakening the process assertions; the original CI log only reported a command exit and did not expose its internal error.

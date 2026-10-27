@@ -35,3 +35,35 @@ it('contains malformed JSON without crashing or authenticating the socket', asyn
   const next = await open();
   expect(await call(next, { type: 'req', id: 'good', method: 'connect', params: { token } })).toMatchObject({ ok: true });
 });
+
+it('keeps authenticated lifecycle control available after native health fails', async () => {
+  Object.assign(service, { request: async () => { throw new Error('Codex process is unavailable'); } });
+  const phone = await open();
+  expect(await call(phone, { type: 'req', id: 'phone', method: 'connect', params: { token } })).toMatchObject({ ok: false });
+  const control = await open();
+  expect(await call(control, { type: 'req', id: 'auth', method: 'connect', params: { token, controlOnly: true } }))
+    .toMatchObject({ ok: true, payload: { backend: 'codex', controlReady: true } });
+  const shutdown = once(service, 'shutdown');
+  expect(await call(control, { type: 'req', id: 'stop', method: 'bridge.stop' })).toMatchObject({ id: 'stop', ok: true });
+  await shutdown;
+});
+
+it('never accepts lifecycle control without the existing token', async () => {
+  const s = await open(), closed = once(s, 'close');
+  s.send(JSON.stringify({ type: 'req', id: 'auth', method: 'connect', params: { token: 'wrong', controlOnly: true } }));
+  expect((await closed)[0]).toBe(1008);
+});
+
+
+it('sends activity only to an authenticated client that requested its current window, preserving legacy chat events', async () => {
+  const legacy = await open(), current = await open();
+  for (const socket of [legacy, current]) await call(socket, { type: 'req', id: 'auth', method: 'connect', params: { token } });
+  await call(current, { type: 'req', id: 'activity', method: 'sessions.activity', params: { keys: ['visible'] } });
+  const legacyEvent = once(legacy, 'message'), currentEvent = once(current, 'message');
+  service.emit('update', { type: 'session_activity_update', activity: null });
+  service.emit('update', { type: 'session_activity_update', activity: { key: 'other', state: 'running' } });
+  service.emit('update', { type: 'session_activity_update', activity: { key: 'visible', state: 'running' } });
+  service.emit('update', { type: 'agent_message_chunk', text: 'legacy-compatible' });
+  expect(JSON.parse((await legacyEvent)[0].toString()).payload.type).toBe('agent_message_chunk');
+  expect(JSON.parse((await currentEvent)[0].toString()).payload).toEqual({ type: 'session_activity_update', activity: { key: 'visible', state: 'running' } });
+});

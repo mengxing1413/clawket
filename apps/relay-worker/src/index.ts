@@ -5,6 +5,9 @@ import {
   parseHermesRelayAuthQuery,
   parseRelayAuthQuery,
   RELAY_FRAME_LIMIT_V2,
+  RELAY_OWNER_PONG_V1_CAPABILITY,
+  RELAY_CLIENT_PING_V1_CAPABILITY,
+  RELAY_TRANSFER_HINT_V1_CAPABILITY,
   resolveRelayAuthToken,
   SECURE_PAIRING_V2_CAPABILITY,
 } from '@clawket/shared';
@@ -59,12 +62,14 @@ import {
   prepareClientMessage,
   rejectClientRequestWithoutBridge,
 } from './relay/routing';
-import { replaceBridge, replaceGateway, sendControlToGateway, sendRelayReady } from './relay/control';
+import { isReservedPresenceControl, replaceBridge, replaceGateway, retireOwnerClients, sendControlToGateway, sendRelayReady } from './relay/control';
+import { consumeOwnerHeartbeatControl } from './relay/owner-heartbeat';
+import { admitHermesOwner } from './relay/owner-contention';
+import { consumeClientHeartbeatControl } from './relay/client-heartbeat';
+import { isReservedTransferControl } from './relay/transfer';
+import { initializeRelayRuntime } from './relay/initialization';
 import {
   canAcceptGatewayOwner,
-  loadGatewayOwner,
-  loadMirroredClientTokenHashes,
-  loadRoomMeta,
   rehydrateSockets,
   reconcileSockets,
   storeMirroredClientTokenHashes,
@@ -72,6 +77,7 @@ import {
   touchGatewayOwner,
 } from './relay/storage';
 import { logRuntimeTelemetry } from './relay/telemetry';
+import { canAdmitClient, hasConflictingClientCredential } from './relay/admission';
 import { parsePositiveInt } from './relay/utils';
 import {
   CONTROL_PREFIX,
@@ -89,6 +95,10 @@ type NormalizedRelayQuery = {
   clientId?: string;
   token?: string;
 };
+
+// Only fetchForPolicy can forward this action after owner authentication.
+// The public Worker rejects this path; DO bindings are the internal boundary.
+const VERIFIED_HERMES_BRIDGE_STATUS_PATH = '/__clawket/verified-hermes-bridge-status';
 
 function parseBackendQuery(url: URL, policy: BackendPolicy): NormalizedRelayQuery {
   if (policy.backend === 'hermes') {
@@ -145,11 +155,19 @@ async function fetchForPolicy(request: Request, env: Env, policy: BackendPolicy)
     && url.pathname === policy.internalRoutes.bridgeStatus) {
     const principalId = url.searchParams.get(policy.principalParam)?.trim() ?? '';
     if (!principalId) return invalidPrincipalResponse(policy);
+    const { token } = resolveRelayAuthToken(undefined, request);
+    if (!token) return errorResponse('UNAUTHORIZED', 'Missing token for relay bridge status', 401);
+    if (!await isRelayTokenAuthorized({
+      routesKv: routesKv(env, policy), registryVerifyUrl: env.REGISTRY_VERIFY_URL,
+      principalId, policy, role: 'gateway', token,
+    })) return errorResponse('UNAUTHORIZED', 'Invalid token for relay bridge status', 401);
+    // Do not resolve/create a room for failed authentication, or repeat the KV
+    // authorization inside the room for every legacy five-second poll.
+    url.pathname = VERIFIED_HERMES_BRIDGE_STATUS_PATH;
+    url.search = '';
+    url.searchParams.set(policy.principalParam, principalId);
     const namespace = roomNamespace(env, policy);
-    return namespace.get(namespace.idFromName(principalId)).fetch(new Request(request.url, {
-      method: request.method,
-      headers: request.headers,
-    }));
+    return namespace.get(namespace.idFromName(principalId)).fetch(new Request(url));
   }
 
   if (url.pathname !== '/ws') return errorResponse('NOT_FOUND', 'Route not found', 404);
@@ -176,18 +194,16 @@ class BaseRelayRoom {
 
   constructor(state: DurableObjectState, env: Env, policy: BackendPolicy) {
     this.runtime = new RelayRuntime(state, env, policy);
-    this.runtime.state.blockConcurrencyWhile(async () => {
-      await loadRoomMeta(this.runtime);
-      await loadMirroredClientTokenHashes(this.runtime);
-      await loadGatewayOwner(this.runtime);
-      rehydrateSockets(this.runtime);
-      await ensureHeartbeat(this.runtime);
-    });
+    this.runtime.state.blockConcurrencyWhile(() => initializeRelayRuntime(this.runtime));
   }
 
   async fetch(request: Request): Promise<Response> {
     const { policy } = this.runtime;
     const url = new URL(request.url);
+    if (policy.backend === 'hermes' && request.method === 'GET'
+      && url.pathname === VERIFIED_HERMES_BRIDGE_STATUS_PATH) {
+      return this.readHermesBridgeStatus(url);
+    }
     if (request.method === 'POST' && url.pathname === policy.internalRoutes.clientTokens) {
       const body = await readJson<Record<string, unknown>>(request);
       const rawPrincipal = body?.[policy.principalParam];
@@ -220,7 +236,6 @@ class BaseRelayRoom {
     const query = parseBackendQuery(url, policy);
     const traceId = (url.searchParams.get('traceId') ?? '').trim() || undefined;
     if (!query.principalId) return invalidPrincipalResponse(policy);
-    await storeRoomMeta(this.runtime, query.principalId);
     const { token, authSource } = resolveRelayAuthToken(query.token, request);
     if (!token) {
       logRuntimeTelemetry(this.runtime, 'ws_auth_rejected', {
@@ -248,6 +263,7 @@ class BaseRelayRoom {
       });
       return errorResponse('UNAUTHORIZED', 'Invalid token for relay connection', 401);
     }
+    await storeRoomMeta(this.runtime, query.principalId);
 
     const targetConnectionId = url.searchParams.get('targetConnectionId') || undefined;
     if (targetConnectionId && (policy.backend !== 'openclaw' || query.role !== 'gateway'
@@ -255,9 +271,19 @@ class BaseRelayRoom {
       || query.clientId !== (this.runtime.gatewaySocket?.deserializeAttachment() as SocketAttachment | null)?.clientId)) {
       return errorResponse('INVALID_CLIENT_CHANNEL', 'Client connection is no longer available', 409);
     }
-    if (query.role === 'client' && authorization.authScope !== 'pairing'
-      && hasClientChannels(this.runtime) && this.runtime.clients.size >= 128
-      && !this.runtime.clients.has(query.clientId || '')) {
+    const credentialHash = query.role === 'client' ? await sha256Hex(token) : undefined;
+    if (query.role === 'client' && hasConflictingClientCredential(this.runtime, {
+      clientId: query.clientId,
+      credentialHash: credentialHash!,
+      pairing: authorization.authScope === 'pairing',
+    })) {
+      return errorResponse('CLIENT_ID_CONFLICT', 'Choose a new client connection identity', 409);
+    }
+    if (query.role === 'client' && !canAdmitClient(this.runtime, {
+      clientId: query.clientId,
+      credentialHash: credentialHash!,
+      pairing: authorization.authScope === 'pairing',
+    })) {
       return errorResponse('CLIENT_LIMIT_REACHED', 'Too many simultaneous client connections', 429);
     }
     const pair = new WebSocketPair();
@@ -266,6 +292,8 @@ class BaseRelayRoom {
     const ownerClientId = query.role === 'gateway'
       ? (query.clientId || `legacy-${(await sha256Hex(token)).slice(0, 16)}`)
       : '';
+    const requestedCapabilities = parseCapabilities(url);
+    let ownerReplacementAt: number | undefined;
     if (query.role === 'gateway') {
       const leaseMs = parsePositiveInt(this.runtime.env.GATEWAY_OWNER_LEASE_MS, policy.ownerLeaseMs);
       if (!canAcceptGatewayOwner(this.runtime, ownerClientId, Date.now(), leaseMs)) {
@@ -276,40 +304,77 @@ class BaseRelayRoom {
         });
         return errorResponse('GATEWAY_OWNER_LOCKED', policy.ownerLockedMessage, 409);
       }
+      const admission = admitHermesOwner(this.runtime, ownerClientId, requestedCapabilities, Date.now());
+      if (!admission.allowed) {
+        logRuntimeTelemetry(this.runtime, policy.ownerLockedEvent, { role: 'gateway', hasBridge: true });
+        return errorResponse('GATEWAY_OWNER_LOCKED', policy.ownerLockedMessage, 409);
+      }
+      ownerReplacementAt = admission.replacementAt;
     }
 
     const clientId = query.role === 'gateway' ? ownerClientId : (query.clientId || crypto.randomUUID());
+    const ownerCapabilities = query.role === 'gateway' ? [
+      ...(policy.backend === 'openclaw' && !targetConnectionId && requestedCapabilities.includes(CLIENT_CHANNELS)
+        ? [CLIENT_CHANNELS] : []),
+      ...(requestedCapabilities.includes(RELAY_OWNER_PONG_V1_CAPABILITY) ? [RELAY_OWNER_PONG_V1_CAPABILITY] : []),
+      ...(authorization.authScope === 'full' && requestedCapabilities.includes(RELAY_TRANSFER_HINT_V1_CAPABILITY)
+        ? [RELAY_TRANSFER_HINT_V1_CAPABILITY] : []),
+    ] : [];
+    const clientCapabilities = query.role === 'client' ? [
+      ...(requestedCapabilities.includes(CLIENT_PONG_CAPABILITY) ? [CLIENT_PONG_CAPABILITY] : []),
+      ...(authorization.authScope === 'full' && requestedCapabilities.includes(RELAY_CLIENT_PING_V1_CAPABILITY)
+        ? [RELAY_CLIENT_PING_V1_CAPABILITY] : []),
+      ...(authorization.authScope === 'full' && requestedCapabilities.includes(RELAY_TRANSFER_HINT_V1_CAPABILITY)
+        ? [RELAY_TRANSFER_HINT_V1_CAPABILITY] : []),
+    ] : [];
     const attachment: SocketAttachment = {
       diagnosticId: crypto.randomUUID(),
       ...(targetConnectionId ? { targetConnectionId } : {}),
-      ...(query.role === 'gateway' && policy.backend === 'openclaw' && !targetConnectionId
-        && parseCapabilities(url).includes(CLIENT_CHANNELS) ? { capabilities: [CLIENT_CHANNELS] } : {}),
+      ...(ownerCapabilities.length ? { capabilities: ownerCapabilities } : {}),
+      ...(ownerCapabilities.includes(RELAY_TRANSFER_HINT_V1_CAPABILITY) ? { authScope: 'full' as const } : {}),
       role: query.role,
       clientId,
       connectedAt: Date.now(),
+      ...(ownerReplacementAt === undefined ? {} : { ownerContention: { lastAttemptAt: ownerReplacementAt } }),
       traceId,
       clientLabel: query.role === 'client' ? authorization.clientLabel : null,
+      ...(credentialHash ? { credentialHash } : {}),
       ...(policy.securePairing ? {
         authScope: authorization.authScope,
         ...(authorization.pairingSessionId ? { pairingSessionId: authorization.pairingSessionId } : {}),
         ...(authorization.ticketExpiresAt ? { ticketExpiresAt: authorization.ticketExpiresAt } : {}),
       } : {}),
-      ...(query.role === 'client' && parseCapabilities(url).includes(CLIENT_PONG_CAPABILITY)
-        ? { capabilities: [CLIENT_PONG_CAPABILITY], lastPongAt: Date.now() }
+      ...(clientCapabilities.length
+        ? { capabilities: clientCapabilities,
+          ...(clientCapabilities.includes(CLIENT_PONG_CAPABILITY) ? { lastPongAt: Date.now() } : {}),
+          ...(clientCapabilities.some(capability => capability === RELAY_CLIENT_PING_V1_CAPABILITY
+            || capability === RELAY_TRANSFER_HINT_V1_CAPABILITY) ? { authScope: 'full' as const } : {}),
+        }
         : {}),
     };
 
     if (targetConnectionId) clientChannel(this.runtime, targetConnectionId)?.close(1000, 'channel_replaced');
     // Keep the constructor-rehydrated map intact until the public replacement
     // branch has closed the previous peer with the backend-specific reason.
-    this.runtime.state.acceptWebSocket(server);
-    server.serializeAttachment(attachment);
+    const activateSocket = () => {
+      this.runtime.state.acceptWebSocket(server);
+      server.serializeAttachment(attachment);
+    };
+    if (query.role === 'gateway' && !targetConnectionId) {
+      try {
+        replaceGateway(this.runtime, server, activateSocket);
+      } catch {
+        try { server.close(1011, 'owner_recovery_failed'); } catch { /* Not accepted when retirement fails. */ }
+        return errorResponse('OWNER_RECOVERY_FAILED', 'Could not safely recover the previous backend session', 503);
+      }
+    } else {
+      activateSocket();
+    }
     sendRelayReady(server);
 
     if (targetConnectionId) {
       server.send('__clawket_relay_control__:' + JSON.stringify({ type: 'control', event: 'client_count', count: 1 }));
     } else if (query.role === 'gateway') {
-      replaceGateway(this.runtime, server);
       touchGatewayActivity(this.runtime, attachment.connectedAt);
       await touchGatewayOwner(this.runtime, clientId, true);
       handleGatewayConnected(this.runtime);
@@ -320,6 +385,16 @@ class BaseRelayRoom {
       }
       this.runtime.pairingClients.set(clientId, server);
     } else {
+      // A freshly authenticated full client may finish pairing with the same ID.
+      // Retire the restricted socket, rather than letting hibernation/routing
+      // resolve two authentication scopes through one caller-supplied identity.
+      const pairingClient = this.runtime.pairingClients.get(clientId);
+      if (pairingClient) {
+        this.runtime.pairingClients.delete(clientId);
+        if (pairingClient.readyState === WebSocket.OPEN) {
+          pairingClient.close(SOCKET_CLOSE_CODES.REPLACED_BY_NEW_CLIENT_SOCKET, 'pairing_completed');
+        }
+      }
       const previousClient = this.runtime.clients.get(clientId);
       if (previousClient && previousClient !== server && previousClient.readyState === WebSocket.OPEN) {
         previousClient.close(SOCKET_CLOSE_CODES.REPLACED_BY_NEW_CLIENT_SOCKET, 'replaced_by_new_client_socket');
@@ -378,11 +453,14 @@ class BaseRelayRoom {
     if (currentSocket !== ws) return;
     const text = normalizeMessage(message);
     if (text == null) return;
-
     if (this.runtime.policy.securePairing && attachment.authScope === 'pairing') {
       if ((attachment.ticketExpiresAt ?? 0) <= Date.now()
         || !allowMessage(this.runtime, ws, attachment, text)
         || !text.startsWith(CONTROL_PREFIX)
+        || consumeOwnerHeartbeatControl(this.runtime, ws, message, text)
+        || consumeClientHeartbeatControl(this.runtime, ws, message, text)
+        || isReservedTransferControl(text)
+        || isReservedPresenceControl(text)
         || !forwardPairingControlToGateway(this.runtime, attachment, text)) {
         ws.close(SOCKET_CLOSE_CODES.RATE_LIMITED, 'invalid_pairing_message');
       }
@@ -396,6 +474,12 @@ class BaseRelayRoom {
       ws.close(SOCKET_CLOSE_CODES.RATE_LIMITED, 'rate_limited');
       return;
     }
+    // Reserve Relay-origin controls after admission but before every forwarding
+    // route. Neither phones nor local backends can forge readiness or leak nonces.
+    if (consumeOwnerHeartbeatControl(this.runtime, ws, message, text)) return;
+    if (consumeClientHeartbeatControl(this.runtime, ws, message, text)) return;
+    if (isReservedTransferControl(text)) return;
+    if (isReservedPresenceControl(text)) return;
     if (routeClientChannel(this.runtime, ws, attachment, text)) {
       if (attachment.role === 'gateway' && attachment.targetConnectionId) {
         touchGatewayActivity(this.runtime);
@@ -404,7 +488,7 @@ class BaseRelayRoom {
       return;
     }
     if (attachment.role === 'gateway') {
-      await handleGatewayMessage(this.runtime, attachment, text, (ownerClientId) =>
+      await handleGatewayMessage(this.runtime, ws, attachment, text, (ownerClientId) =>
         touchGatewayOwner(this.runtime, ownerClientId));
       return;
     }
@@ -521,7 +605,6 @@ class BaseRelayRoom {
     if (!principalId) return invalidPrincipalResponse(policy);
     const { token } = resolveRelayAuthToken(undefined, request);
     if (!token) return errorResponse('UNAUTHORIZED', 'Missing token for relay bridge status', 401);
-    await storeRoomMeta(this.runtime, principalId);
     const authorized = await isRelayTokenAuthorized({
       routesKv: routesKv(this.runtime.env, policy),
       registryVerifyUrl: this.runtime.env.REGISTRY_VERIFY_URL,
@@ -532,6 +615,12 @@ class BaseRelayRoom {
       mirroredClientTokenHashes: this.runtime.mirroredClientTokenHashes,
     });
     if (!authorized) return errorResponse('UNAUTHORIZED', 'Invalid token for relay bridge status', 401);
+    return this.readHermesBridgeStatus(url);
+  }
+
+  private readHermesBridgeStatus(url: URL): Response {
+    const principalId = url.searchParams.get(this.runtime.policy.principalParam)?.trim() ?? '';
+    if (!principalId) return invalidPrincipalResponse(this.runtime.policy);
     reconcileSockets(this.runtime);
     return jsonResponse({
       ok: true,
@@ -565,12 +654,12 @@ class BaseRelayRoom {
           this.runtime.pendingGatewayPingAt = 0;
           this.runtime.gatewayPingCapability = 'unknown';
         }
+        retireOwnerClients(this.runtime);
         this.runtime.gatewaySocket = null;
         this.runtime.pendingChallenge = null;
-        await touchGatewayOwner(this.runtime, attachment.clientId, true);
-        const clients = policy.securePairing
-          ? [...this.runtime.clients.values(), ...this.runtime.pairingClients.values()]
-          : this.runtime.clients.values();
+        // Snapshot/close before storage yields: a new owner/client may enter
+        // while the lease write is awaiting completion.
+        const clients = policy.securePairing ? [...this.runtime.pairingClients.values()] : [];
         for (const client of clients) {
           try {
             client.close(SOCKET_CLOSE_CODES.GATEWAY_UNAVAILABLE, policy.ownerUnavailableReason);
@@ -578,6 +667,7 @@ class BaseRelayRoom {
             // Best effort cleanup; clients may already be detached remotely.
           }
         }
+        await touchGatewayOwner(this.runtime, attachment.clientId, true);
       }
     } else if (policy.securePairing && attachment.authScope === 'pairing') {
       if (this.runtime.pairingClients.get(attachment.clientId) === ws) {
@@ -676,6 +766,7 @@ export const __testing = {
   rehydrateSockets,
   reconcileSockets,
   replaceGateway,
+  retireOwnerClients,
   replaceBridge,
   sendRelayReady,
   clearPrincipalExistenceCache,

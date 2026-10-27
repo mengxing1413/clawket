@@ -118,19 +118,6 @@ export type DeviceTokenRecord = {
   updatedAtMs: number;
 };
 
-export type YouMindAuthSession = {
-  accessToken: string;
-  refreshToken: string;
-  expiresIn: number;
-  createdAtMs: number;
-  user?: {
-    id?: string;
-    email?: string;
-    name?: string;
-    avatarUrl?: string;
-  } | null;
-};
-
 type ProSubscriptionCacheEntry = {
   snapshot: ProSubscriptionSnapshot;
   cachedAtMs: number;
@@ -161,8 +148,6 @@ const KEYS = {
   proSubscriptionSnapshot: 'clawket.proSubscriptionSnapshot.v1',
   lifetimeUpgradeAnnouncementShown: 'clawket.lifetimeUpgradeAnnouncementShown.v1',
   autoAppReviewState: 'clawket.autoAppReviewState.v1',
-  youmindAuthPrefix: 'clawket.youmind.auth.v1',
-  youmindDeviceId: 'clawket.youmind.deviceId.v1',
 } as const;
 
 const NODE_INVOKE_AUDIT_KEY = 'clawket.nodeInvokeAudit.v1';
@@ -190,43 +175,6 @@ function lastOpenedSessionSnapshotStorageKey(scopeId: string, agentId?: string):
 
 function cachedAgentIdentityStorageKey(scopeId: string, agentId: string): string {
   return `${KEYS.cachedAgentIdentityPrefix}.${scopeId}::${agentId}`;
-}
-
-function normalizeYouMindScope(url: string): string {
-  const trimmed = url.trim();
-  if (!trimmed) return 'default';
-  return sha256(trimmed.replace(/\/+$/, '').toLowerCase());
-}
-
-function normalizeYouMindScopeKey(scopeKey?: string | null): string | null {
-  const trimmed = scopeKey?.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith('cfg:')) {
-    return trimmed.slice(4).trim() || null;
-  }
-  return trimmed;
-}
-
-function normalizeYouMindScopedStorageKey(url: string, scopeKey?: string | null): string {
-  const normalizedScope = normalizeYouMindScopeKey(scopeKey);
-  if (normalizedScope) {
-    return `scope.${sha256(normalizedScope)}`;
-  }
-  return normalizeYouMindScope(url);
-}
-
-function youmindAuthStorageKey(url: string, scopeKey?: string | null): string {
-  return `${KEYS.youmindAuthPrefix}.${normalizeYouMindScopedStorageKey(url, scopeKey)}`;
-}
-
-function youmindPrefixedScopeAuthStorageKey(url: string, scopeKey?: string | null): string | null {
-  const trimmed = scopeKey?.trim();
-  if (!trimmed || trimmed.startsWith('cfg:')) return null;
-  return `${KEYS.youmindAuthPrefix}.${normalizeYouMindScopedStorageKey(url, `cfg:${trimmed}`)}`;
-}
-
-function youmindLegacyAuthStorageKey(url: string): string {
-  return `${KEYS.youmindAuthPrefix}.${normalizeYouMindScope(url)}`;
 }
 
 function normalizeDeviceTokenScopePart(value: string | null | undefined): string {
@@ -323,44 +271,6 @@ function normalizeLastOpenedSessionSnapshot(value: unknown): LastOpenedSessionSn
     agentName: agentName || undefined,
     agentEmoji: agentEmoji || undefined,
     agentAvatarUri: agentAvatarUri || undefined,
-  };
-}
-
-function normalizeYouMindAuthSession(value: unknown): YouMindAuthSession | null {
-  if (!value || typeof value !== 'object') return null;
-  const record = value as Record<string, unknown>;
-  const accessToken = typeof record.accessToken === 'string' ? record.accessToken.trim() : '';
-  const refreshToken = typeof record.refreshToken === 'string' ? record.refreshToken.trim() : '';
-  const expiresIn = typeof record.expiresIn === 'number' && Number.isFinite(record.expiresIn)
-    ? record.expiresIn
-    : 0;
-  const createdAtMs = typeof record.createdAtMs === 'number' && Number.isFinite(record.createdAtMs)
-    ? record.createdAtMs
-    : 0;
-  if (!accessToken || !refreshToken || expiresIn <= 0 || createdAtMs <= 0) return null;
-  const rawUser = record.user;
-  const user = rawUser && typeof rawUser === 'object'
-    ? {
-      id: typeof (rawUser as Record<string, unknown>).id === 'string'
-        ? ((rawUser as Record<string, unknown>).id as string).trim() || undefined
-        : undefined,
-      email: typeof (rawUser as Record<string, unknown>).email === 'string'
-        ? ((rawUser as Record<string, unknown>).email as string).trim() || undefined
-        : undefined,
-      name: typeof (rawUser as Record<string, unknown>).name === 'string'
-        ? ((rawUser as Record<string, unknown>).name as string).trim() || undefined
-        : undefined,
-      avatarUrl: typeof (rawUser as Record<string, unknown>).avatarUrl === 'string'
-        ? ((rawUser as Record<string, unknown>).avatarUrl as string).trim() || undefined
-        : undefined,
-    }
-    : undefined;
-  return {
-    accessToken,
-    refreshToken,
-    expiresIn,
-    createdAtMs,
-    user: user ?? null,
   };
 }
 
@@ -692,85 +602,6 @@ export const StorageService = {
     await SecureStore.deleteItemAsync(KEYS.gatewayConfigsState, SECURE_OPTIONS);
   },
 
-  async setYouMindAuthSession(url: string, session: YouMindAuthSession, scopeKey?: string | null): Promise<void> {
-    await setJson(youmindAuthStorageKey(url, scopeKey), session);
-  },
-
-  async getYouMindAuthSession(
-    url: string,
-    scopeKey?: string | null,
-    options?: { allowLegacyFallback?: boolean },
-  ): Promise<YouMindAuthSession | null> {
-    const primaryKey = youmindAuthStorageKey(url, scopeKey);
-    const value = await getJson<unknown>(primaryKey);
-    if (value != null) {
-      return normalizeYouMindAuthSession(value);
-    }
-
-    const prefixedScopeKey = youmindPrefixedScopeAuthStorageKey(url, scopeKey);
-    if (prefixedScopeKey) {
-      const prefixedValue = await getJson<unknown>(prefixedScopeKey);
-      const normalizedPrefixed = normalizeYouMindAuthSession(prefixedValue);
-      if (normalizedPrefixed) {
-        await setJson(primaryKey, normalizedPrefixed);
-        return normalizedPrefixed;
-      }
-    }
-
-    if (options?.allowLegacyFallback && scopeKey?.trim()) {
-      const legacyValue = await getJson<unknown>(youmindLegacyAuthStorageKey(url));
-      return normalizeYouMindAuthSession(legacyValue);
-    }
-    return null;
-  },
-
-  async clearYouMindAuthSession(url: string, scopeKey?: string | null): Promise<void> {
-    await SecureStore.deleteItemAsync(youmindAuthStorageKey(url, scopeKey), SECURE_OPTIONS);
-    const prefixedScopeKey = youmindPrefixedScopeAuthStorageKey(url, scopeKey);
-    if (prefixedScopeKey) {
-      await SecureStore.deleteItemAsync(prefixedScopeKey, SECURE_OPTIONS);
-    }
-  },
-
-  async migrateLegacyYouMindState(url: string, scopeKey: string): Promise<void> {
-    const normalizedScope = scopeKey.trim();
-    if (!normalizedScope) return;
-
-    const scopedSessionKey = youmindAuthStorageKey(url, normalizedScope);
-    const prefixedScopedSessionKey = youmindPrefixedScopeAuthStorageKey(url, normalizedScope);
-    const legacySessionKey = youmindLegacyAuthStorageKey(url);
-    const [scopedSession, prefixedScopedSession, legacySession] = await Promise.all([
-      getJson<unknown>(scopedSessionKey),
-      prefixedScopedSessionKey ? getJson<unknown>(prefixedScopedSessionKey) : Promise.resolve(null),
-      getJson<unknown>(legacySessionKey),
-    ]);
-    if (scopedSession == null && prefixedScopedSession != null) {
-      await setJson(scopedSessionKey, prefixedScopedSession);
-    } else if (scopedSession == null && legacySession != null) {
-      await setJson(scopedSessionKey, legacySession);
-    }
-
-  },
-
-  async setYouMindDeviceId(deviceId: string): Promise<void> {
-    const normalized = deviceId.trim();
-    if (!normalized) {
-      await AsyncStorage.removeItem(KEYS.youmindDeviceId);
-      return;
-    }
-    await AsyncStorage.setItem(KEYS.youmindDeviceId, normalized);
-  },
-
-  async getYouMindDeviceId(): Promise<string | null> {
-    const value = await AsyncStorage.getItem(KEYS.youmindDeviceId);
-    const normalized = value?.trim();
-    return normalized || null;
-  },
-
-  async clearYouMindDeviceId(): Promise<void> {
-    await AsyncStorage.removeItem(KEYS.youmindDeviceId);
-  },
-
   async saveGatewayConfigBackup(config: Record<string, unknown>): Promise<GatewayConfigBackupSummary> {
     const createdAt = Date.now();
     const randomSuffix = Math.random().toString(36).slice(2, 8);
@@ -984,7 +815,9 @@ export const StorageService = {
 
   async getExecApprovalEnabled(): Promise<boolean> {
     const raw = await SecureStore.getItemAsync(KEYS.execApproval, SECURE_OPTIONS);
-    return raw === '1'; // default OFF
+    // Default ON (owner request 2026-10-02): an approval the Agent asks for
+    // during a chat appears in that chat. Only an explicit legacy opt-out hides it.
+    return raw !== '0';
   },
 
   async setChatFontSize(size: number): Promise<void> {
@@ -1004,11 +837,14 @@ export const StorageService = {
     const storedImagePath = normalized.background.enabled
       ? toStoredChatBackgroundImagePath(normalized.background.imagePath)
       : undefined;
+    const photo = Boolean(storedImagePath) && normalized.background.enabled;
     await setJson(KEYS.chatAppearance, {
       ...normalized,
       background: {
         ...normalized.background,
-        enabled: Boolean(storedImagePath) && normalized.background.enabled,
+        // A photo that cannot be stored falls back to the built-in wallpaper.
+        kind: normalized.background.kind === 'photo' && !photo ? 'pattern' : normalized.background.kind,
+        enabled: photo,
         imagePath: storedImagePath,
       },
     });
@@ -1029,6 +865,7 @@ export const StorageService = {
         ...normalized,
         background: {
           ...normalized.background,
+          kind: 'pattern',
           enabled: false,
           imagePath: undefined,
         },
@@ -1222,13 +1059,11 @@ export const StorageService = {
   },
 
   async getAutoAppReviewState(): Promise<AutoAppReviewState | null> {
-    try {
-      const raw = await AsyncStorage.getItem(KEYS.autoAppReviewState);
-      if (!raw) return null;
-      return normalizeAutoAppReviewState(JSON.parse(raw));
-    } catch {
-      return null;
-    }
+    const raw = await AsyncStorage.getItem(KEYS.autoAppReviewState);
+    if (!raw) return null;
+    const state = normalizeAutoAppReviewState(JSON.parse(raw));
+    if (!state) throw new Error('Invalid automatic app review state');
+    return state;
   },
 
   async setAutoAppReviewState(state: AutoAppReviewState): Promise<void> {

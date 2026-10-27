@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -36,6 +36,139 @@ beforeEach(() => {
 });
 afterEach(async () => { for (const service of services.splice(0)) await service.stop(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 describe('Claude service durable send and ownership boundary', () => {
+  it('reads an occupied native conversation model in its own project without resuming or persisting it', async () => {
+    const { project, service } = fixture(true); const nativeId = randomUUID();
+    const other = join(project, 'other'); mkdirSync(other);
+    mocks.list.mockResolvedValue([{ sessionId: nativeId, cwd: other, summary: 'Native', lastModified: 10 }]);
+    mocks.history.mockResolvedValue([{ uuid: 'reply', type: 'assistant', message: { model: 'claude-haiku-test', content: [{ type: 'text', text: 'Reply' }] } }]);
+    mocks.roster.mockResolvedValue({ known: true, owners: [{ sessionId: nativeId, status: 'idle' }] });
+    const [row] = await request(service, 'sessions.list') as Array<{ key: string }>;
+    expect(await request(service, 'models.list', { sessionKey: row.key })).toMatchObject({ currentModel: 'claude-haiku-test' });
+    expect(mocks.starts.mock.calls.every(([options]) => options.key === 'model-catalog' && !options.resume)).toBe(true);
+    expect(mocks.starts.mock.calls.at(-1)![0].cwd).toBe(other);
+    expect(mocks.history.mock.calls.at(-1)![1]).toEqual({ dir: other });
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect((service as any).store.records).toEqual([]);
+  });
+
+  it('persists observed model metadata without turning it into a launch override on restart', async () => {
+    const { service, open } = fixture();
+    const row = await request(service, 'sessions.create') as { key: string };
+    await request(service, 'models.list', { sessionKey: row.key });
+    const session = mocks.starts.mock.calls.at(-1)![1];
+    session.currentModel = 'claude-effective'; session.emit('model', 'claude-effective');
+    expect(await request(service, 'models.list', { sessionKey: row.key })).toMatchObject({ currentModel: 'claude-effective' });
+    expect((await request(service, 'sessions.list') as any[])[0].model).toBe('claude-effective');
+    expect((service as any).store.records[0]).toMatchObject({ observedModel: 'claude-effective' });
+    expect((service as any).store.records[0].model).toBeUndefined();
+    await service.stop(); const restarted = open();
+    expect((await request(restarted, 'sessions.list') as any[])[0].model).toBe('claude-effective');
+    await request(restarted, 'models.list', { sessionKey: row.key });
+    expect(mocks.starts.mock.calls.at(-1)![0].model).toBeUndefined();
+  });
+
+  it('keeps legacy explicit model pins while preferring the current native read over stale metadata', async () => {
+    const { service } = fixture();
+    const row = await request(service, 'sessions.create') as { key: string };
+    (service as any).store.records[0].model = 'legacy-pin';
+    expect(await request(service, 'models.list', { sessionKey: row.key })).toMatchObject({ currentModel: 'sonnet' });
+    expect(mocks.starts.mock.calls.at(-1)![0].model).toBe('legacy-pin');
+  });
+
+  it('rejects an unknown scoped model read before starting a catalog probe', async () => {
+    const { service } = fixture();
+    await expect(request(service, 'models.list', { sessionKey: 'unknown-session' })).rejects.toThrow('Unknown');
+    expect(mocks.starts).not.toHaveBeenCalled();
+  });
+
+  it('a rename acknowledgement prevents a new sync from reusing a pre-rename multi-row scan', async () => {
+    const { service } = fixture();
+    const first = await request(service, 'sessions.create', { title: 'Before rename' }) as any;
+    const second = await request(service, 'sessions.create', { title: 'Second' }) as any;
+    const original = (service as any).descriptor.bind(service);
+    let reached!: () => void, release!: () => void, blocked = false;
+    const entered = new Promise<void>(resolve => { reached = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(service as any, 'descriptor').mockImplementation(async (...args: any[]) => {
+      const value = await original(...args);
+      if (args[0].key === second.key && !blocked) { blocked = true; reached(); await barrier; }
+      return value;
+    });
+    const older = request(service, 'sessions.sync') as Promise<any>; await entered;
+    await request(service, 'sessions.rename', { sessionKey: first.key, title: 'Confirmed name' });
+    const newer = await request(service, 'sessions.sync') as any;
+    release();
+    const retried = await older;
+    for (const response of [newer, retried]) expect(response.sessions.find((row: any) => row.key === first.key).title).toBe('Confirmed name');
+  });
+  it('negotiates catalog sync without replacing legacy list, and retains the baseline after incomplete native reads', async () => {
+    const { service, project } = fixture();
+    await request(service, 'sessions.create', { title: 'Owned' });
+    const info = { sessionId: randomUUID(), cwd: project, summary: 'Native', lastModified: 1 };
+    mocks.list.mockResolvedValue([info]);
+    const first = await request(service, 'sessions.sync') as any;
+    const base = { epoch: first.epoch, revision: first.revision };
+    expect(first).toMatchObject({ kind: 'full', total: 2, nextOffset: null });
+    expect(await request(service, 'sessions.list')).toEqual(first.sessions);
+    expect(await service.health()).toMatchObject({ sessionCatalogSync: 1 });
+    mocks.list.mockRejectedValue(new Error('private native path'));
+    await expect(request(service, 'sessions.sync', { base })).rejects.toThrow('Conversation catalog could not be refreshed completely');
+    expect(await request(service, 'sessions.sync', { page: { ...base, offset: 0 } })).toEqual(first);
+    expect(await request(service, 'sessions.list')).toHaveLength(1);
+    const nativeKey = first.sessions.find((session: any) => session.source === 'native').key;
+    mocks.list.mockResolvedValue([{ sessionId: info.sessionId, cwd: project }]);
+    await expect(request(service, 'sessions.sync', { base })).rejects.toThrow('Conversation catalog could not be refreshed completely');
+    expect(await request(service, 'chat.history', { sessionKey: nativeKey })).toMatchObject({ messages: [] });
+    mocks.list.mockResolvedValue([info]);
+    expect(await request(service, 'sessions.sync', { base })).toEqual({ kind: 'unchanged', ...base });
+    mocks.list.mockResolvedValue([]);
+    expect(await request(service, 'sessions.sync')).toMatchObject({ kind: 'full', total: 1 });
+    await expect(request(service, 'chat.history', { sessionKey: nativeKey })).rejects.toThrow('Unknown');
+  });
+  it('rejects truncated Claude discovery for sync while preserving legacy partial listing', async () => {
+    const { service, project } = fixture();
+    const rows = Array.from({ length: 100 }, () => ({ sessionId: randomUUID(), cwd: project, summary: 'Native', lastModified: 1 }));
+    mocks.list.mockResolvedValue(rows);
+    await expect(request(service, 'sessions.sync')).rejects.toThrow('Conversation catalog could not be refreshed completely');
+    expect(await request(service, 'sessions.list')).toHaveLength(100);
+  });
+  it.each([false, true])('syncs native and owned history despite an SDK row without cwd, without starting a writer (device=%s)', async device => {
+    const { service, project } = fixture(device);
+    await request(service, 'sessions.create', { title: 'Owned' });
+    const native = { sessionId: randomUUID(), cwd: project, summary: 'Native', lastModified: 1 };
+    mocks.list.mockResolvedValue([native, { sessionId: randomUUID(), summary: 'Unscoped', lastModified: 2 }]);
+    const first = await request(service, 'sessions.sync') as any;
+    expect(first).toMatchObject({ kind: 'full', total: 2, nextOffset: null });
+    expect(first.sessions.map((session: any) => session.title)).toEqual(['Owned', 'Native']);
+    expect(await request(service, 'sessions.list')).toEqual(first.sessions);
+    const base = { epoch: first.epoch, revision: first.revision };
+    expect(await request(service, 'sessions.sync', { base })).toEqual({ kind: 'unchanged', ...base });
+    const nativeKey = first.sessions.find((session: any) => session.source === 'native').key;
+    expect(await request(service, 'chat.history', { sessionKey: nativeKey })).toMatchObject({ messages: [] });
+    mocks.list.mockResolvedValue([{ sessionId: native.sessionId, summary: 'Native', lastModified: 2 }]);
+    const next = await request(service, 'sessions.sync') as any;
+    expect(next).toMatchObject({ kind: 'full', total: 1 });
+    await expect(request(service, 'chat.history', { sessionKey: nativeKey })).rejects.toThrow('Unknown');
+    // The last frozen page remains intact; no global/project fallback gains write authority.
+    expect(await request(service, 'sessions.sync', { page: { ...base, offset: 0 } })).toEqual(first);
+    expect(mocks.starts).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled();
+  });
+  it('looks up durable receipts after restart without native discovery, owner takeover or replay', async () => {
+    const { service, open } = fixture();
+    const row = await request(service, 'sessions.create') as { key: string };
+    const input = { sessionKey: row.key, text: 'receipt', idempotencyKey: '__proto__' };
+    expect(await request(service, 'chat.promptStatus', input)).toEqual({ status: 'unknown' });
+    expect(mocks.starts).not.toHaveBeenCalled();
+    const sent = await request(service, 'chat.send', input) as { runId: string };
+    await service.stop();
+    const restarted = open(); vi.clearAllMocks();
+    expect(await request(restarted, 'chat.promptStatus', input)).toEqual({ status: 'recorded', runId: sent.runId });
+    expect(await request(restarted, 'chat.promptStatus', { ...input, sessionKey: 'other' })).toEqual({ status: 'unknown' });
+    expect(await request(restarted, 'chat.promptStatus', { ...input, idempotencyKey: 'constructor' })).toEqual({ status: 'unknown' });
+    await expect(request(restarted, 'chat.promptStatus', { ...input, idempotencyKey: '' })).rejects.toThrow('Invalid');
+    expect(mocks.starts).not.toHaveBeenCalled(); expect(mocks.send).not.toHaveBeenCalled();
+    expect(mocks.list).not.toHaveBeenCalled(); expect(mocks.roster).not.toHaveBeenCalled();
+  });
   it('shows the accepted user message, then the completed assistant reply without persisting transcript text', async () => {
     const { service } = fixture();
     const row = await request(service, 'sessions.create') as { key: string };
@@ -263,8 +396,9 @@ describe('Claude service durable send and ownership boundary', () => {
     expect(mocks.starts.mock.calls.at(-1)![0]).toMatchObject({ key: 'model-catalog' });
     expect(mocks.starts.mock.calls.at(-1)![0].resume).toBeUndefined();
     await request(service, 'chat.send', { sessionKey: row.key, text: 'first', idempotencyKey: 'first' });
+    const started = mocks.starts.mock.calls.length;
     await request(service, 'models.list', { sessionKey: row.key });
-    expect(mocks.starts.mock.calls.at(-1)![0].resume).toBeUndefined();
+    expect(mocks.starts).toHaveBeenCalledTimes(started);
     expect(mocks.send).toHaveBeenCalledTimes(1);
   });
 
@@ -277,4 +411,63 @@ describe('Claude service durable send and ownership boundary', () => {
     expect(mocks.starts).not.toHaveBeenCalled();
   });
 
+});
+
+it('serves assistant-delivered native Claude attachments inside their actual project without resuming a writer', async () => {
+  const { service, project } = fixture();
+  writeFileSync(join(project, 'report.txt'), 'Claude attachment');
+  mocks.list.mockResolvedValue([{ sessionId: randomUUID(), cwd: project, summary: 'Native', lastModified: 1 }]);
+  mocks.history.mockResolvedValue([{ uuid: 'reply', type: 'assistant', message: { content: '[Report](report.txt)' } }]);
+  const rows = await request(service, 'sessions.list') as any[];
+  const key = rows.find(row => row.source === 'native').key;
+  const history = await request(service, 'chat.history', { sessionKey: key }) as any;
+  const artifactId = history.messages[0].attachments[0].artifactId;
+  const file = await request(service, 'clawket.artifacts.open', { sessionKey: key, artifactId }) as any;
+  expect(Buffer.from((await request(service, 'clawket.artifacts.read', { sessionKey: key, id: file.id, offset: 0 }) as any).data, 'base64').toString()).toBe('Claude attachment');
+  expect(mocks.starts).not.toHaveBeenCalled();
+  await expect(request(service, 'clawket.artifacts.read', { sessionKey: 'other', id: file.id, offset: 0 })).rejects.toThrow();
+});
+
+
+it('projects native busy/idle/waiting/unknown without changing ownership or starting an SDK session', async () => {
+  const { service, project } = fixture();
+  const nativeId = randomUUID(); mocks.list.mockResolvedValue([{ sessionId: nativeId, cwd: project, summary: 'Native', lastModified: 1 }]);
+  const rows = await request(service, 'sessions.list') as any[];
+  const key = rows[0].key; mocks.history.mockClear();
+  for (const [status, state] of [['busy', 'running'], ['idle', 'idle'], ['waiting', 'waiting'], ['unknown', 'unknown']]) {
+    mocks.roster.mockResolvedValue({ known: true, owners: [{ sessionId: nativeId, status }] });
+    expect(await request(service, 'sessions.activity', { keys: [key] })).toEqual([{ key, state }]);
+    const listed = await request(service, 'sessions.list') as any[];
+    expect(listed[0].hasActiveRun).toBe(status === 'busy');
+    expect(listed[0].canContinue).toBe(false); // An idle owner still owns the native thread.
+  }
+  mocks.roster.mockResolvedValue({ known: false, owners: [] });
+  expect(await request(service, 'sessions.activity', { keys: [key, 'missing'] })).toEqual([{ key, state: 'unknown' }, { key: 'missing', state: 'unknown' }]);
+  expect(mocks.starts).not.toHaveBeenCalled(); expect(mocks.history).not.toHaveBeenCalled();
+  await expect(request(service, 'sessions.activity', { keys: ['same', 'same'] })).rejects.toThrow('Invalid session activity request');
+});
+
+it('reports package version and protects active work before fencing update admission', async () => {
+  const { service: subject } = fixture();
+  (subject as any).options.bridgeVersion = '3.1.11';
+  expect(await subject.request({ type: 'req', id: 'version', method: 'health' })).toMatchObject({ backend: 'claude-code', bridgeVersion: '3.1.11' });
+  (subject as any).sessions.set('update-test', { activeRun: {} });
+  expect(subject.prepareForUpdate()).toBe(false);
+  (subject as any).sessions.delete('update-test');
+  // The ordinary fixture may have a real idle native process; those remain restartable.
+  expect(subject.prepareForUpdate()).toBe(true);
+  await expect(subject.request({ type: 'req', id: 'after', method: 'sessions.list' })).rejects.toThrow('restarting');
+});
+
+it('answers phone-started update only through the injected control', async () => {
+  const { service: subject } = fixture();
+  const call = (method: string, params?: Record<string, unknown>) => subject.request({ type: 'req', id: method, method, ...(params ? { params } : {}) } as any);
+  expect(await call('health')).not.toHaveProperty('remoteUpdate');
+  await expect(call('bridge.update.status')).rejects.toThrow('unavailable');
+  const status = { id: '5b0c7a0e-3c1f-4e8e-9b2a-6f1d2c3b4a59', state: 'checking' as const, startedAt: 1 }, start = vi.fn(async () => ({ accepted: true, status }));
+  (subject as any).options.remoteUpdate = { available: () => true, start, status: () => status };
+  expect(await call('health')).toMatchObject({ remoteUpdate: 1 });
+  expect(await call('bridge.update.start', { version: '0.0.1' })).toEqual({ accepted: true, status });
+  expect(await call('bridge.update.status')).toEqual({ status });
+  expect(start).toHaveBeenCalledExactlyOnceWith();
 });

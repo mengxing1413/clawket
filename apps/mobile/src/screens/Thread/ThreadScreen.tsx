@@ -42,6 +42,7 @@ import { useProPaywall } from '../../contexts/ProPaywallContext';
 import {
   getConnectionRuntime,
   useConnections,
+  type ConnectionRuntimeSnapshot,
 } from '../../connection';
 import type { RootStackParamList, ThreadOrigin } from '../../navigation/root-stack';
 import { useChatController } from '../../chat/useChatController';
@@ -68,10 +69,13 @@ import {
 } from './ThreadView';
 import {
   areThreadRunSeedsEqual,
+  copiedSessionTitle,
   deriveThreadContentState,
+  displayProjectPath,
   formatThreadLocalTime,
   isThreadErrorCode,
   loadThreadCronRunSeeds,
+  resolveContextRemainingPercent,
   resolveThreadErrorCode,
   resolveThreadErrorDetail,
   type ThreadErrorInput,
@@ -104,6 +108,11 @@ type ThreadCronActivity = Readonly<{
 
 const NO_CRON_ACTIVITY: ThreadCronActivity = { scope: '', runs: EMPTY_RUN_SEEDS, source: 'none' };
 
+function findRosterSession(roster: ConnectionRuntimeSnapshot['roster'], connectionId: string, agentId: string, sessionKey: string) {
+  return roster.find((group) => group.connection.id === connectionId)
+    ?.agents.find((row) => row.agent.agentId === agentId)?.sessions?.find((session) => session.key === sessionKey);
+}
+
 function runCardSignature(card: ThreadRunCard): string {
   return [
     card.id,
@@ -120,6 +129,7 @@ function runCardSignature(card: ThreadRunCard): string {
     card.summary ?? '',
     card.canOpenLogs ? '1' : '0',
     card.cronRun ? '1' : '0',
+    card.runnable ? '1' : '0',
   ].join('\u0001');
 }
 
@@ -220,6 +230,8 @@ function ThreadScreenContent({
   const [recoveringDraft, setRecoveringDraft] = useState(false);
   const [addSheetVisible, setAddSheetVisible] = useState(false);
   const [commandsSheetVisible, setCommandsSheetVisible] = useState(false);
+  // A pending Agent question takes the work dock's place above the composer.
+  const [questionPending, setQuestionPending] = useState(false);
   const [selectedSkill, setSelectedSkill] = useState<{ scope: string; name: string; prefix: string } | null>(null);
   const [runInputId, setRunInputId] = useState<string | null>(null);
   const [sessionFilesVisible, setSessionFilesVisible] = useState(false);
@@ -276,9 +288,9 @@ function ThreadScreenContent({
     setCommandsSheetVisible(false);
   }, [connectionId, sessionKey]);
 
-  const rosterSession = connections.roster.find((group) => group.connection.id === connectionId)
-    ?.agents.find((row) => row.agent.agentId === agentId)?.sessions?.find((session) => session.key === sessionKey);
+  const rosterSession = findRosterSession(connections.roster, connectionId, agentId, sessionKey);
   const nativeReadOnly = capabilities.sessionBranch === true && rosterSession?.source === 'native' && rosterSession.canContinue !== true;
+  const blockedReason = rosterSession?.continuationBlockedReason;
   // A stable object, so streamed chunks do not hand the timeline a new row renderer.
   const timelineCapabilities = useMemo(
     () => (nativeReadOnly ? { ...capabilities, chat: false } : capabilities),
@@ -287,6 +299,9 @@ function ThreadScreenContent({
   const [checkingNative, setCheckingNative] = useState(false);
   const [branching, setBranching] = useState(false);
   const [branchError, setBranchError] = useState(false);
+  // A check the reader asked for still found the conversation open on the computer.
+  const [stillOpenAfterCheck, setStillOpenAfterCheck] = useState(false);
+  useEffect(() => { setStillOpenAfterCheck(false); }, [blockedReason, connectionId, sessionKey]);
   const nativeBranchBusy = useRef(false);
   const mainConversation = isMainConversation({ sessionKey, mainSessionKey: app.mainSessionKey, kind: rosterSession?.kind });
   const manualSession = useManualSession(connectionId, agentId, sessionKey);
@@ -296,6 +311,8 @@ function ThreadScreenContent({
   const previewSnapshot = useRef<SessionPreviewSnapshot | null>(null);
   const controller = useChatController({
     adapter,
+    routeConnectionId: connectionId,
+    routeAgentId: agentId,
     routeSessionKey: sessionKey,
     readOnly: sessionPreview || nativeReadOnly,
     debugMode: app.debugMode,
@@ -360,6 +377,13 @@ function ThreadScreenContent({
     else controller.composerRef.current?.focus();
   }, [route.params.shortcut, controller.draftReady, controller.sessionKey, sessionKey, routeIsActive, locked, sessionPreview, capabilities.skills, capabilities.attachments, navigation, controller.composerRef, controller.voiceInputSupported, controller.canAddMoreImages, controller.takePhoto, controller.pickImage, t]);
   const currentSession = controller.sessions.find((session) => session.key === sessionKey);
+  // Context left and the project sit in the model sheet (A+ composer, 2026-09-30).
+  const contextRemainingPercent = resolveContextRemainingPercent(
+    currentSession?.totalTokensFresh === false ? undefined : currentSession?.totalTokens,
+    currentSession?.contextTokens,
+  );
+  const sessionProjectPath = rosterSession?.project?.path?.trim();
+  const sessionProject = sessionProjectPath ? { label: displayProjectPath(sessionProjectPath), path: sessionProjectPath } : null;
   const lastReadRevisionRef = useRef<string | null>(null);
   // Read watermarks follow the same human-activity clock as roster unread, so a
   // heartbeat or metadata patch neither re-flags this thread nor re-marks it.
@@ -783,6 +807,11 @@ function ThreadScreenContent({
     analyticsEvents.runCardOpened({ kind: 'cron' });
     setSelectedCronRun(run.cronRun);
   }, []);
+  // "Run again" under a failed scheduled result: the same forced run as the editor's "Run now".
+  const rerunCron = useCallback(async (run: ThreadRunCard) => {
+    if (!cronOperations?.run || !run.jobId) throw new Error('Scheduled task unavailable');
+    await cronOperations.run(run.jobId, 'force');
+  }, [cronOperations]);
 
   const handleCopyMessage = useCallback((message: UiMessage) => {
     const text = message.role === 'assistant'
@@ -811,13 +840,13 @@ function ThreadScreenContent({
     if (!adapter || !focused || locked || sessionPreview || branchBusy.current || !branchScope.active) return;
     branchBusy.current = true;
     controller.composerRef.current?.blur();
-    void createReplyConversation(adapter, agentId, sessionKey, message).then(session => {
+    void createReplyConversation(adapter, agentId, sessionKey, message, rosterSession?.project?.id).then(session => {
       if (!branchScope.active || getConnectionRuntime().getSnapshot().activeAdapter !== adapter) return;
       navigation.push('Thread', { connectionId, agentId, sessionKey: session.key, from: 'panel' });
     }).catch(() => {
       if (branchScope.active) Alert.alert(t('Error', { ns: 'common' }), t('Unable to start a new chat'));
     }).finally(() => { branchBusy.current = false; });
-  }, [adapter, focused, locked, sessionPreview, branchScope, controller.composerRef, agentId, sessionKey, connectionId, navigation, t]);
+  }, [adapter, focused, locked, sessionPreview, branchScope, controller.composerRef, agentId, sessionKey, rosterSession?.project?.id, connectionId, navigation, t]);
 
   const messageActions = useMemo(() => ({
     onCopy: handleCopyMessage,
@@ -926,6 +955,7 @@ function ThreadScreenContent({
   return (
     <>
       <ThreadView
+        artifactOperations={focused && !locked && !sessionPreview && routeIsActive ? adapter?.artifacts : undefined}
         connectionFailure={{
           scope: `${connectionId}:${agentId}`,
           name: connections.connections.find((item) => item.id === connectionId)?.label ?? agentName,
@@ -947,40 +977,45 @@ function ThreadScreenContent({
         agentAvatarUrl={agentAvatarUrl}
         agentPlatform={agentPlatform}
         sessionTitle={currentSession?.title ?? currentSession?.label}
-        projectPath={rosterSession?.project?.path}
         isMainSession={mainConversation}
         model={controller.currentModelHeaderLabel}
         modelDisplayName={controller.currentModelDisplayName}
-        contextUsed={currentSession?.totalTokensFresh === false
-          ? undefined
-          : currentSession?.totalTokens}
-        contextWindow={currentSession?.contextTokens}
         activityLabel={controller.activityLabel}
+        runWorkIdentity={controller.runWorkIdentity}
         interactionAttention={rosterSession ? rosterSession.attention : currentSession?.attention}
         capabilities={timelineCapabilities}
         readOnlyFooter={nativeReadOnly && !sessionPreview ? <View style={{ padding: Space.lg, paddingBottom: Math.max(insets.bottom, Space.lg), gap: Space.md }}>
           <Text testID="native-session-read-only-hint" style={{ fontSize: FontSize.secondary, color: theme.colors.inkSecondary, textAlign: 'center' }}>
-            {rosterSession?.continuationBlockedReason === 'in_use'
-              ? t('This conversation is open on your computer. Close that conversation, then check again, or continue in a new session.')
-              : rosterSession?.continuationBlockedReason === 'ownership_unknown'
-                ? t('Could not verify whether this conversation is in use. Check again, or continue in a new session.')
-                : rosterSession?.continuationBlockedReason === 'project_unavailable'
+            {blockedReason === 'in_use'
+              ? stillOpenAfterCheck
+                ? t('It’s still open on your computer. Archive or exit it there, then try again.')
+                : t('This conversation is still open on your computer. Archive or exit it there to keep chatting here.')
+              : blockedReason === 'ownership_unknown'
+                ? t('Could not confirm whether this conversation is still open on your computer.')
+                : blockedReason === 'project_unavailable'
                   ? t('This conversation’s project folder is unavailable on your computer.')
-                  : t('Imported conversations are read-only. Continue with their context in a new session; the original stays unchanged.')}
+                  : t('This conversation came from your computer and is view-only here. Continue in a copy; the original stays unchanged.')}
           </Text>
-          <Button label={t('Continue in a new session')} variant={rosterSession?.continuationBlockedReason ? 'secondary' : 'primary'} loading={branching} disabled={adapter?.state !== 'ready' || checkingNative || rosterSession?.continuationBlockedReason === 'project_unavailable'} onPress={() => {
+          {/* The copy is the main action: whoever reads this on the phone is usually away from the computer (owner decision 2026-09-30). */}
+          {blockedReason ? <Button testID="native-session-recheck" label={blockedReason === 'in_use' ? t('I’ve closed it on my computer') : t('Retry')} variant={blockedReason === 'project_unavailable' ? 'primary' : 'secondary'} loading={checkingNative} disabled={adapter?.state !== 'ready' || branching} onPress={() => {
+            if (!adapter || nativeBranchBusy.current) return;
+            const checkedReason = blockedReason;
+            nativeBranchBusy.current = true; setBranchError(false); setCheckingNative(true);
+            // The Bridge publishes fresh ownership before answering, so the runtime roster already holds the result.
+            void adapter.loadSession(sessionKey).then(() => {
+              if (!branchScope.active || checkedReason !== 'in_use') return;
+              setStillOpenAfterCheck(findRosterSession(getConnectionRuntime().getSnapshot().roster, connectionId, agentId, sessionKey)?.continuationBlockedReason === 'in_use');
+            }).catch(() => { if (branchScope.active) setBranchError(true); })
+              .finally(() => { nativeBranchBusy.current = false; if (branchScope.active) setCheckingNative(false); });
+          }} /> : null}
+          {blockedReason !== 'project_unavailable' ? <Button testID="native-session-copy" label={t('Continue in a copy')} variant="primary" loading={branching} disabled={adapter?.state !== 'ready' || checkingNative} onPress={() => {
             if (nativeBranchBusy.current || !adapter?.createSession) return;
             nativeBranchBusy.current = true; setBranching(true); setBranchError(false);
-            void ManualSessions.create(adapter, agentId, `native-branch:${sessionKey}`, { fromSession: sessionKey }).then(created => {
+            const title = copiedSessionTitle(currentSession?.title ?? currentSession?.label ?? rosterSession?.title, source => t('{{title}} (copy)', { title: source }));
+            void ManualSessions.create(adapter, agentId, `native-branch:${sessionKey}`, { fromSession: sessionKey, ...(title ? { title } : {}) }).then(created => {
               if (getConnectionRuntime().getSnapshot().activeAdapter !== adapter || !branchScope.active) return;
               navigation.replace('Thread', { connectionId, agentId, sessionKey: created.key, from: 'panel' });
             }).catch(() => { if (branchScope.active) setBranchError(true); }).finally(() => { nativeBranchBusy.current = false; if (branchScope.active) setBranching(false); });
-          }} />
-          {rosterSession?.continuationBlockedReason ? <Button label={t('Check again')} variant="primary" loading={checkingNative} disabled={adapter?.state !== 'ready' || branching} onPress={() => {
-            if (!adapter || nativeBranchBusy.current) return;
-            nativeBranchBusy.current = true; setBranchError(false); setCheckingNative(true);
-            void adapter.loadSession(sessionKey).catch(() => { if (branchScope.active) setBranchError(true); })
-              .finally(() => { nativeBranchBusy.current = false; if (branchScope.active) setCheckingNative(false); });
           }} /> : null}
           {branchError ? <Banner tone="bad" message={t('Could not update this request. Try again.')} /> : null}
         </View> : undefined}
@@ -1000,15 +1035,22 @@ function ThreadScreenContent({
         runCards={sessionPreview ? EMPTY_RUN_CARDS : runCards}
         locale={locale}
         input={displayInput}
-        pendingQuestions={adapter && capabilities.agentQuestions && !nativeReadOnly ? <AgentQuestions key={`${connectionId}:${sessionKey}`} adapter={adapter} sessionKey={sessionKey} /> : undefined}
+        pendingQuestions={adapter && capabilities.agentQuestions && !nativeReadOnly ? <AgentQuestions key={`${connectionId}:${sessionKey}`} adapter={adapter} sessionKey={sessionKey} onPendingChange={setQuestionPending} /> : undefined}
+        questionPending={Boolean(adapter && capabilities.agentQuestions && !nativeReadOnly) && questionPending}
+        keyboardVisible={controller.keyboardVisible}
         selectedSkill={activeSkill ? <SelectedSkill name={activeSkill.name} onRemove={() => {
           controller.setInput(displayInput); setSelectedSkill(null);
         }} /> : undefined}
         composerRef={controller.composerRef}
         isRunning={controller.isSending}
-        pendingReplyRenderKey={controller.pendingReplyRenderKey}
+        sendInFlight={controller.sendInFlight}
         canSend={!sessionPreview && controller.canSend}
         loadingMoreHistory={!sessionPreview && controller.loadingMoreHistory}
+        historyPagingBlocked={controller.refreshing}
+        historyScope={`${connectionId}:${agentId}:${sessionKey}`}
+        qaGeometryActive={focused && routeIsActive && !locked && controller.sessionKey === sessionKey}
+        historyLoadMoreError={!sessionPreview && controller.historyLoadMoreError}
+        onRetryHistory={!sessionPreview ? controller.retryLoadMoreHistory : undefined}
         topInset={insets.top}
         bottomInset={insets.bottom}
         copy={copy}
@@ -1021,7 +1063,7 @@ function ThreadScreenContent({
           if (!value) { setSelectedSkill(null); controller.setInput(''); }
           else controller.setInput(activeSkill ? `${activeSkill.prefix}${value}` : value);
         }}
-        onSend={sessionPreview ? openSessionPaywall : controller.canSteer ? () => { controller.composerRef.current?.blur(); setRunInputId(controller.activeRunId); } : controller.onSend}
+        onSend={sessionPreview ? openSessionPaywall : controller.canChooseRunInput ? () => { controller.composerRef.current?.blur(); Keyboard.dismiss(); setRunInputId(controller.activeRunId); } : controller.onSend}
         onCancel={requestCancelCurrentRun}
         onOpenAddMenu={addMenuAvailable ? handleOpenAddMenu : undefined}
         onVoice={controller.voiceInputSupported ? controller.toggleVoiceInput : undefined}
@@ -1049,6 +1091,7 @@ function ThreadScreenContent({
         onOpenRunSession={onOpenRunSession ? openRunSession : undefined}
         onOpenCronRun={openCronRun}
         onOpenRunLogs={onOpenRunLogs}
+        onRerunCron={cronOperations?.run && !locked ? rerunCron : undefined}
         onOpenAttachments={handleOpenMessageAttachments}
         messageActions={messageActions}
         queuedMessageActions={sessionPreview ? undefined : queuedMessageActions}
@@ -1068,13 +1111,20 @@ function ThreadScreenContent({
         showSlashSuggestions={controller.showSlashSuggestions}
         onSelectSlashCommand={controller.onSelectSlashCommand}
         onDismissSlashSuggestions={controller.dismissSlashSuggestions}
-        thinkingLevel={controller.thinkingLevel}
-        thinkingLevelOptions={controller.thinkingLevelOptions}
-        onSelectThinkingLevel={controller.onSelectStaticThinkLevel}
+        permissionsNeedConfirmation={controller.permissions?.requiresConfirmation === true}
+        onReviewRuntimeSettings={controller.runtimeSettingsUnconfirmed && !controller.runtimeSettingsBusy ? () => {
+          controller.composerRef.current?.blur();
+          Keyboard.dismiss();
+          const reviewPermissions = controller.permissions?.requiresConfirmation === true;
+          controller.setPermissionPickerVisible(reviewPermissions);
+          controller.setModelPickerVisible(!reviewPermissions);
+          controller.retryModelPickerLoad();
+        } : undefined}
         onResolveApproval={controller.resolveApproval}
       />
       <RunInputSheet visible={Boolean(runInputId) && !sessionPreview} scope={`${connectionId}:${agentId}:${sessionKey}`}
-        onClose={() => setRunInputId(null)} onCurrent={() => { if (runInputId) controller.onSteer(runInputId); }} onNext={controller.onSend} canSteer={controller.canSteer && controller.activeRunId === runInputId} />
+        onClose={() => setRunInputId(null)} onCurrent={() => { if (runInputId) controller.onSteer(runInputId); }} onNext={controller.onSend}
+        canSteer={controller.canSteer && controller.activeRunId === runInputId} steeringPending={controller.steeringPending} />
       <SessionFilesSheet visible={sessionFilesVisible && focused && !locked && !sessionPreview && routeIsActive} adapter={adapter} sessionKey={sessionKey}
         online={adapter?.state === 'ready'} onClose={() => setSessionFilesVisible(false)} />
       <SkillPickerSheet visible={skillPickerVisible && !sessionPreview} adapter={adapter} agentId={agentId} sessionKey={sessionKey}
@@ -1126,26 +1176,42 @@ function ThreadScreenContent({
           visible: controller.preview.previewVisible && (!sessionPreview || visibleMessages.some((message) => message.imageUris?.some((uri) => controller.preview.previewUris.includes(uri)))),
           uris: controller.preview.previewUris,
           index: controller.preview.previewIndex,
-          width: controller.preview.screenWidth,
-          height: controller.preview.screenHeight,
-          topInset: insets.top,
-          bottomInset: insets.bottom,
           onClose: controller.preview.closePreview,
           onIndexChange: controller.preview.setPreviewIndex,
         }}
-        modelPicker={{
-          visible: !sessionPreview && controller.modelPickerVisible,
+        modelSheet={{
+          visible: !sessionPreview && (controller.modelPickerVisible || controller.permissionPickerVisible),
+          focusPermissions: controller.permissionPickerVisible,
+          scope: controller.modelScope,
+          // Native settings backends (Codex) confirm every write; the others switch at once.
+          writes: controller.hasRuntimeSettings ? 'native' : 'optimistic',
           loading: controller.modelPickerLoading,
+          busy: controller.hasRuntimeSettings ? controller.runtimeSettingsBusy : undefined,
+          running: controller.hasRuntimeSettings ? controller.isSending : undefined,
           error: controller.modelPickerError,
           models: controller.availableModels,
-          configuredDefaultModel: controller.configuredDefaultModel,
-          onManage: () => openAgentSection('models'),
           providers: controller.availableProviders,
-          defaultModel: controller.currentModel ?? undefined,
-          defaultProvider: controller.currentModelProvider ?? undefined,
-          onClose: () => controller.setModelPickerVisible(false),
+          currentModel: controller.currentModel ?? undefined,
+          currentProvider: controller.currentModelProvider ?? undefined,
+          configuredDefaultModel: controller.configuredDefaultModel,
+          recentModels: controller.recentModels,
+          thinking: controller.thinkingLevelOptions.length && (controller.hasRuntimeSettings || controller.thinkingLevel) ? {
+            current: controller.thinkingLevel ?? null,
+            options: controller.thinkingLevelOptions,
+            onSelect: controller.onSelectStaticThinkLevel,
+          } : undefined,
+          fastMode: controller.fastMode,
+          onSelectFastMode: controller.onSelectFastMode,
+          permissionsSupported: capabilities.sessionPermissions === true,
+          permissions: controller.permissions,
+          onSelectPermissions: controller.onSelectPermissions,
+          contextRemainingPercent,
+          project: sessionProject,
+          onManage: controller.hasRuntimeSettings ? undefined : () => openAgentSection('models'),
+          onStopRun: requestCancelCurrentRun,
+          onClose: () => { controller.setModelPickerVisible(false); controller.setPermissionPickerVisible(false); },
           onRetry: controller.retryModelPickerLoad,
-          onSelect: controller.onSelectModel,
+          onSelectModel: controller.onSelectModel,
         }}
         commandPicker={{
           visible: !sessionPreview && controller.commandPickerVisible,
@@ -1289,11 +1355,5 @@ export function createThreadCopy(t: TFunction): ThreadCopy {
       : status,
     logs: t('Logs', { ns: 'common' }),
     chooseModel: t('Models', { ns: 'settings' }),
-    formatModelContext: (model, remainingPercent) => t('{{model}} · {{percent}}% left', {
-      ns: 'chat',
-      model,
-      percent: remainingPercent,
-    }),
-    formatThinkingLevel: (level) => t(`thinking_${level}`, { ns: 'chat' }),
   };
 }

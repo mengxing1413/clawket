@@ -1,4 +1,4 @@
-import type { MessageAttribution } from '@clawket/agent-protocol';
+import type { ChatMessage, MessageAttribution } from '@clawket/agent-protocol';
 
 export type MessageUsage = {
   inputTokens?: number;
@@ -62,6 +62,8 @@ export type UiMessage = {
   renderKey?: string;
   /** Completed live rows retain their order until the same turn is reconciled. */
   presentationRunId?: string;
+  /** Backend-authored execution group; distinct from the local presentation run ID. */
+  turnId?: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   attribution?: MessageAttribution;
   sentLocally?: true;
@@ -72,9 +74,12 @@ export type UiMessage = {
   };
   /** Local acknowledgement failed; server acceptance is unknown. */
   sendUncertain?: boolean;
+  /** Bridge receipt only. Keep execution uncertainty until exact native history confirms it. */
+  bridgeRecordedRunId?: string;
   idempotencyKey?: string;
   timestampMs?: number;
   streaming?: boolean;
+  artifactAttachments?: NonNullable<ChatMessage['attachments']>;
   imageUris?: string[];
   imageMetas?: ImageMeta[];
   fileAttachments?: UiFileAttachment[];
@@ -82,6 +87,8 @@ export type UiMessage = {
   usage?: MessageUsage;
   toolName?: string;
   toolStatus?: 'running' | 'success' | 'error' | 'unknown';
+  /** Explicit adapter state; unknown is not the legacy missing-result hint. */
+  toolStatusReported?: true;
   toolSummary?: string;
   toolArgs?: string;
   toolDetail?: string;

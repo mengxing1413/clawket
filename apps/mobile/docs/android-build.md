@@ -14,6 +14,18 @@ Do not treat them as the same thing:
 - APK packaging is only for first install, native changes, or distribution verification.
 - Google Play closed testing requires a release-signed `.aab`, not a debug-signed APK.
 
+## Photo and media permissions
+
+Clawket uses the system Photo Picker for chat attachments, QR import, avatars and wallpaper. Android does not enumerate recent library photos; the Add sheet strip remains iOS-only. The owner approved removing broad Android media reads on 2026-10-07 after Play blocked submission.
+
+- `app.json` blocks `READ_MEDIA_IMAGES`, `READ_MEDIA_VIDEO`, `READ_MEDIA_AUDIO`, `READ_MEDIA_VISUAL_USER_SELECTED` and `READ_EXTERNAL_STORAGE`, and explicitly sets `expo-media-library.granularPermissions` to `[]`. Removing only `android.permissions` entries is insufficient because config plugins and dependency manifests can add permissions back.
+- Photo, poster, bundled-image and Node `media.save` writes share `src/services/photo-library-permissions.ts`. Android API 33+ writes app-created media without a permission prompt. API 24–32 requests only Expo's legacy write access; its dependency manifest bounds `WRITE_EXTERNAL_STORAGE` to API 32. iOS requests add-only photo access. Camera and microphone permissions remain independent.
+- Android Node handshakes omit `photos.latest` and the `photos` namespace even when a saved toggle is enabled. A stale invoke returns `UNSUPPORTED_FEATURE` before any library access. Do not substitute a picker for “latest photos” under the same command. The user can select photos in chat; iOS retains the original Node operation. Other Node operations and OpenClaw/Hermes attachment delivery retain their existing contracts.
+
+`npm run check:app-config` checks the source permission policy with corrupted-input regressions and runs in CI. Before an authorized Play upload, inspect the **merged manifest of the actual candidate AAB**, not only the source config, for all five blocked reads and the legacy write SDK bound. Check every active Play track for affected bundles. Permission removal requires a native rebuild; a JavaScript update or Console declaration edit cannot remove permissions from an existing binary.
+
+Device acceptance covers multiple or cancelled photo picks, QR import, cropped avatars, wallpaper, camera capture, incoming shares, all image/poster saves, both OpenClaw/Hermes image sends, and Android Node command advertisement/rejection. Cover denied photo read access on Android 13+ and legacy write refusal on an older Android device when available; preserve iOS recent-photo access and add-only saves. Local tests/builds do not establish Play approval or physical acceptance.
+
 ## Environment Setup
 
 ```bash
@@ -166,11 +178,24 @@ android/app/build/outputs/apk/release/app-release.apk
 `-PreactNativeArchitectures=arm64-v8a` builds only arm64. This keeps APK size lower.  
 Remove it to include `armeabi-v7a` for older devices, at the cost of a larger APK.
 
-If you need to upload a replacement build to Google Play and the previous `versionCode` is already used, rebuild with a higher override:
+If you need to upload a replacement build to Google Play and the previous `versionCode` is already used, rebuild with a higher override. For 3.1.2, the computed code 30102 is already used by the uploaded 3.1.1 build; recheck Play's highest uploaded code and use at least 30103:
 
 ```bash
-EXPO_ANDROID_VERSION_CODE=30102 npm run build:android:aab
+EXPO_ANDROID_VERSION_CODE=30103 npm run build:android:aab
 ```
+
+### Local QA package
+
+`-Pclawket.qa=true` (or `CLAWKET_ANDROID_QA=1`) builds `com.p697.clawket.qa`, labeled "Clawket QA", so it installs beside the store app on a personal phone. The Kotlin namespace and everything else stay the same; `plugins/with-android-qa-variant.js` generates the switch. Combine it with local debug signing:
+
+```bash
+cd android
+./gradlew app:assembleRelease -x lint -x test --build-cache -PreactNativeArchitectures=arm64-v8a \
+  -Pclawket.allowDebugReleaseSigning=true -Pclawket.qa=true
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+A QA package is a local development build: Google Play billing and verified App Links do not apply to it, and it is never uploaded. Samsung phones may ask Google Play Protect to scan every `adb install`; someone has to answer that prompt on the phone.
 
 ### Store-ready AAB
 
@@ -230,10 +255,10 @@ If you switch between differently signed builds, Android may reject the install 
 INSTALL_FAILED_UPDATE_INCOMPATIBLE
 ```
 
-When that happens:
+On the owner's phone, never uninstall `com.p697.clawket`: that deletes the store app's data and pairings. Install a [local QA package](#local-qa-package) beside it instead. Only a QA package, or any build on a dedicated test device, may be replaced:
 
 ```bash
-adb uninstall com.p697.clawket
+adb uninstall com.p697.clawket.qa
 adb install android/app/build/outputs/apk/release/app-release.apk
 ```
 
@@ -456,10 +481,10 @@ Cause:
 
 - Android does not allow overwriting an installed app signed with a different certificate
 
-Fix:
+Fix: build a [local QA package](#local-qa-package), which installs beside the store app. Never uninstall `com.p697.clawket` from the owner's phone; replace only a QA package or a build on a dedicated test device:
 
 ```bash
-adb uninstall com.p697.clawket
+adb uninstall com.p697.clawket.qa
 adb install android/app/build/outputs/apk/release/app-release.apk
 ```
 
@@ -491,6 +516,26 @@ Mitigation:
 
 - reconnect the cable
 - verify `adb devices` before starting the dev stack or installing an APK
+
+### Truncated Device Screenshots
+
+Symptom:
+
+- a screenshot shows the screen down to a straight horizontal edge, often through a line of text, and plain white below it, including where the system navigation bar should be
+- the full-size PNG has no `IEND` chunk (on the SM-A566B its size is 360 bytes plus whole 8204-byte data chunks): the stream stopped part-way, and image viewers draw the rows that never arrived as white
+
+Device QA on 2026-10-01 read three such captures as rendering bugs (a Session Panel list that seemed to stay blank for 2–3 seconds, a roster with two rows after a theme switch, a slow model sheet); screen recordings of the same steps showed complete frames.
+
+Mitigation:
+
+- write the capture on the device, pull it, and check that it ends with the `IEND` chunk before judging what it shows:
+
+```bash
+adb shell screencap -p /sdcard/qa.png && adb pull /sdcard/qa.png .
+tail -c 8 qa.png | xxd -p   # a complete PNG prints 49454e44ae426082
+```
+
+- time transitions from an `adb shell screenrecord` video and its frame timestamps (`ffprobe -show_entries frame=pts_time`), not from screenshots taken seconds apart
 
 ## Practical Summary
 

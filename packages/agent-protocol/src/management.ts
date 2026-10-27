@@ -34,8 +34,30 @@ export interface ModelProviderInfo {
   apiUrl?: string;
 }
 
+export type SessionPermissionMode = 'workspace' | 'read-only' | 'full-access';
+
+/** Effective native permissions, not an optimistic picker draft. */
+export interface SessionPermissionState {
+  /** A previous native restore was unconfirmed; only an explicit verified permission choice clears it. */
+  requiresConfirmation?: boolean;
+  /** Computed by the client transport, never accepted as a wire security guarantee. */
+  unencryptedTransport?: boolean;
+  mode: SessionPermissionMode | 'custom' | null;
+  available: boolean;
+  availableModes?: SessionPermissionMode[];
+  scope: 'session';
+}
+
 export interface ModelSelectionState {
+  permissions?: SessionPermissionState;
+  /** Missing means unsupported; null means the native owner's setting is not yet known. */
+  fastMode?: { enabled: boolean | null; available: boolean };
   thinkingLevel?: ThinkingLevel;
+  /**
+   * The levels the current model accepts, in display order, when the backend
+   * reports them per model; missing means `listThinkingLevels()` applies.
+   */
+  thinkingLevels?: ThinkingLevel[];
   currentModel: string;
   currentProvider: string;
   currentBaseUrl: string;
@@ -897,6 +919,9 @@ export type ModelsOperations = Partial<{
     setSelection(params: ModelSelectionWrite): Promise<ModelSelectionWriteResult>;
     listThinkingLevels(): ThinkingLevel[];
     setThinkingLevel(sessionKey: string, level: ThinkingLevel): Promise<ModelSelectionState>;
+    setFastMode(sessionKey: string, enabled: boolean): Promise<ModelSelectionState>;
+    /** `sessionPermissions` refinement; resolves with the effective native state. */
+    setPermissions(mode: SessionPermissionMode, sessionKey: string): Promise<ModelSelectionState>;
     /** `modelManage` refinement: Gateway config catalog, defaults and allowlist. */
     getCatalog(): Promise<ModelCatalogState>;
     saveCatalog(write: ModelCatalogWrite): Promise<void>;
@@ -970,6 +995,7 @@ export type ConfigOperations = Partial<{
 }>;
 
 export type ManagementOperations = Partial<{
+  profile: import('./profile').AgentProfileOperations;
   models: ModelsOperations;
   skills: SkillsOperations;
   cron: CronOperations;

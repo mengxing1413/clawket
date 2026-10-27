@@ -1,3 +1,5 @@
+vi.mock('./managed-release.js', () => ({ delegateManagedRuntime: vi.fn(async () => false), isRuntimeCommand: (args: string[]) => ['run', 'start', 'install', 'restart'].includes(args[0]) }));
+vi.mock('./runtime-owner.js', () => ({ registerRuntimeOwner: vi.fn(async () => async () => {}) }));
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -148,8 +150,11 @@ function mockChildProcess() {
 }
 
 vi.mock('@clawket/bridge-core', mockBridgeCore);
-function mockBridgeCore() {
+async function mockBridgeCore(importOriginal: <T>() => Promise<T>) {
+  const { officialRelayEndpoints, canonicalizeOfficialRelayUrl, migrateOfficialRelayConfig, sameRelayRegistry }
+    = await importOriginal<typeof import('@clawket/bridge-core')>();
   return {
+    officialRelayEndpoints, canonicalizeOfficialRelayUrl, migrateOfficialRelayConfig, sameRelayRegistry,
     buildHermesLocalPairingQrPayload: buildHermesLocalPairingQrPayloadMock,
     clearServiceState: vi.fn(),
     deleteHermesRelayConfig: vi.fn(),
@@ -200,6 +205,25 @@ vi.mock('@clawket/bridge-runtime', () => ({
   restartOpenClawGateway: vi.fn(),
 }));
 
+function hermesRelayPairing(action: 'registered' | 'refreshed') {
+  return {
+    config: {
+      serverUrl: 'https://hermes-registry.example.com',
+      bridgeId: 'hbg_123',
+      relaySecret: 'hrs_secret',
+      relayUrl: 'wss://hermes-relay.example.com/ws',
+      instanceId: 'hermes-host',
+      displayName: 'Hermes',
+      createdAt: '2026-04-11T00:00:00.000Z',
+      updatedAt: '2026-04-11T00:00:00.000Z',
+    },
+    accessCode: 'ABCD23',
+    accessCodeExpiresAt: '2026-04-11T01:00:00.000Z',
+    qrPayload: '{"version":1,"kind":"clawket_hermes_pair"}',
+    action,
+  };
+}
+
 describe('cli pairing output', () => {
   const originalArgv = process.argv.slice();
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
@@ -216,6 +240,7 @@ describe('cli pairing output', () => {
     // Process listings below are mocked POSIX ps output.
     vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
     vi.clearAllMocks();
+    vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
     const testHome = mkdtempSync(join(tmpdir(), 'clawket-cli-home-'));
     vi.stubEnv('HOME', testHome);
     vi.stubEnv('USERPROFILE', testHome);
@@ -264,22 +289,7 @@ describe('cli pairing output', () => {
       qrPayload: '{"v":2,"k":"cp","g":"gw_test_123","a":"AB7K9Q"}',
       action: 'refreshed',
     });
-    pairHermesRelayMock.mockResolvedValue({
-      config: {
-        serverUrl: 'https://hermes-registry.example.com',
-        bridgeId: 'hbg_123',
-        relaySecret: 'hrs_secret',
-        relayUrl: 'wss://hermes-relay.example.com/ws',
-        instanceId: 'hermes-host',
-        displayName: 'Hermes',
-        createdAt: '2026-04-11T00:00:00.000Z',
-        updatedAt: '2026-04-11T00:00:00.000Z',
-      },
-      accessCode: 'ABCD23',
-      accessCodeExpiresAt: '2026-04-11T01:00:00.000Z',
-      qrPayload: '{"version":1,"kind":"clawket_hermes_pair"}',
-      action: 'registered',
-    });
+    pairHermesRelayMock.mockResolvedValue(hermesRelayPairing('registered'));
     readHermesRelayConfigMock.mockReturnValue({
       serverUrl: 'https://hermes-registry.example.com',
       bridgeId: 'hbg_123',
@@ -335,10 +345,14 @@ describe('cli pairing output', () => {
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    vi.useRealTimers();
+    await new Promise(resolve => setImmediate(resolve));
     // The watchdog test switches to fake timers; restore them here so a failure
     // before its own `vi.useRealTimers()` cannot stall every later test.
     vi.useRealTimers();
+    process.exitCode = 0;
     process.argv = originalArgv.slice();
     consoleLogSpy.mockRestore();
     consoleErrorSpy.mockRestore();
@@ -386,7 +400,7 @@ describe('cli pairing output', () => {
   });
 
   it('prints OpenClaw and Hermes Bridge capabilities in status output', async () => {
-    process.argv = ['node', 'clawket', 'status'];
+    process.argv = ['node', 'clawket', 'status', '--verbose'];
     buildDoctorReportMock.mockResolvedValue({
       paired: true,
       hermesRelayPaired: true,
@@ -406,8 +420,40 @@ describe('cli pairing output', () => {
     );
   });
 
+  it('prints compact status JSON and leaves legacy details behind --verbose', async () => {
+    process.argv = ['node', 'clawket', 'status', '--json'];
+    buildDoctorReportMock.mockResolvedValue({ paired: true, serviceRunning: true, localGatewayReachable: true });
+    await import('./index.js');
+    await vi.waitFor(() => expect(consoleLogSpy).toHaveBeenCalled());
+    const result = JSON.parse(String(consoleLogSpy.mock.calls[0][0]));
+    expect(result.connections[0]).toMatchObject({ backend: 'openclaw', state: 'running' });
+    expect(consoleLogSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['reset', '--backend', 'typo'],
+    ['reset', '--backend', 'local-model'],
+    ['reset', '--config', '/an-agent.json'],
+    ['reset', '--backend', 'openclaw', '--config', '/an-agent.json'],
+    ['codex', 'reset', '--backend', 'hermes'],
+  ])('rejects an ambiguous reset without stopping any legacy service: %j', async (...args) => {
+    process.argv = ['node', 'clawket', ...args];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    await import('./index.js');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(stopServiceMock).not.toHaveBeenCalled(); expect(stopRuntimeProcessesMock).not.toHaveBeenCalled();
+  });
+
+  it('Hermes reset does not stop the shared OpenClaw service', async () => {
+    process.argv = ['node', 'clawket', 'reset', '--backend', 'hermes', '--json'];
+    await import('./index.js');
+    await vi.waitFor(() => expect(consoleLogSpy).toHaveBeenCalled());
+    expect(JSON.parse(String(consoleLogSpy.mock.calls[0][0])).scope).toBe('hermes');
+    expect(stopServiceMock).not.toHaveBeenCalled(); expect(stopRuntimeProcessesMock).not.toHaveBeenCalled();
+  });
+
   it('prints empty Bridge capability lists for legacy status and doctor payloads', async () => {
-    process.argv = ['node', 'clawket', 'doctor'];
+    process.argv = ['node', 'clawket', 'doctor', '--verbose'];
     buildDoctorReportMock.mockResolvedValue({
       paired: true,
       hermesRelayPaired: true,
@@ -447,7 +493,7 @@ describe('cli pairing output', () => {
     process.argv = ['node', 'clawket', 'pair', '--preview'];
     pairGatewayMock.mockResolvedValue({
       config: {
-        serverUrl: 'https://clawket-registry-preview.clawket.workers.dev',
+        serverUrl: 'https://registry-preview.clawket.ai',
         gatewayId: 'gw_preview_123',
         relaySecret: 'preview-secret',
         relayUrl: 'wss://clawket-relay-preview.clawket.workers.dev/ws',
@@ -467,7 +513,7 @@ describe('cli pairing output', () => {
 
     await vi.waitFor(() => {
       expect(pairGatewayMock).toHaveBeenCalledWith(expect.objectContaining({
-        serverUrl: 'https://clawket-registry-preview.clawket.workers.dev',
+        serverUrl: 'https://registry-preview.clawket.ai',
         environment: 'preview',
       }));
     });
@@ -894,6 +940,135 @@ describe('cli pairing output', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('Pairing code: ABCD23');
   });
 
+  it('reports a Hermes API that rejects the Clawket key instead of printing a relay QR', async () => {
+    mkdirSync(join(process.env.HOME as string, '.hermes', 'hermes-agent'), { recursive: true });
+    mkdirSync(join(process.env.HOME as string, '.clawket'), { recursive: true });
+    writeFileSync(
+      join(process.env.HOME as string, '.clawket', 'hermes-bridge.json'),
+      JSON.stringify({ host: '0.0.0.0', port: 4321, apiBaseUrl: 'http://127.0.0.1:8642', token: 'test' }),
+      'utf8',
+    );
+    pairHermesRelayMock.mockResolvedValue(hermesRelayPairing('refreshed'));
+    execFileSyncMock.mockReturnValue(`40161 ${process.argv[1]} hermes relay run --host 0.0.0.0 --port 4321\n`);
+    global.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        running: true,
+        hasBridge: true,
+        bridgeUrl: 'http://127.0.0.1:4321',
+        hermesApiBaseUrl: 'http://127.0.0.1:8642',
+        hermesApiReachable: false,
+        hermesApiIssue: 'credential_mismatch',
+      }),
+    } as Response)) as unknown as typeof fetch;
+    process.argv = ['node', 'clawket', 'hermes', 'pair', 'relay', '--server', 'https://hermes-registry.example.com', '--json'];
+    process.exitCode = undefined;
+
+    try {
+      await import('./index.js');
+
+      await vi.waitFor(() => {
+        expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('"hermesApiIssue": "credential_mismatch"'));
+      });
+      const output = JSON.parse(String(consoleLogSpy.mock.calls.at(-1)?.[0]));
+      expect(output).toMatchObject({
+        ok: false,
+        backend: 'hermes',
+        transport: 'relay',
+        bridgeId: 'hbg_123',
+        hermesApiReachable: false,
+        hermesApiIssue: 'credential_mismatch',
+      });
+      expect(output.runtimeMessage).toContain('--restart-hermes');
+      expect(output.runtimeMessage).toContain('CLAWKET_HERMES_API_KEY');
+      expect(output.error).toBe(output.runtimeMessage);
+      expect(output).not.toHaveProperty('pairingCode');
+      expect(process.exitCode).toBe(1);
+      expect(writeRawQrPngMock).not.toHaveBeenCalled();
+      expect(qrcodeGenerateMock).not.toHaveBeenCalled();
+    } finally {
+      process.exitCode = undefined;
+    }
+  });
+
+  it('reports an unusable Hermes API for local pairing without building its QR', async () => {
+    mkdirSync(join(process.env.HOME as string, '.clawket'), { recursive: true });
+    writeFileSync(
+      join(process.env.HOME as string, '.clawket', 'hermes-bridge.json'),
+      JSON.stringify({ host: '0.0.0.0', port: 4321, apiBaseUrl: 'http://127.0.0.1:8642', token: 'test' }),
+      'utf8',
+    );
+    execFileSyncMock.mockReturnValue(`40160 ${process.argv[1]} hermes run --host 0.0.0.0 --port 4321\n`);
+    global.fetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        running: true,
+        bridgeUrl: 'http://127.0.0.1:4321',
+        hermesApiBaseUrl: 'http://127.0.0.1:8642',
+        hermesApiReachable: false,
+        hermesApiIssue: 'credential_mismatch',
+      }),
+    } as Response)) as unknown as typeof fetch;
+    process.argv = ['node', 'clawket', 'hermes', 'pair', 'local', '--public-host', '192.168.31.41'];
+    process.exitCode = undefined;
+
+    try {
+      await import('./index.js');
+
+      await vi.waitFor(() => {
+        expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("rejected Clawket's API key"));
+      });
+      expect(process.exitCode).toBe(1);
+      expect(buildHermesLocalPairingQrPayloadMock).not.toHaveBeenCalled();
+      expect(qrcodeGenerateMock).not.toHaveBeenCalled();
+    } finally {
+      process.exitCode = undefined;
+    }
+  });
+
+  it('applies --restart-hermes to a running Clawket Hermes bridge during relay pairing', async () => {
+    mkdirSync(join(process.env.HOME as string, '.hermes', 'hermes-agent'), { recursive: true });
+    mkdirSync(join(process.env.HOME as string, '.clawket'), { recursive: true });
+    writeFileSync(
+      join(process.env.HOME as string, '.clawket', 'hermes-bridge.json'),
+      JSON.stringify({ host: '0.0.0.0', port: 4321, apiBaseUrl: 'http://127.0.0.1:8642', token: 'saved-token' }),
+      'utf8',
+    );
+    pairHermesRelayMock.mockResolvedValue(hermesRelayPairing('refreshed'));
+    execFileSyncMock.mockReturnValue([
+      `40160 ${process.argv[1]} hermes run --host 0.0.0.0 --port 4321`,
+      `40161 ${process.argv[1]} hermes relay run --host 0.0.0.0 --port 4321`,
+    ].join('\n'));
+    const killSpy = vi.spyOn(process, 'kill')
+      .mockImplementation(((pid: number, signal?: number | NodeJS.Signals) => {
+        if (signal === 0) {
+          throw new Error('process exited');
+        }
+        return true;
+      }) as typeof process.kill);
+    process.argv = ['node', 'clawket', 'hermes', 'pair', 'relay', '--server', 'https://hermes-registry.example.com', '--restart-hermes', '--json'];
+
+    await import('./index.js');
+
+    await vi.waitFor(() => {
+      expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('"pairingCode": "ABCD23"'));
+    });
+    expect(killSpy).toHaveBeenCalledWith(40160, 'SIGTERM');
+    // The relay runtime reconnects to the replacement Bridge; it is neither stopped nor restarted.
+    expect(killSpy).not.toHaveBeenCalledWith(40161, 'SIGTERM');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(spawnMock).toHaveBeenCalledWith(
+      process.execPath,
+      expect.arrayContaining(['hermes', 'run', '--port', '4321', '--restart-hermes']),
+      expect.objectContaining({ env: expect.objectContaining({ CLAWKET_HERMES_BRIDGE_TOKEN: 'saved-token' }) }),
+    );
+    killSpy.mockRestore();
+  });
+
   it('defaults clawket pair --backend hermes to Hermes relay on the production registry', async () => {
     mkdirSync(join(process.env.HOME as string, '.hermes', 'hermes-agent'), { recursive: true });
     mkdirSync(join(process.env.HOME as string, '.clawket'), { recursive: true });
@@ -961,6 +1136,7 @@ describe('cli pairing output', () => {
       bridgeUrl: 'ws://127.0.0.1:4321/v1/hermes/ws?token=test',
     }));
 
+    await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0));
     processOnSpy.mockRestore();
     exitSpy.mockRestore();
   });
@@ -1193,6 +1369,8 @@ describe('cli pairing output', () => {
     const processOnSpy = vi.spyOn(process, 'on')
       .mockImplementation(((event: NodeJS.Signals, listener: () => void) => {
         if (event === 'SIGTERM') {
+          // A service stop signals more than once; the repeat must not run a second shutdown.
+          queueMicrotask(listener);
           queueMicrotask(listener);
         }
         return process;
@@ -1227,6 +1405,8 @@ describe('cli pairing output', () => {
     );
     expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('[hermes-service] Started Hermes bridge runtime (pid 40160).'));
 
+    await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0));
+    expect(exitSpy).toHaveBeenCalledTimes(1);
     processOnSpy.mockRestore();
     exitSpy.mockRestore();
   });

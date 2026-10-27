@@ -3,8 +3,48 @@ import {
   formatToolDisplayName,
   formatToolOneLiner,
   formatToolOneLinerLocalized,
+  resolveToolDetail,
+  resolveToolTitle,
   stripToolStatusPrefix,
+  unwrapShellCommand,
+  resolveQuestionExchange,
+  unwrapToolCall,
 } from './tool-display';
+
+describe('resolveToolTitle', () => {
+  it('reads what the Agent says a call is for: a Codex js title, a Claude Code description', () => {
+    expect(resolveToolTitle(JSON.stringify({ code: 'await cua.getState();', title: '查看当前浏览器页面' }))).toBe('查看当前浏览器页面');
+    expect(resolveToolTitle({ command: 'npm test', description: 'Run the unit tests' })).toBe('Run the unit tests');
+    expect(resolveToolTitle({ summary: '  Status\n check  ' })).toBe('Status check');
+    expect(resolveToolTitle({ title: ' ', description: 'Second choice' })).toBe('Second choice');
+  });
+
+  it('keeps one line and stays absent for inputs without one', () => {
+    const long = resolveToolTitle({ title: 'x'.repeat(200) });
+    expect(long).toHaveLength(120);
+    expect(long?.endsWith('…')).toBe(true);
+    expect(resolveToolTitle({ command: 'git status' })).toBeUndefined();
+    expect(resolveToolTitle({ title: 42 })).toBeUndefined();
+    expect(resolveToolTitle('not json')).toBeUndefined();
+    expect(resolveToolTitle('["title"]')).toBeUndefined();
+    expect(resolveToolTitle(undefined)).toBeUndefined();
+  });
+});
+
+describe('unwrapToolCall', () => {
+  it('reads OpenClaw\'s generic tool_call wrapper as the tool it carries', () => {
+    expect(unwrapToolCall('tool_call', '{"id":"exec","args":{"command":"ls -A"}}'))
+      .toEqual({ name: 'exec', args: '{"command":"ls -A"}' });
+    expect(unwrapToolCall('Tool_Call', '{"id":" read "}')).toEqual({ name: 'read', args: undefined });
+  });
+
+  it('keeps other tools and malformed wrappers as recorded', () => {
+    expect(unwrapToolCall('exec', '{"command":"pwd"}')).toEqual({ name: 'exec', args: '{"command":"pwd"}' });
+    expect(unwrapToolCall('tool_call', 'not json')).toEqual({ name: 'tool_call', args: 'not json' });
+    expect(unwrapToolCall('tool_call', '{"args":{}}')).toEqual({ name: 'tool_call', args: '{"args":{}}' });
+    expect(unwrapToolCall('tool_call')).toEqual({ name: 'tool_call', args: undefined });
+  });
+});
 
 describe('formatToolActivity', () => {
   const t = (key: string, options?: Record<string, unknown>) => {
@@ -16,6 +56,13 @@ describe('formatToolActivity', () => {
     expect(formatToolActivity('exec', t)).toBe('Running command');
     expect(formatToolActivity('bash', t)).toBe('Running command');
     expect(formatToolActivity('Bash', t)).toBe('Running command');
+  });
+
+  it('labels other backends\' command and file tools by what they do', () => {
+    expect(formatToolActivity('terminal', t)).toBe('Running command');
+    expect(formatToolActivity('local_shell', t)).toBe('Running command');
+    expect(formatToolActivity('mcp__fs__read_file', t)).toBe('Reading file');
+    expect(formatToolActivity('MultiEdit', t)).toBe('Writing file');
   });
 
   it('maps read to reading file', () => {
@@ -62,8 +109,10 @@ describe('formatToolOneLiner', () => {
     expect(formatToolOneLiner('exec', null)).toBe('exec');
   });
 
-  it('returns name only when args is not an object', () => {
-    expect(formatToolOneLiner('exec', 'string')).toBe('exec');
+  it('reads a plain-text input as the target and ignores other shapes', () => {
+    // Hermes previews a call's input as plain text rather than JSON.
+    expect(formatToolOneLiner('terminal', 'ls -la')).toBe('terminal ls -la');
+    expect(formatToolOneLiner('exec', '{"truncated": ')).toBe('exec');
     expect(formatToolOneLiner('exec', 42)).toBe('exec');
   });
 
@@ -128,8 +177,48 @@ describe('formatToolDisplayName', () => {
     expect(formatToolDisplayName('web_fetch', t)).toBe('[Web Fetch]');
   });
 
+  it('labels other backends\' names for the same commands, edits and web tools', () => {
+    expect(formatToolDisplayName('terminal', t)).toBe('[Command]');
+    expect(formatToolDisplayName('Bash', t)).toBe('[Command]');
+    expect(formatToolDisplayName('patch', t)).toBe('[Write file]');
+    expect(formatToolDisplayName('MultiEdit', t)).toBe('[Write file]');
+    expect(formatToolDisplayName('WebFetch', t)).toBe('[Web Fetch]');
+    expect(formatToolDisplayName('WebSearch', t)).toBe('[Web Search]');
+  });
+
   it('keeps unknown tool names readable', () => {
     expect(formatToolDisplayName('custom_tool', t)).toBe('custom tool');
+    expect(formatToolDisplayName('js', t)).toBe('js');
+  });
+});
+
+describe('unwrapShellCommand', () => {
+  it('names the command a Codex shell invocation ran', () => {
+    expect(unwrapShellCommand('/bin/zsh -lc "git ls-files -z | python3 -c \\"print(1)\\""'))
+      .toBe('git ls-files -z | python3 -c "print(1)"');
+    expect(unwrapShellCommand("bash -lc 'echo it'\\''s done'")).toBe("echo it's done");
+    expect(unwrapShellCommand('/usr/bin/sh -c "ls -la"')).toBe('ls -la');
+    // Codex leaves a one-word command unquoted.
+    expect(unwrapShellCommand('/bin/zsh -lc pwd')).toBe('pwd');
+    expect(unwrapShellCommand('/bin/zsh -lc ls -la')).toBe('/bin/zsh -lc ls -la');
+    expect(resolveToolDetail('exec', { command: '/bin/zsh -lc "git status"' })).toBe('git status');
+    expect(resolveToolDetail('terminal', { command: '/bin/zsh -lc "npm test"' })).toBe('npm test');
+  });
+
+  it('leaves plain commands and anything after the quoted script as recorded', () => {
+    expect(unwrapShellCommand('git status')).toBe('git status');
+    expect(unwrapShellCommand('/bin/zsh -lc "make" && echo done')).toBe('/bin/zsh -lc "make" && echo done');
+    expect(resolveToolDetail('read', { path: '/bin/zsh -lc "x"' })).toBe('/bin/zsh -lc "x"');
+  });
+});
+
+describe('resolveToolDetail for search tools', () => {
+  it('names what Grep, Glob and their kin look for before where', () => {
+    expect(resolveToolDetail('Grep', { pattern: 'useTranslation', path: '/Users/lucy/app/src' })).toBe('useTranslation');
+    expect(resolveToolDetail('Glob', { pattern: '**/*.test.ts' })).toBe('**/*.test.ts');
+    expect(resolveToolDetail('search_files', { pattern: 'TODO', path: 'src' })).toBe('TODO');
+    expect(resolveToolDetail('ls', { path: '/Users/lucy/app' })).toBe('~/app');
+    expect(resolveToolDetail('memory_search', { query: 'release' })).toBe('release');
   });
 });
 
@@ -181,5 +270,19 @@ describe('stripToolStatusPrefix', () => {
     expect(stripToolStatusPrefix('Command ~/foo abgeschlossen', deT)).toBe('Command ~/foo');
     expect(stripToolStatusPrefix('Command ls fehlgeschlagen', deT)).toBe('Command ls');
     expect(stripToolStatusPrefix('Command ls wird ausgeführt', deT)).toBe('Command ls');
+  });
+});
+
+describe('resolveQuestionExchange', () => {
+  const args = JSON.stringify({ questions: [{ question: '你更喜欢红色还是蓝色？', header: '颜色偏好', options: [{ label: '红色' }, { label: '蓝色' }] }] });
+  it('reads what a Claude Code question asked and what the user answered', () => {
+    const result = 'Your questions have been answered: "你更喜欢红色还是蓝色？"="蓝色". You can now continue with these answers in mind.';
+    expect(resolveQuestionExchange('AskUserQuestion', args, result)).toEqual({ question: '你更喜欢红色还是蓝色？', answer: '蓝色' });
+    expect(resolveQuestionExchange('AskUserQuestion', args)).toEqual({ question: '你更喜欢红色还是蓝色？', answer: undefined });
+  });
+
+  it('ignores other tools and malformed input', () => {
+    expect(resolveQuestionExchange('Bash', args, '"a"="b"')).toBeUndefined();
+    expect(resolveQuestionExchange('AskUserQuestion', '{broken', '')).toEqual({ question: undefined, answer: undefined });
   });
 });

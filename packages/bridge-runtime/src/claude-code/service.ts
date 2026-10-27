@@ -1,4 +1,9 @@
+import { UpdateAdmission } from '../update-admission.js';
+import { DeliveredArtifacts } from '../delivered-artifacts.js';
+import { sessionActivityKeys } from '../session-activity.js';
+import { SessionCatalogSync } from '../session-catalog.js';
 import { InteractionAttention } from '../interaction-attention.js';
+import { readPromptIdentity, recordedPromptStatus } from '../prompt-status.js';
 import { sessionPreview } from '../session-preview.js';
 import { ClaudeFault } from './errors.js';
 import { EventEmitter } from 'node:events';
@@ -14,10 +19,11 @@ import { claudeHistoryPage } from './history-page.js';
 import { ClaudeOwners, type ClaudeOwnerSnapshot } from './owners.js';
 import { ClaudeSession, claudePromptContent } from './session.js';
 import { ClaudeStore, type ClaudeRecord } from './store.js';
-import { claudeModels } from './models.js';
+import { claudeModels, claudeModelValue } from './models.js';
+import { handleRemoteUpdateRequest, isRemoteUpdateMethod, remoteUpdateHealth, type RemoteUpdateControl } from '../remote-update.js';
 
 export interface ClaudeRequest { type: 'req'; id: string; method: string; params?: Record<string, unknown> }
-export interface ClaudeOptions { project: string; directory: string; executable: string; device?: boolean; ownershipDirectory?: string }
+export interface ClaudeOptions { bridgeVersion?: string; remoteUpdate?: RemoteUpdateControl; project: string; directory: string; executable: string; device?: boolean; ownershipDirectory?: string }
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 function string(value: unknown, label: string, max = 300): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max) throw new ClaudeFault(`Invalid ${label}`);
@@ -37,6 +43,7 @@ export class ClaudeService extends EventEmitter {
   private previews = new Map<string, { preview: string; lastActivityAt: number }>();
   private queue: Promise<unknown> = Promise.resolve();
   private stopped = false;
+  private readonly updateAdmission = new UpdateAdmission();
 
   constructor(private readonly options: ClaudeOptions) {
     super();
@@ -50,8 +57,10 @@ export class ClaudeService extends EventEmitter {
     this.owners = new ClaudeOwners(options.executable);
   }
 
+  private readonly artifacts = new DeliveredArtifacts();
   private readonly attention = new InteractionAttention();
   private update(update: SessionUpdate): void {
+    if (update.type === 'run_finished') { const key = update.sessionKey; update = this.artifacts.final(update, [this.store.records.find(row => row.key === key)?.cwd ?? this.project]); }
     const patch = this.attention.accept(update);
     this.emit('update', update);
     if (patch) this.emit('update', patch);
@@ -71,48 +80,87 @@ export class ClaudeService extends EventEmitter {
   }
   private async descriptor(record: ClaudeRecord, roster?: ClaudeOwnerSnapshot): Promise<SessionDescriptor> {
     const project = await this.catalog.addProject(record.cwd);
-    const continuation = record.imported ? this.continuation(record.nativeId!, project.available, roster ?? await this.owners.snapshot(), record.key) : {};
+    const snapshot = record.imported ? roster ?? await this.owners.snapshot() : roster;
+    const continuation = record.imported ? this.continuation(record.nativeId!, project.available, snapshot!, record.key) : {};
     const livePreview = this.previews.get(record.key);
     const nativePreview = record.nativeId ? this.catalog.cachedPreview(record.nativeId) : undefined;
     const visible = nativePreview && (!livePreview || nativePreview.lastActivityAt > livePreview.lastActivityAt)
       ? nativePreview : livePreview ?? nativePreview;
     return { connectionId: '', agentId: 'claude-code', key: record.key, kind: 'direct',
       title: record.title || basename(record.cwd), updatedAt: Math.max(record.lastActivityAt ?? record.createdAt, visible?.lastActivityAt ?? 0),
-      lastActivityAt: visible?.lastActivityAt ?? record.lastActivityAt ?? null, preview: visible?.preview, model: record.model,
+      lastActivityAt: visible?.lastActivityAt ?? record.lastActivityAt ?? null, preview: visible?.preview,
+      model: this.sessions.get(record.key)?.currentModel ?? (record.imported && record.nativeId ? this.catalog.cachedModel(record.nativeId) : undefined) ?? record.observedModel ?? record.model,
       project, source: record.imported ? 'native' : 'bridge', ...continuation,
-      hasActiveRun: !!this.sessions.get(record.key)?.activeRun, attention: this.attention.get(record.key),
+      hasActiveRun: !!this.sessions.get(record.key)?.activeRun || !!(record.imported && snapshot?.known && snapshot.owners.some(owner => owner.sessionId === record.nativeId && owner.status === 'busy')), attention: this.attention.get(record.key),
       allowedActions: { rename: !record.imported, reset: !record.imported, delete: !record.imported, pin: true } };
   }
 
+  private readonly catalogSync = new SessionCatalogSync(() => this.listSessions(true));
+  private async listSessions(strict = false): Promise<SessionDescriptor[]> {
+    const roster = await this.owners.snapshot();
+    const native = await this.discover(roster, strict);
+    const recentOwned = [...this.store.records].filter(record => record.materialized && !!record.nativeId && !this.catalog.hasNativeEntry(record.nativeId))
+      .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0)).slice(0, 8);
+    for (let index = 0; index < recentOwned.length; index += 2) await Promise.all(recentOwned.slice(index, index + 2).map(record =>
+      this.catalog.loadPreview(record.nativeId!, record.cwd, record.lastActivityAt ?? record.createdAt)));
+    const owned = [];
+    for (const record of this.store.records) owned.push(await this.descriptor(record, roster));
+    return [...owned, ...native];
+  }
   async health(): Promise<object> {
     if (this.stopped) throw new ClaudeFault('Claude Bridge is stopped');
     // Viewing projects/history remains useful when model authentication needs attention.
-    return { backend: 'claude-code', projects: true, vision: true,
+    return { backend: 'claude-code', ...(this.options.bridgeVersion ? { bridgeVersion: this.options.bridgeVersion } : {}), ...remoteUpdateHealth(this.options.remoteUpdate), sessionActivity: 1, sessionCatalogSync: 1, artifacts: true, promptStatus: true, projects: true, vision: true,
       capabilities: { steer: false, thinkingLevels: false, skills: false, sessionBranch: true } };
   }
 
   async request(frame: ClaudeRequest): Promise<unknown> {
+    return this.updateAdmission.request(() => this.requestNow(frame));
+  }
+  private async requestNow(frame: ClaudeRequest): Promise<unknown> {
+    const result = await this.dispatch(frame);
+    if (['sessions.create', 'sessions.rename', 'sessions.reset', 'sessions.delete'].includes(frame.method)) this.catalogSync.invalidate();
+    if (['sessions.reset', 'sessions.delete'].includes(frame.method) && typeof frame.params?.sessionKey === 'string') this.artifacts.forget(frame.params.sessionKey);
+    return result;
+  }
+  private async dispatch(frame: ClaudeRequest): Promise<unknown> {
     if (this.stopped || !frame || frame.type !== 'req' || typeof frame.id !== 'string'
       || frame.id.length > 200 || !frame.id || typeof frame.method !== 'string'
       || frame.params !== undefined && (!frame.params || typeof frame.params !== 'object' || Array.isArray(frame.params))) {
       throw new ClaudeFault('Invalid Claude request');
     }
     const p = frame.params ?? {};
+    if (isRemoteUpdateMethod(frame.method)) return handleRemoteUpdateRequest(this.options.remoteUpdate, frame.method);
     switch (frame.method) {
       case 'health': return this.health();
+      case 'sessions.activity': {
+        const keys = sessionActivityKeys(p.keys);
+        const roster = keys.length ? await this.owners.snapshot() : { known: false as const, owners: [] };
+        if (this.stopped) throw new ClaudeFault('Claude Bridge is stopped');
+        return keys.map(key => {
+          const record = this.store.records.find(row => row.key === key);
+          const attention = this.attention.get(key);
+          if (this.sessions.get(key)?.activeRun) return { key, state: attention === 'input' || attention === 'approval' ? 'waiting' : 'running',
+            attention: attention === 'input' || attention === 'approval' ? attention : null };
+          let nativeId = record?.nativeId;
+          if (!record) { try { nativeId = this.catalog.native(key).sessionId; } catch { return { key, state: 'unknown' }; } }
+          if (record && !nativeId) return { key, state: 'idle' };
+          if (!roster.known) return { key, state: 'unknown' };
+          const owners = roster.owners.filter(owner => owner.sessionId === nativeId);
+          return { key, state: owners.some(owner => owner.status === 'busy') ? 'running'
+            : owners.some(owner => owner.status === 'waiting') ? 'waiting'
+              : owners.some(owner => owner.status === 'unknown') ? 'unknown' : 'idle' };
+        });
+      }
+      case 'chat.promptStatus': {
+        const identity = hash(readPromptIdentity(p.idempotencyKey));
+        const record = this.store.records.find(row => row.key === p.sessionKey);
+        return recordedPromptStatus(record && Object.hasOwn(record.fingerprints, identity) ? record.fingerprints[identity] : undefined);
+      }
       case 'agents.list': return [{ connectionId: '', agentId: 'claude-code', name: 'Claude Code', isMain: true, entryMode: 'sessions', mainSessionKey: '' }];
       case 'projects.list': await this.discover({ known: false, owners: [] }); return this.catalog.listProjects();
-      case 'sessions.list': {
-        const roster = await this.owners.snapshot();
-        const native = await this.discover(roster);
-        const recentOwned = [...this.store.records].filter(record => record.materialized && !!record.nativeId && !this.catalog.hasNativeEntry(record.nativeId))
-          .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0)).slice(0, 8);
-        for (let index = 0; index < recentOwned.length; index += 2) await Promise.all(recentOwned.slice(index, index + 2).map(record =>
-          this.catalog.loadPreview(record.nativeId!, record.cwd, record.lastActivityAt ?? record.createdAt)));
-        const owned = [];
-        for (const record of this.store.records) owned.push(await this.descriptor(record, roster));
-        return [...owned, ...native];
-      }
+      case 'sessions.list': return this.listSessions();
+      case 'sessions.sync': return this.catalogSync.reply(p);
       case 'sessions.create': return this.serial(async () => {
         if (this.store.records.length >= 500) throw new ClaudeFault('Claude conversation limit reached');
         await this.discover();
@@ -158,6 +206,8 @@ export class ClaudeService extends EventEmitter {
         this.previews.delete(record.key);
         return { ok: true };
       });
+      case 'clawket.artifacts.open': return this.artifacts.resolve(p.sessionKey, p.artifactId, cursor => this.history(String(p.sessionKey), cursor));
+      case 'clawket.artifacts.read': return this.artifacts.read(p.sessionKey, p.id, p.offset);
       case 'chat.history': return this.history(string(p.sessionKey, 'session'), p.cursor);
       case 'chat.send': return this.serial(async () => this.send(await this.continuationRecord(p.sessionKey), p));
       case 'chat.abort': {
@@ -191,13 +241,23 @@ export class ClaudeService extends EventEmitter {
       case 'models.list': case 'models.select': return this.serial(async () => {
         if (p.sessionKey === undefined || p.sessionKey === null || (frame.method === 'models.list' && !this.store.records.some(row => row.key === p.sessionKey && !row.imported))) {
           if (frame.method !== 'models.list') throw new ClaudeFault('Choose a conversation before changing its Claude model');
-          const probe = new ClaudeSession({ key: 'model-catalog', cwd: this.project, executable: this.options.executable });
+          const record = this.store.records.find(row => row.key === p.sessionKey);
+          const native = p.sessionKey == null || record ? undefined : this.catalog.native(string(p.sessionKey, 'session'));
+          const cwd = record?.cwd ?? native?.cwd ?? this.project;
+          const nativeId = record?.nativeId ?? native?.sessionId;
+          const live = record && this.sessions.get(record.key);
+          if (live) {
+            const models = await live.models();
+            const current = live.currentModel ?? record.observedModel ?? record.model ?? '';
+            return { currentModel: claudeModelValue(models, current, record.model),
+              currentProvider: 'anthropic', currentBaseUrl: '', models: claudeModels(models) };
+          }
+          const current = nativeId ? await this.catalog.readModel(nativeId, cwd) ?? record?.model ?? '' : '';
+          const probe = new ClaudeSession({ key: 'model-catalog', cwd, executable: this.options.executable });
           this.probes.add(probe);
           try {
             const models = await probe.models();
-            const current = this.store.records.find(row => row.key === p.sessionKey)?.model ?? '';
-            const selected = models.find(model => model.value === current || model.resolvedModel === current);
-            return { currentModel: selected?.value ?? current, currentProvider: 'anthropic', currentBaseUrl: '',
+            return { currentModel: claudeModelValue(models, current, record?.model), currentProvider: 'anthropic', currentBaseUrl: '',
               models: claudeModels(models) };
           } finally { await probe.close(); this.probes.delete(probe); }
         }
@@ -210,9 +270,8 @@ export class ClaudeService extends EventEmitter {
             await session.setModel(model); record.model = model; this.store.save();
           }
           const catalog = await session.models();
-          const current = record.model ?? session.currentModel;
-          const selected = catalog.find(model => model.value === current || model.resolvedModel === current);
-          const selection: ModelSelectionState = { currentModel: selected?.value ?? current ?? '', currentProvider: 'anthropic', currentBaseUrl: '',
+          const current = session.currentModel ?? record.observedModel ?? record.model;
+          const selection: ModelSelectionState = { currentModel: claudeModelValue(catalog, current, record.model), currentProvider: 'anthropic', currentBaseUrl: '',
             models: claudeModels(catalog) };
           return frame.method === 'models.select' ? { ...selection, ok: true, scope: 'session' } : selection;
         } finally { if (record.imported && !session.activeRun) await this.releaseSession(record.key, session); }
@@ -257,17 +316,20 @@ export class ClaudeService extends EventEmitter {
     this.locks.get(key)?.close(); this.locks.delete(key);
   }
 
-  private async discover(roster?: ClaudeOwnerSnapshot): Promise<SessionDescriptor[]> {
+  private async discover(roster?: ClaudeOwnerSnapshot, strict = false): Promise<SessionDescriptor[]> {
     try {
       const result = await this.catalog.discover();
+      if (strict && !result.complete) throw new ClaudeFault('Claude conversation catalog could not be refreshed completely');
       if (result.truncated) this.update({ type: 'error', code: 'unsupported', message: 'Claude history discovery reached its safety limit. Some older conversations are not shown.' });
       const ownedKeys = new Set(this.store.records.flatMap(record => record.nativeId ? [`native:${hash(record.nativeId).slice(0, 32)}`] : []));
       const snapshot = roster ?? await this.owners.snapshot();
       return result.sessions.filter(session => !ownedKeys.has(session.key)).map(session => ({ ...session,
         ...this.continuation(this.catalog.native(session.key).sessionId, session.project?.available === true, snapshot, session.key),
+        hasActiveRun: snapshot.known && snapshot.owners.some(owner => owner.sessionId === this.catalog.native(session.key).sessionId && owner.status === 'busy'),
       }));
     }
     catch {
+      if (strict) throw new ClaudeFault('Claude conversation catalog could not be refreshed completely');
       this.update({ type: 'error', code: 'server', message: 'Claude native history could not be refreshed. Existing Clawket chats remain available.' });
       await this.catalog.addProject(this.project);
       return [];
@@ -317,9 +379,9 @@ export class ClaudeService extends EventEmitter {
         model: record.model, ...(record.materialized ? { resume: record.nativeId } : { sessionId: record.nativeId }) });
       session.on('update', (update: SessionUpdate) => this.update(update));
       session.on('closed', () => { void this.serial(() => this.releaseSession(record.key, session)).catch(() => {}); });
-      session.on('identity', () => {
-        if (!record.model && session.currentModel) {
-          record.model = session.currentModel;
+      session.on('model', () => {
+        if (session.currentModel) {
+          record.observedModel = session.currentModel;
           try { this.store.save(); }
           catch { this.update({ type: 'error', sessionKey: record.key, code: 'server', message: 'Claude model metadata could not be saved.' }); }
           void this.descriptor(record).then(descriptor => this.update({ type: 'session_info_update', session: descriptor })).catch(() => {});
@@ -382,17 +444,19 @@ export class ClaudeService extends EventEmitter {
   }
 
   private async history(key: string, cursor: unknown): Promise<SessionHistory> {
+    const artifactEpoch = this.artifacts.epoch;
     const record = this.store.records.find(row => row.key === key);
     if (!record) {
       const descriptors = await this.discover();
       const descriptor = descriptors.find(row => row.key === key);
       if (descriptor) this.update({ type: 'session_info_update', session: descriptor });
-      return this.catalog.history(key, cursor);
+      const page = await this.catalog.history(key, cursor);
+      return { ...page, messages: this.artifacts.project(key, page.messages, [this.catalog.native(key).cwd], artifactEpoch, cursor) };
     }
     if (record.imported) this.update({ type: 'session_info_update', session: await this.descriptor(record) });
     const page = record.materialized ? await claudeHistoryPage(record.nativeId!, record.cwd, cursor) : { messages: [] };
     const activeRun = this.sessions.get(key)?.activeRun;
-    const rendered = page.messages;
+    const rendered = this.artifacts.project(key, page.messages, [record.cwd], artifactEpoch, cursor);
     for (const message of rendered) {
       const accepted = Object.values(record.fingerprints).find(item => item.runId === message.id);
       if (message.role === 'user' && accepted) message.idempotencyKey = accepted.clientKey;
@@ -401,14 +465,16 @@ export class ClaudeService extends EventEmitter {
       ...(activeRun ? { activeRun } : {}), ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
   }
 
+  prepareForUpdate(): boolean { return this.updateAdmission.prepare(() => [...this.sessions.values()].some(session => !!session.activeRun)); }
+
   async stop(): Promise<void> {
     if (this.stopped) return;
-    this.stopped = true;
+    this.stopped = true; this.artifacts.clear();
     for (const probe of this.probes) await probe.close();
     for (const session of this.sessions.values()) await session.close();
     await this.queue.catch(() => {});
     this.sessions.clear();
     for (const lock of this.locks.values()) lock.close();
-    this.locks.clear(); this.store.close();
+    this.locks.clear(); this.store.close(); this.artifacts.clear();
   }
 }

@@ -2,6 +2,8 @@ import { isSecurePairingSecretConfigured, sha256Hex, verifyPairingRelayTicket } 
 import { HERMES_BACKEND_POLICY, OPENCLAW_BACKEND_POLICY } from '../backend-policy';
 import type { BackendPolicy, PairBridgeRecord, PairGatewayRecord, PairRecord } from './types';
 
+const REGISTRY_VERIFY_TIMEOUT_MS = 10_000;
+
 type RelayAuthCommon = {
   routesKv: KVNamespace;
   registryVerifyUrl?: string;
@@ -69,7 +71,7 @@ export async function authorizeRelayToken(input: RelayAuthInput): Promise<RelayA
   if (pair) {
     if (role === 'gateway') {
       if (tokenHash === pair.relaySecretHash) return fullAuthorization(true, null, 'kv');
-      const authorized = await verifyViaRegistry(registryVerifyUrl, principalId, token, policy);
+      const authorized = await verifyViaRegistry(registryVerifyUrl, principalId, token, policy, role);
       return fullAuthorization(authorized, null, authorized ? 'registry' : 'rejected');
     }
     const matched = Array.isArray(pair.clientTokens)
@@ -79,11 +81,11 @@ export async function authorizeRelayToken(input: RelayAuthInput): Promise<RelayA
       return fullAuthorization(true, matched.label?.trim() || null, mirrored ? 'mirrored' : 'kv');
     }
     if (mirrored) return fullAuthorization(true, null, 'mirrored');
-    const authorized = await verifyViaRegistry(registryVerifyUrl, principalId, token, policy);
+    const authorized = await verifyViaRegistry(registryVerifyUrl, principalId, token, policy, role);
     return fullAuthorization(authorized, null, authorized ? 'registry' : 'rejected');
   }
   if (mirrored) return fullAuthorization(true, null, 'mirrored');
-  const authorized = await verifyViaRegistry(registryVerifyUrl, principalId, token, policy);
+  const authorized = await verifyViaRegistry(registryVerifyUrl, principalId, token, policy, role);
   return fullAuthorization(authorized, null, authorized ? 'registry' : 'rejected');
 }
 
@@ -157,18 +159,58 @@ async function verifyViaRegistry(
   principalId: string,
   token: string,
   policy: BackendPolicy,
+  role: 'gateway' | 'client',
 ): Promise<boolean> {
   const base = registryVerifyUrl?.trim();
   if (!base) return false;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REGISTRY_VERIFY_TIMEOUT_MS);
   try {
     const endpoint = `${base.replace(/\/+$/, '')}${policy.registryVerifyPath}${encodeURIComponent(principalId)}`;
     const response = await fetch(endpoint, {
       method: 'GET',
       headers: { authorization: `Bearer ${token}` },
+      signal: controller.signal,
     });
-    return response.status === 200;
+    if (response.status !== 200) {
+      await response.body?.cancel();
+      return false;
+    }
+    return await readRegistryRole(response, controller.signal, role);
   } catch {
     return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Registry's legacy public contract includes the wire role. A valid client
+// token must never gain owner authority merely because verification returned 200.
+async function readRegistryRole(response: Response, signal: AbortSignal, role: 'gateway' | 'client'): Promise<boolean> {
+  const reader = response.body?.getReader();
+  if (!reader) return false;
+  const abortRead = () => { void reader.cancel().catch(() => {}); };
+  signal.addEventListener('abort', abortRead, { once: true });
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    if (signal.aborted) return false;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (signal.aborted) return false;
+      if (done) break;
+      size += value.byteLength;
+      if (size > 1024) return false;
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const payload = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    return payload !== null && !Array.isArray(payload) && payload.ok === true && payload.role === role;
+  } finally {
+    signal.removeEventListener('abort', abortRead);
+    try { await reader.cancel(); } finally { reader.releaseLock(); }
   }
 }

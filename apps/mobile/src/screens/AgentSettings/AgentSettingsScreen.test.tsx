@@ -59,6 +59,8 @@ const darkColors = {
 let mockTheme = { scheme: 'light' as 'light' | 'dark', colors: lightColors };
 const mockedAnalyticsEvents = analyticsEvents as jest.Mocked<typeof analyticsEvents>;
 
+jest.mock('@react-navigation/native', () => ({ useIsFocused: () => true }));
+
 jest.mock('../../components/ui/Sheet', () => ({ Sheet: ({ visible, children, onAfterClose }: any) => {
   const ReactRuntime = require('react');
   const previous = ReactRuntime.useRef(false);
@@ -608,7 +610,9 @@ describe('AgentSettingsView deep rendering', () => {
 
   it('does not render sections whose capability is false', () => {
     const disabled: Capabilities = {
-      ...CAPABILITY_MATRIX.youmind,
+      ...CAPABILITY_MATRIX['local-model'],
+      attachments: false,
+      models: false,
       devices: true,
     };
     const view = render(<AgentSettingsView {...props({ capabilities: disabled })} />);

@@ -1,3 +1,5 @@
+import { scheduleRequestTimeout } from '../transports/request-timeout';
+import { createTransportDiagnosticReporter } from '../../services/transport-diagnostics';
 import {
   AdapterError,
   resolveCapabilities,
@@ -63,7 +65,7 @@ type PendingConnect = {
   promise: Promise<void>;
   resolve: () => void;
   reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  cancelTimeout: () => void;
 };
 
 export type GatewaySessionRecord = SessionInfo & {
@@ -137,6 +139,7 @@ export abstract class GatewayAdapterBase implements AgentAdapter {
     this.#gatewayConfig = input.gatewayConfig;
     this.#gateway = input.options?.gateway ?? new GatewayClient({
       profile: input.protocolProfile,
+      onTransportDiagnostic: createTransportDiagnosticReporter({ backend: input.record.backendKind, transport: input.record.transportKind, environment: input.record.environment }),
     });
     this.connectTimeoutMs = readPositiveNumber(
       input.options?.connectTimeoutMs,
@@ -328,21 +331,21 @@ export abstract class GatewayAdapterBase implements AgentAdapter {
       resolvePromise = resolve;
       rejectPromise = reject;
     });
-    const timer = setTimeout(() => {
+    const cancelTimeout = scheduleRequestTimeout(this.gateway, this.connectTimeoutMs, () => {
       if (this.pendingConnect?.promise !== promise) return;
-      const error = new AdapterError('bridge_offline', 'Connection handshake timed out');
+      const error = new AdapterError('timeout', 'Connection handshake timed out');
       this.pendingConnect = null;
       this.manuallyDisconnected = true;
       this.clearActiveRunState();
       this.gateway.disconnect();
       this.setAdapterState('offline', error.message);
       rejectPromise(error);
-    }, this.connectTimeoutMs);
+    });
     this.pendingConnect = {
       promise,
       resolve: resolvePromise,
       reject: rejectPromise,
-      timer,
+      cancelTimeout,
     };
 
     try {
@@ -531,6 +534,7 @@ export abstract class GatewayAdapterBase implements AgentAdapter {
     const forwardedEvents = [
       'chatRunStart',
       'chatDelta',
+      'chatCommentary',
       'chatTool',
       'chatFinal',
       'chatAborted',
@@ -618,6 +622,7 @@ export abstract class GatewayAdapterBase implements AgentAdapter {
     if (
       update.type === 'run_started'
       || update.type === 'agent_message_chunk'
+      || update.type === 'agent_commentary_chunk'
       || update.type === 'agent_thought_chunk'
       || update.type === 'tool_call'
       || update.type === 'tool_call_update'
@@ -677,7 +682,7 @@ export abstract class GatewayAdapterBase implements AgentAdapter {
     const pending = this.pendingConnect;
     if (!pending) return;
     this.pendingConnect = null;
-    clearTimeout(pending.timer);
+    pending.cancelTimeout();
     pending.resolve();
   }
 
@@ -685,7 +690,7 @@ export abstract class GatewayAdapterBase implements AgentAdapter {
     const pending = this.pendingConnect;
     if (!pending) return;
     this.pendingConnect = null;
-    clearTimeout(pending.timer);
+    pending.cancelTimeout();
     pending.reject(error);
   }
 
@@ -707,6 +712,7 @@ export abstract class GatewayAdapterBase implements AgentAdapter {
 const FORWARDED_GATEWAY_EVENTS = [
   'chatRunStart',
   'chatDelta',
+  'chatCommentary',
   'chatTool',
   'chatFinal',
   'chatAborted',

@@ -2,7 +2,7 @@
   "expo": {
     "name": "Clawket",
     "slug": "clawket",
-    "version": "3.1.0",
+    "version": "3.1.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
@@ -11,7 +11,15 @@
       "bundleIdentifier": "com.p697.clawket",
       "associatedDomains": [
         "applinks:registry.clawket.ai",
-        "applinks:clawket-registry-preview.clawket.workers.dev"
+        "applinks:clawket-registry-preview.clawket.workers.dev",
+        "applinks:registry-preview.clawket.ai",
+        "applinks:codex-registry.clawket.ai",
+        "applinks:codex-registry-preview.clawket.ai",
+        "applinks:claude-code-registry.clawket.ai",
+        "applinks:claude-code-registry-preview.clawket.ai",
+        "applinks:pi-registry.clawket.ai",
+        "applinks:pi-registry-preview.clawket.ai",
+        "applinks:local-model-registry.clawket.ai"
       ],
       "infoPlist": {
         "NSCameraUsageDescription": "Allow Clawket to use your camera to scan QR codes and take photos to send to AI.",
@@ -72,6 +80,46 @@
               "scheme": "https",
               "host": "clawket-registry-preview.clawket.workers.dev",
               "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "registry-preview.clawket.ai",
+              "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "codex-registry.clawket.ai",
+              "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "codex-registry-preview.clawket.ai",
+              "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "claude-code-registry.clawket.ai",
+              "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "claude-code-registry-preview.clawket.ai",
+              "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "pi-registry.clawket.ai",
+              "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "pi-registry-preview.clawket.ai",
+              "pathPrefix": "/pair/"
+            },
+            {
+              "scheme": "https",
+              "host": "local-model-registry.clawket.ai",
+              "pathPrefix": "/pair/"
             }
           ],
           "category": [
@@ -82,9 +130,10 @@
       ],
       "permissions": [
         "android.permission.ACCESS_COARSE_LOCATION",
-        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ],
+      "blockedPermissions": [
         "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.WRITE_EXTERNAL_STORAGE",
         "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
         "android.permission.READ_MEDIA_IMAGES",
         "android.permission.READ_MEDIA_VIDEO",
@@ -114,6 +163,7 @@
       [
         "expo-media-library",
         {
+          "granularPermissions": [],
           "photosPermission": "Allow Clawket to show your recent photos when attaching images and to save stats posters to your photo library.",
           "savePhotosPermission": "Allow Clawket to save stats posters to your photo library."
         }
@@ -173,11 +223,13 @@
       "./plugins/with-locales",
       "./plugins/with-alternate-app-icons",
       "./plugins/with-android-release-signing",
+      "./plugins/with-android-qa-variant",
       "./plugins/with-paste-input-setup",
       "./plugins/with-xcode-env",
       "./plugins/with-ios-pod-deployment-target",
       "./plugins/with-home-widgets",
       "./plugins/with-android-system-bars",
+      "./plugins/with-openclaw-direct-networking",
       "./plugins/with-ios-signing",
       [
         "expo-build-properties",

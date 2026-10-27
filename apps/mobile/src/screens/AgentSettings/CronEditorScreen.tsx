@@ -87,6 +87,9 @@ function CronEditor({ adapter, agent, online, reconnecting = false, jobId, initi
   const [runsError, setRunsError] = useState<string | null>(null);
   const [runOffset, setRunOffset] = useState<number | null>(null);
   const [runsBusy, setRunsBusy] = useState(false);
+  // Once history has answered, re-reads (Refresh, the follow-ups after Run now) keep the empty line
+  // in place instead of hiding it for the read and hopping Run now / Delete (owner report 2026-09-29).
+  const [runsAnswered, setRunsAnswered] = useState(false);
   const [runRefresh, setRunRefresh] = useState(0);
   const [runFollow, setRunFollow] = useState(0);
   useEffect(() => {
@@ -142,6 +145,7 @@ function CronEditor({ adapter, agent, online, reconnecting = false, jobId, initi
       setRuns(current => offset ? [...current, ...owned] : owned);
       setRunOffset(result.hasMore ? result.nextOffset : null);
       setRunsError(null);
+      setRunsAnswered(true);
     } catch (reason) {
       if (data.isCurrent() && runRequest.current === request) setRunsError(message(reason));
     } finally {
@@ -370,7 +374,7 @@ function CronEditor({ adapter, agent, online, reconnecting = false, jobId, initi
               <Button testID="cron-refresh-runs" label={t('Refresh', { ns: 'common' })} variant="ghost" size="sm" style={styles.labelAction} disabled={!online || runsBusy} onPress={() => setRunRefresh(value => value + 1)} />
             </View>
             {runsError ? <Banner message={runsError} actionLabel={t('Retry', { ns: 'common' })} onAction={() => setRunRefresh(value => value + 1)} /> : null}
-            {!runs.length && !runsBusy && !runsError ? <Text style={[styles.placeholder, styles.inset]}>{t('No runs yet')}</Text> : null}
+            {!runs.length && runsAnswered && !runsError ? <Text style={[styles.placeholder, styles.inset]}>{t('No runs yet')}</Text> : null}
             {runs.length ? <SettingsGroup testID="cron-edit-runs">
               {runs.map((run, index) => <React.Fragment key={`${run.ts}:${index}`}>
                 {index ? <SettingsDivider inset="content" /> : null}
@@ -383,7 +387,7 @@ function CronEditor({ adapter, agent, online, reconnecting = false, jobId, initi
             {runOffset !== null ? <Button testID="cron-runs-more" label={t('Load more')} variant="ghost" size="sm" style={styles.more} disabled={!online || runsBusy} onPress={() => { void loadRuns(runOffset); }} /> : null}
           </View> : null}
           {!systemOwned ? <View style={styles.actions}>
-            {operations?.run ? <Button testID="agent-cron-run" icon={Play} label={t('Run now')} variant="secondary" disabled={!online || Boolean(busy)} loading={busy === 'run'} style={styles.flex} onPress={() => { void runNow(); }} /> : null}
+            {operations?.run ? <Button testID="agent-cron-run" icon={Play} label={t('Run now')} variant="card" disabled={!online || Boolean(busy)} loading={busy === 'run'} style={styles.flex} onPress={() => { void runNow(); }} /> : null}
             {operations?.remove ? <Button testID="agent-cron-delete" icon={Trash2} label={t('Delete', { ns: 'common' })} variant="destructive" disabled={!online || Boolean(busy)} loading={busy === 'delete'} style={styles.flex} onPress={() => setConfirmDelete(true)} /> : null}
           </View> : null}
         </> : <>

@@ -34,12 +34,12 @@ Future acceptance includes large text, light/dark content legibility, keyboard t
 |---|---|---|---|
 | Shared language | Buttons, headers, fields, rows, switches, banners, sheets | Consumer audit; state/theme checks; required gate | Pending rollout |
 | Chat core | Roster, thread header/history/composer, sessions, search, message actions | Real navigation and send/stream/stop/retry; keyboard and long-content visual review | Pending |
-| Connection and first run | Welcome, platform chooser, pairing, YouMind sign-in, connection lifecycle | Initial/recovery states, all three platform paths, visible disconnect/reconnect | Reference approved; remaining surfaces pending |
+| Connection and first run | Welcome, platform chooser, pairing, connection lifecycle | Initial/recovery states, OpenClaw and Hermes platform paths, visible disconnect/reconnect | Reference approved; remaining surfaces pending |
 | Settings and Agent management | Account categories, Agent profile and capability-gated detail pages | Every reachable page/empty/error state, small screen and translated copy | Pending |
 | Theme consolidation | Global appearance versus unified chat-theme entry | Existing preferences preserved; preview agrees with real chat | Pending |
 | Finish | Remove temporary review shortcut, keep developer gallery, document exact coverage | Release simulator evidence; appropriate Android checks; full required gate | Pending |
 
-The original engineering acceptance remains open: OpenClaw/Lucy, Hermes, and YouMind functional completeness; reconnect stability; Release responsiveness; and final owner real-device acceptance. UI approval does not replace these gates. Production deployment and store release are not implied by approval of the design reference.
+The original engineering acceptance remains open: OpenClaw/Lucy and Hermes functional completeness; reconnect stability; Release responsiveness; and final owner real-device acceptance. UI approval does not replace these gates. Production deployment and store release are not implied by approval of the design reference.
 
 ## In-progress implementation checkpoint
 
@@ -52,15 +52,15 @@ The original engineering acceptance remains open: OpenClaw/Lucy, Hermes, and You
 
 ### Simulator signing finding
 
-The persistence failure was isolated to the unsigned QA build (`CODE_SIGNING_ALLOWED=NO`). Rebuilding Release with `CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-` embeds Xcode's simulated application identifier; the original OpenClaw/Hermes/YouMind records and preferences immediately return. macOS `codesign` shows an empty entitlement plist for a correctly signed simulator binary because the simulated entitlements are injected into its executable; inspect `Clawket.app-Simulated.xcent` as well. Do not certify Keychain/persistence/connection behavior from unsigned Simulator builds. No production Keychain behavior or external backend source was changed to work around the QA issue.
+The persistence failure was isolated to the unsigned QA build (`CODE_SIGNING_ALLOWED=NO`). Rebuilding Release with `CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-` embeds Xcode's simulated application identifier; the original OpenClaw/Hermes records and preferences immediately return. macOS `codesign` shows an empty entitlement plist for a correctly signed simulator binary because the simulated entitlements are injected into its executable; inspect `Clawket.app-Simulated.xcent` as well. Do not certify Keychain/persistence/connection behavior from unsigned Simulator builds. No production Keychain behavior or external backend source was changed to work around the QA issue.
 
 ### Native chat checkpoint and remaining visual work
 
-Signed Release restored all three existing connections. YouMind loaded its real history, sent a Chinese QA prompt, and returned the requested reply. Inspected the conversation with software keyboard, Agent profile, connection page, pause confirmation, and paused state. Saved local screenshots in `evidence/rollout/`. Cold-start persistence and resume were next, but macOS locked before the next observation; YouMind is intentionally paused in the simulator until interactive QA resumes. This is not a completed three-backend acceptance.
+Signed Release restored the existing connections. Inspected the conversation with software keyboard, Agent profile, connection page, pause confirmation, and paused state. Saved local screenshots in `evidence/rollout/`. Cold-start persistence and resume were next, but macOS locked before the next observation. This is not a completed cross-backend acceptance.
 
 The inspection also led to: a smaller keyboard/control gap (home-indicator clearance no longer counted twice), accessible assistant message content, recorded per-message model labels instead of relabeling history with the current model, and shared glass-surface shadow behavior. Wallpaper persistence now awaits storage before replacing live appearance or removing the old image; failed writes preserve the old background and clean up the staged copy. Focused regressions cover these storage and presentation behaviors. The keyboard adjustment still requires its final rendered screenshot.
 
-Still required before owner-wide acceptance: recapture revised Help Center/App icon/theme pages; all Agent management sections and nested sheets; live OpenClaw/Hermes regression, YouMind resume/cold-start; light/dark and small-screen translated/keyboard checks; final performance observations and screenshot matrix. A locked computer must never be replaced with fabricated screenshots or marked as visual acceptance.
+Still required before owner-wide acceptance: recapture revised Help Center/App icon/theme pages; all Agent management sections and nested sheets; live OpenClaw/Hermes regression; light/dark and small-screen translated/keyboard checks; final performance observations and screenshot matrix. A locked computer must never be replaced with fabricated screenshots or marked as visual acceptance.
 
 
 ### Per-page evidence ledger
@@ -72,13 +72,11 @@ All paths below are local `evidence/rollout/` PNGs. A screenshot proves only the
 | Welcome | `welcome-light`; hierarchy, action priority and spacing reviewed | Small screen / dark |
 | Platform chooser | `platform-chooser-light`; official marks and separated setup reviewed | Dark |
 | OpenClaw pairing | `pairing-light`; two steps and recovery return reviewed | Signed save, final recovery revision |
-| Hermes pairing / YouMind login | Approved shared setup primitives | Current complete native flow |
+| Hermes pairing | Approved shared setup primitives | Current complete native flow |
 | Roster | `roster-light`; four real Agents, neutral header and unread badge | Dark, search and add actions |
-| YouMind thread | `youmind-chat-keyboard-light`; real history and new Chinese reply | Revised keyboard gap, stop and cold start |
 | OpenClaw / Hermes thread | Conversation preferences now share preview implementation | Real send/stream/history/actions regression |
 | Session panel | Shared tabs/sheet/header migrated | Groups/list/search/actions |
 | Global search / message detail | Shared input, rows and message palette migrated | Native result, empty, favorites and detail |
-| YouMind profile | `youmind-profile-light`; identity, chat and connection hierarchy reviewed | Dark |
 | OpenClaw / Hermes profile | Stat-card profile (header chat button, Cron jobs / Cost today heroes, Models / Skills / Files tiles) rendered in light/dark render tests | Real counts, heartbeat line and advanced sheet on device |
 | Models / providers | Shared search, tabs, settings rows | Both backend sections |
 | Skills / discovery / detail | Shared search, lists and sheets | Long content, permissions and search |
@@ -89,7 +87,7 @@ All paths below are local `evidence/rollout/` PNGs. A screenshot proves only the
 | Logs | Shared input, filters and rows | Long content, streaming/pause |
 | OpenClaw management | Shared navigation and management sections | Configuration/permissions/diagnostics/backup |
 | Connections | `connections-empty-before`; empty action added after review | Final populated and empty states |
-| Connection lifecycle | `youmind-connection-light`, `connection-pause-confirmation`; pause succeeded | Cold start, resume, reconnect and advanced details |
+| Connection lifecycle | `connection-pause-confirmation`; pause succeeded | Cold start, resume, reconnect and advanced details |
 | Settings root | `settings-light`; categories and quiet navigation reviewed | Final populated / dark |
 | Appearance / chat theme | `theme-discard-light`; shared preview, local color draft and save behavior implemented | Saved real thread agreement; small screen / dark |
 | Chat and notifications | `chat-notifications-light` | Final dark/language sheets |
@@ -102,3 +100,13 @@ Build recovery: the final full gates initially hit disk exhaustion. Removed only
 
 
 Automated checkpoint: current required gate passes (228 Mobile suites / 2,092 tests; 148 UI source files; 6,318 translated entries). Signed iOS Release built and installed; Android arm64 Debug build and Android JS/Hermes export passed. These results do not close any pending native-review row above.
+
+## Platform-first pairing (2026-10-01; home refinement 2026-10-03; copy pass 2026-10-06)
+
+The owner approved the “按平台连接” mockup and its implementation. The October 3 refinement keeps the official platforms first in a compact two-column grid. Below them, an independent detection heading introduces the selectable command plus Copy directly on the home. There is no intermediate discovery page. Scan is the home action; manual code entry expands in place and requires a transient platform picker first. Collapsing code entry retains its draft; changing platform or environment clears it. Route progress and failures keep home pairings on the home; scope changes fence pending clipboard text and invitation claims. Discovery displays `npx @p697/clawket@latest pair choose` only in Production: the interactive command accepts no flags, detects installed products in the terminal, and does not include local model servers. Never put this interactive command in an Agent prompt.
+
+The October 6 copy pass (owner-approved review of a device screenshot) keeps that structure and removes repetition. The grid cells keep their chevrons: the pass briefly removed them, and the owner asked for them back the same day. The heading is “Or detect automatically” / 「或者自动检测」, naming an alternative to the platforms rather than a next step; the detection sentence and the magnifier icon are gone, since the terminal itself asks which Agent to pair. The command footer reads “Run in your computer’s terminal” and the copy capsule “Copy” (announced as “Copy command”). Photo import moved into the scanner as a “Choose from photos” capsule beside Cancel, so neither the home nor a platform step shows a photos link; the scanner closes before the library opens and returns the photo’s QR through the opener’s callbacks. A platform step’s generic “Open Terminal and run this command.” line is gone because the step title says it; Pi’s project-folder hint and the local-model engine hints remain. “Enter pairing code” keeps its full wording: it now stands alone under Scan and matches the terminal’s “Pairing code:” line.
+
+OpenClaw and Hermes default to the folded Agent prompt with transient clipboard feedback and the existing pairing-code form. Codex, Claude Code, Pi, and local models default to a stacked, selectable terminal command and a primary QR scanner. Step 01 carries the quiet method switch; local models keep their engine selector and Pi keeps its project-directory hint. Terminal code entry is disclosed on request, photos are read from inside the scanner, and changing platforms resets drafts and restores the platform default. A generic human code requires selecting its platform before entering it; QR and photo payloads supply their own backend. Use the existing secure claim path and current environment validation for every entry method.
+
+Reuse neutral Buttons, SetupPrimitives, official PlatformMarks and theme tokens in both appearances. Retain plain page headers, keyboard reveal, the held error and connecting cover. Automated interaction checks are not physical-device visual acceptance; do not connect a simulator for acceptance without owner authorization.

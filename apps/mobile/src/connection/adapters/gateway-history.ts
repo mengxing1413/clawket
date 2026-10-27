@@ -1,3 +1,4 @@
+import { extractHistoryAttachments, stripOpenClawMediaDirectives } from './gateway-attachments';
 import { readGatewayMessageAttribution } from './gateway-message-attribution';
 import { canMatchMessageAuthors, restoreCachedAttribution } from '../../chat/messageAttribution';
 import { stripOpenClawInputContext } from '../../utils/openclaw-input-context';
@@ -48,11 +49,15 @@ export function mapGatewayHistoryMessage(
     || readNonEmptyString(value.messageId)
     || (isRecord(value.__openclaw) ? readNonEmptyString(value.__openclaw.id) : undefined)
     || `${sessionKey}:history:${timestampMs ?? 'unknown'}:${index}`;
+  // OpenClaw projects its transcript reset and compaction boundaries as one-word
+  // system rows ("Reset", "Compaction"); only that structured kind becomes a
+  // known notice, and other system text stays verbatim.
+  const boundaryNotice = role === 'system' ? readOpenClawBoundaryNotice(value.__openclaw) : undefined;
   const message: ChatMessage = {
     id,
     role,
-    text: role === 'user' && isRecord(value.__openclaw) && value.__openclaw.importedFrom === 'claude-cli'
-      ? stripOpenClawInputContext(stripCliResumeContext(extractHistoryText(content))) : extractHistoryText(content),
+    text: boundaryNotice ?? (role === 'user' && isRecord(value.__openclaw) && value.__openclaw.importedFrom === 'claude-cli'
+      ? stripOpenClawInputContext(stripCliResumeContext(extractHistoryText(content))) : extractHistoryText(content)),
     ...(timestampMs !== undefined ? { timestampMs } : {}),
     ...(idempotencyKey ? { idempotencyKey } : {}),
     ...(readNonEmptyString(value.provider) ? { provider: readNonEmptyString(value.provider) } : {}),
@@ -76,11 +81,53 @@ export function mapGatewayHistoryMessage(
   return message;
 }
 
+type PlacedHistoryRow = Readonly<{ value: unknown; index: number }>;
+
+/**
+ * OpenClaw sorts `chat.history` by message time, but writes a reset or
+ * compaction boundary while handling the message that triggered it, after that
+ * message's own (sender) time. Its transcript position still comes first
+ * (recorded 2026-10-02: reset rawSeq 3843, the user's message 3844). Put a
+ * boundary back before the rows that follow it in the same transcript, one
+ * millisecond ahead of them so the time-ordered history merge agrees. Rows keep
+ * their wire index for fallback IDs.
+ */
+function placeTranscriptBoundaries(values: unknown[]): PlacedHistoryRow[] {
+  const rows: PlacedHistoryRow[] = values.map((value, index) => ({ value, index }));
+  for (let current = 0; current < rows.length; current += 1) {
+    const boundary = rows[current]!.value;
+    if (!isRecord(boundary) || boundary.role !== 'system' || !readOpenClawBoundaryNotice(boundary.__openclaw)) continue;
+    const position = readTranscriptPosition(boundary);
+    if (!position) continue;
+    let target = current;
+    while (target > 0) {
+      const earlier = readTranscriptPosition(rows[target - 1]!.value);
+      if (!earlier || earlier.source !== position.source || earlier.rawSeq <= position.rawSeq) break;
+      target -= 1;
+    }
+    if (target === current) continue;
+    const following = rows[target]!.value;
+    const followingTimestamp = normalizeTimestamp(isRecord(following) ? following.timestamp : undefined);
+    const timestamp = followingTimestamp === undefined
+      ? normalizeTimestamp(boundary.timestamp)
+      : Math.min(normalizeTimestamp(boundary.timestamp) ?? Number.POSITIVE_INFINITY, followingTimestamp - 1);
+    const [moved] = rows.splice(current, 1);
+    rows.splice(target, 0, { index: moved!.index, value: timestamp === undefined ? boundary : { ...boundary, timestamp } });
+  }
+  return rows;
+}
+
+function readTranscriptPosition(value: unknown): Readonly<{ source: string; rawSeq: number }> | undefined {
+  if (!isRecord(value) || !isRecord(value.__openclaw) || !isRecord(value.__openclaw.transcriptPosition)) return undefined;
+  const { source, rawSeq } = value.__openclaw.transcriptPosition;
+  return typeof source === 'string' && typeof rawSeq === 'number' && Number.isFinite(rawSeq) ? { source, rawSeq } : undefined;
+}
+
 /** CLI history may coalesce tool calls and results inside assistant/user content. */
 export function mapGatewayHistoryMessages(sessionKey: string, values: unknown[]): ChatMessage[] {
   const messages: ChatMessage[] = [];
   const names = new Map<string, string>();
-  values.forEach((value, index) => {
+  placeTranscriptBoundaries(values).forEach(({ value, index }) => {
     if (!isRecord(value) || !Array.isArray(value.content)
         || (value.role !== 'assistant' && value.role !== 'user')) {
       const mapped = mapGatewayHistoryMessage(sessionKey, value, index);
@@ -184,17 +231,31 @@ export function preserveOpenClawCliHistorySegments(
     }
     const textOnly = typeof value.content === 'string' || (Array.isArray(value.content)
       && value.content.every(block => isRecord(block) && block.type === 'text'));
-    if (userSendKey && cliSessionId && segments.length && textOnly
+    const managed = message.attachments?.length && message.attachments.every(a => a.artifactId);
+    const deliveryOnly = managed && Array.isArray(value.content) && value.content.every(block => isRecord(block)
+      && (block.type === 'text' || extractHistoryAttachments([block]).some(a => a.artifactId)));
+    const comparable = (text: string) => normalized(managed ? stripOpenClawMediaDirectives(text) : text);
+    if (userSendKey && cliSessionId && segments.length && (textOnly || deliveryOnly)
       && value.provider === 'claude-cli' && meta.idempotencyKey === `cli-assistant:${userSendKey}`
-      && normalized(message.text) === normalized(segments.map(segment => segment.text).join('\n\n'))) {
+      && comparable(message.text) === comparable(segments.map(segment => segment.text).join('\n\n'))) {
       redundantIds.add(message.id);
+      if (managed) {
+        // Exact native run provenance retires the stripped, optimistic live final too.
+        for (const cached of messages) if (cached.id === `final_${userSendKey}`
+          && cached.role === 'assistant' && comparable(cached.text) === comparable(message.text)) redundantIds.add(cached.id);
+      }
       finalMetadata.set(segments[segments.length - 1].id, message);
     }
     segments = [];
   });
   return messages.filter(message => !redundantIds.has(message.id)).map(message => {
     const final = finalMetadata.get(message.id);
-    return final ? { ...message, usage: final.usage ?? message.usage } : message;
+    return final ? { ...message, usage: final.usage ?? message.usage,
+      ...(final.attachments?.some(a => a.artifactId) ? {
+        text: stripOpenClawMediaDirectives(message.text).trim(),
+        attachments: final.attachments, idempotencyKey: final.idempotencyKey,
+      } : {}),
+    } : message;
   });
 }
 
@@ -289,11 +350,22 @@ export function mergeGatewayHistory(
       || (cached.timestampMs !== undefined && Math.abs(cached.timestampMs - remote.timestampMs) <= 2_000);
   };
   const matchedRemote = new Set<number>();
+  // The server row that confirmed each dropped cache row, for anchoring below.
+  const confirmedBy = new Map<number, ChatMessage>();
+  const confirm = (cachedIndex: number, remote: ChatMessage | undefined) => {
+    if (remote) confirmedBy.set(cachedIndex, remote);
+    return false;
+  };
   const optimisticCacheTail = cachedMessages.filter((message, cachedIndex) => {
-    if (remoteIds.has(message.id)) return false;
+    if (remoteIds.has(message.id)) return confirm(cachedIndex, remoteMessages.find(remote => remote.id === message.id));
     if (message.tool?.callId && remoteMessages.some((remote) => remote.tool?.callId === message.tool?.callId
-      && remote.role === message.role)) return false;
-    if (message.idempotencyKey && remoteIdempotencyKeys.has(message.idempotencyKey)) return false;
+      && remote.role === message.role)) {
+      return confirm(cachedIndex, remoteMessages.find(remote => remote.tool?.callId === message.tool?.callId
+        && remote.role === message.role));
+    }
+    if (message.idempotencyKey && remoteIdempotencyKeys.has(message.idempotencyKey)) {
+      return confirm(cachedIndex, remoteMessages.find(remote => remote.idempotencyKey === message.idempotencyKey));
+    }
     // Local optimistic IDs/timestamps differ from the Gateway's persisted IDs.
     // Match copies one-to-one so a repeated user message is never collapsed.
     const cacheRowId = (message as CachedHistoryMessage).cacheRowId ?? message.id;
@@ -331,7 +403,7 @@ export function mergeGatewayHistory(
     ));
     if (canonicalIndex >= 0) {
       if (optimistic) matchedRemote.add(canonicalIndex);
-      return false;
+      return confirm(cachedIndex, remoteMessages[canonicalIndex]);
     }
     return earliestRemoteTimestamp === undefined
       || message.timestampMs === undefined
@@ -342,7 +414,7 @@ export function mergeGatewayHistory(
   // after new replies made old tools look newest on every reconciliation.
   const untimed = optimisticCacheTail.filter((message) => message.timestampMs === undefined);
   const timed = optimisticCacheTail.filter((message) => message.timestampMs !== undefined);
-  return [...untimed, ...remoteMessages, ...timed]
+  const merged = [...untimed, ...remoteMessages, ...timed]
     .map((message, index) => ({ message, index }))
     .sort((left, right) => {
       const leftTimestamp = left.message.timestampMs;
@@ -353,11 +425,32 @@ export function mergeGatewayHistory(
       return leftTimestamp - rightTimestamp || left.index - right.index;
     })
     .map(({ message }) => message);
+
+  // A tool step the transcript never recorded (the provider ran it itself)
+  // stays before the confirmed row that followed it on screen: that reply is
+  // stamped with its response start, earlier than the step's own clock.
+  const retained = new Set(optimisticCacheTail);
+  const anchoredTools = new Map<ChatMessage, ChatMessage>();
+  cachedMessages.forEach((message, cachedIndex) => {
+    if (message.role !== 'tool' || !retained.has(message)) return;
+    let next = cachedIndex + 1;
+    while (cachedMessages[next]?.role === 'tool' && retained.has(cachedMessages[next]!)) next++;
+    const anchor = confirmedBy.get(next);
+    if (anchor) anchoredTools.set(message, anchor);
+  });
+  if (anchoredTools.size === 0) return merged;
+  const ordered = merged.filter(message => !anchoredTools.has(message));
+  for (const [tool, anchor] of anchoredTools) {
+    const at = ordered.indexOf(anchor);
+    ordered.splice(at < 0 ? ordered.length : at, 0, tool);
+  }
+  return ordered;
 }
 
 function cachedMessageToChatMessage(message: CachedMessage): CachedHistoryMessage {
   const timestampMs = message.timestampMs ?? message.toolFinishedAt ?? message.toolStartedAt;
   const attachments: NonNullable<ChatMessage['attachments']> = [
+    ...(message.artifactAttachments ?? []),
     ...(message.imageUris ?? []).map((uri) => ({
       type: 'image' as const,
       mimeType: 'image/*',
@@ -417,36 +510,10 @@ function extractHistoryText(content: unknown): string {
   return content
     .filter(isRecord)
     .filter((block) => block.type === 'text' || block.type === 'content')
-    .map((block) => typeof block.text === 'string' ? block.text : '')
+    .map((block) => typeof block.artifactDisplayText === 'string' ? block.artifactDisplayText : typeof block.text === 'string' ? block.text : '')
     .join('');
 }
 
-function extractHistoryAttachments(content: unknown): NonNullable<ChatMessage['attachments']> {
-  if (!Array.isArray(content)) return [];
-  const attachments: NonNullable<ChatMessage['attachments']> = [];
-  for (const raw of content) {
-    if (!isRecord(raw)) continue;
-    const type = raw.type;
-    if (type !== 'image' && type !== 'file' && type !== 'image_url') continue;
-    const imageUrl = isRecord(raw.image_url) ? readNonEmptyString(raw.image_url.url) : undefined;
-    const uri = readNonEmptyString(raw.uri) ?? imageUrl;
-    const source = isRecord(raw.source) ? raw.source : null;
-    const base64 = readNonEmptyString(raw.content)
-      ?? readNonEmptyString(raw.data)
-      ?? readNonEmptyString(source?.data);
-    attachments.push({
-      type: type === 'file' ? 'file' : 'image',
-      mimeType: readNonEmptyString(raw.mimeType)
-        ?? readNonEmptyString(raw.mime_type)
-        ?? readNonEmptyString(source?.media_type)
-        ?? 'application/octet-stream',
-      ...(base64 ? { content: base64 } : {}),
-      ...(uri ? { uri } : {}),
-      ...(readNonEmptyString(raw.name) ? { name: readNonEmptyString(raw.name) } : {}),
-    });
-  }
-  return attachments;
-}
 
 function extractHistoryTool(
   message: Record<string, unknown>,
@@ -510,6 +577,14 @@ function extractHistoryTool(
           ? { input: toolCall.input }
         : {}),
   };
+}
+
+/** The fixed notice `localizeAgentSystemNotice` translates for an OpenClaw boundary. */
+function readOpenClawBoundaryNotice(meta: unknown): string | undefined {
+  if (!isRecord(meta)) return undefined;
+  if (meta.kind === 'reset') return 'Session reset';
+  if (meta.kind === 'compaction') return 'Context compacted';
+  return undefined;
 }
 
 function normalizeRole(value: unknown): ChatMessage['role'] {

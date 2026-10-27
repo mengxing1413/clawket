@@ -1,7 +1,19 @@
+import { validTurnIdentity } from './turnIdentity';
+import { liveReplyRenderKey, type StreamSegment } from './liveRunThread';
+import { sameLiveToolCall } from './liveToolMessages';
+import { finalReplyTail } from './streamText';
+import type { UiMessage } from '../types/chat';
+
 export type SessionRunState = {
   runId: string;
+  turnId?: string;
+  inputMessageId?: string;
+  inputMessageKey?: string;
   streamText: string | null;
   startedAt: number;
+  streamTimestampMs?: number;
+  /** Scoped in-memory Codex rows; streamText retains the cumulative wire snapshot. */
+  presentation?: { owner: object; segments: StreamSegment[]; tools: UiMessage[] };
 };
 
 function shouldReplaceStreamText(previous: string | null, next: string): boolean {
@@ -18,8 +30,10 @@ export function markSessionRunStarted(
   const prev = map.get(sessionKey);
   const next: SessionRunState = {
     runId,
+    ...(prev?.runId === runId ? { turnId: prev.turnId, inputMessageId: prev.inputMessageId, inputMessageKey: prev.inputMessageKey, presentation: prev.presentation } : {}),
     streamText: prev?.runId === runId ? prev.streamText : null,
     startedAt: prev?.runId === runId ? prev.startedAt : startedAt,
+    streamTimestampMs: prev?.runId === runId ? prev.streamTimestampMs : undefined,
   };
   map.set(sessionKey, next);
   return next;
@@ -32,14 +46,17 @@ export function markSessionRunDelta(
   text: string,
   startedAt = Date.now(),
   authoritative = false,
+  streamTimestampMs?: number,
 ): SessionRunState {
   const prev = map.get(sessionKey);
   const next: SessionRunState = {
     runId,
+    ...(prev?.runId === runId ? { turnId: prev.turnId, inputMessageId: prev.inputMessageId, inputMessageKey: prev.inputMessageKey, presentation: prev.presentation } : {}),
     streamText: prev?.runId === runId
       ? (authoritative || shouldReplaceStreamText(prev.streamText, text) ? text : prev.streamText)
       : text,
     startedAt: prev?.runId === runId ? prev.startedAt : startedAt,
+    streamTimestampMs: streamTimestampMs ?? (prev?.runId === runId ? prev.streamTimestampMs : undefined),
   };
   map.set(sessionKey, next);
   return next;
@@ -55,4 +72,52 @@ export function clearSessionRunState(
   if (runId && prev.runId !== runId) return false;
   map.delete(sessionKey);
   return true;
+}
+
+/** Metadata may arrive after start acknowledgement; it cannot reset presentation. */
+export function rememberSessionRunIdentity(map: Map<string, SessionRunState>, key: string, runId: string,
+  turnId: unknown, inputMessageId: unknown, inputMessageKey?: unknown): boolean {
+  const state = map.get(key);
+  const turn = validTurnIdentity(turnId), input = validTurnIdentity(inputMessageId);
+  if (!state || state.runId !== runId || !turn || !input || (state.turnId && state.turnId !== turn)
+    || (state.inputMessageId && state.inputMessageId !== input)) return false;
+  const clientKey = validTurnIdentity(inputMessageKey);
+  if (state.inputMessageKey && clientKey && state.inputMessageKey !== clientKey) return false;
+  if (state.turnId === turn && state.inputMessageId === input && (!clientKey || state.inputMessageKey === clientKey)) return false;
+  state.turnId = turn; state.inputMessageId = input;
+  if (clientKey) state.inputMessageKey = clientKey;
+  return true;
+}
+
+/**
+ * A noncurrent Codex run keeps the rows its open conversation would show: a new
+ * tool commits the text before it, dated by that text's first clock. Without
+ * this a later restore merges every paragraph into one tail of unknown age.
+ */
+export function rememberSessionRunTool(map: Map<string, SessionRunState>, sessionKey: string, runId: string,
+  owner: object, tool: UiMessage, now = Date.now()): void {
+  const state = map.get(sessionKey);
+  if (!state || state.runId !== runId) return;
+  const presentation = state.presentation?.owner === owner ? state.presentation : { owner, segments: [], tools: [] };
+  if (presentation.tools.some(candidate => sameLiveToolCall(candidate, tool))) return;
+  const tail = finalReplyTail(state.streamText ?? '', presentation.segments);
+  const timestampMs = state.streamTimestampMs ?? now;
+  const segments: StreamSegment[] = tail.trim() ? [...presentation.segments, {
+    id: `stream_segment_${timestampMs}_${presentation.segments.length}`,
+    renderKey: liveReplyRenderKey(state.startedAt, runId, presentation.segments.length),
+    text: tail, timestampMs, afterToolCount: presentation.tools.length,
+  }] : presentation.segments;
+  map.set(sessionKey, { ...state, streamTimestampMs: undefined, presentation: { owner, segments, tools: [...presentation.tools, tool] } });
+}
+
+/** Settles a remembered Codex tool row in place; a call this phone never saw stays absent. */
+export function settleSessionRunTool(map: Map<string, SessionRunState>, sessionKey: string, runId: string,
+  owner: object, update: UiMessage, settle: (previous: UiMessage) => UiMessage): void {
+  const state = map.get(sessionKey);
+  const presentation = state?.runId === runId && state.presentation?.owner === owner ? state.presentation : undefined;
+  const index = presentation ? presentation.tools.findIndex(candidate => sameLiveToolCall(candidate, update)) : -1;
+  if (!state || !presentation || index < 0) return;
+  const tools = [...presentation.tools];
+  tools[index] = { ...settle(tools[index]!), id: tools[index]!.id };
+  map.set(sessionKey, { ...state, presentation: { ...presentation, tools } });
 }

@@ -1,3 +1,4 @@
+import { NativeQuotaCard } from './NativeQuotaCard';
 import { useUsageCalendar } from './useUsageCalendar';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -62,6 +63,11 @@ import {
 } from './model';
 import { translateAgentSettingsKey } from './translation';
 
+// The last summary each live adapter answered, per Agent and calendar day. Reopening the profile
+// starts from it and refreshes in place, instead of drawing the hero's heartbeat line and the stat
+// values late (owner rule 2026-09-29: a wait never moves the layout). A replaced adapter starts over.
+const summaryCache = new WeakMap<AgentAdapter, Map<string, AgentSettingsSummary>>();
+
 export type AgentSettingsNavigate = (
   route: 'AgentSettingsSection',
   params: RootStackParamList['AgentSettingsSection'],
@@ -81,7 +87,7 @@ export type AgentSettingsViewProps = Readonly<{
    * showed dashes for counts that were only late).
    */
   summaryLoading?: boolean;
-  identityDetail?: string;
+  quotaCard?: React.ReactNode;
   /** Agents on the connection; the shared Gateway heartbeat line shows only for a lone Agent. */
   agentCount?: number;
   errorMessage?: string;
@@ -107,49 +113,6 @@ export type AgentSettingsScreenProps = Omit<
   initialSummary?: AgentSettingsSummary;
   permissionDenied?: boolean;
 }>;
-
-type AgentSettingsRuntimeScreenProps = Omit<
-  AgentSettingsScreenProps,
-  'identityDetail'
-> & Readonly<{
-  loadIdentityDetail: (connection: ConnectionDescriptor) => Promise<string | undefined>;
-}>;
-
-export function AgentSettingsRuntimeScreen({
-  connection,
-  loadIdentityDetail,
-  ...screenProps
-}: AgentSettingsRuntimeScreenProps): React.JSX.Element {
-  const [loadedIdentity, setLoadedIdentity] = useState<Readonly<{
-    connectionId: string;
-    detail?: string;
-  }> | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    setLoadedIdentity(null);
-    void loadIdentityDetail(connection)
-      .then((detail) => {
-        if (active) setLoadedIdentity({ connectionId: connection.id, detail });
-      })
-      .catch(() => {
-        if (active) setLoadedIdentity({ connectionId: connection.id });
-      });
-    return () => {
-      active = false;
-    };
-  }, [connection, loadIdentityDetail]);
-
-  return (
-    <AgentSettingsScreen
-      {...screenProps}
-      connection={connection}
-      identityDetail={loadedIdentity?.connectionId === connection.id
-        ? loadedIdentity.detail
-        : undefined}
-    />
-  );
-}
 
 export function AgentSettingsRouteLoading({
   onBack,
@@ -201,9 +164,10 @@ export function AgentSettingsScreen({
   }> | null>(null);
   const [hasStateError, setHasStateError] = useState(false);
   const [summaryPendingKey, setSummaryPendingKey] = useState<string | null>(null);
+  const cachedSummary = accessibleAdapter && summaryKey ? summaryCache.get(accessibleAdapter)?.get(summaryKey) : undefined;
   const summary = loadedSummary?.key === summaryKey
     ? loadedSummary.value
-    : initialSummary;
+    : cachedSummary ?? initialSummary;
   // Optional counts must never hold navigation hostage.
   const initialized = true;
 
@@ -219,15 +183,25 @@ export function AgentSettingsScreen({
 
   const initialSummaryRef = useRef(initialSummary);
   initialSummaryRef.current = initialSummary;
+  const adapterRef = useRef(accessibleAdapter);
+  adapterRef.current = accessibleAdapter;
   const mergeSummary = useCallback((key: string, nextSummary: AgentSettingsSummary) => {
     setLoadedSummary((previous) => ({
       key,
       value: {
-        ...(previous?.key === key ? previous.value : initialSummaryRef.current),
+        ...(previous?.key === key
+          ? previous.value
+          : (adapterRef.current ? summaryCache.get(adapterRef.current)?.get(key) : undefined) ?? initialSummaryRef.current),
         ...nextSummary,
       },
     }));
   }, []);
+  useEffect(() => {
+    if (!loadedSummary || !accessibleAdapter) return;
+    let values = summaryCache.get(accessibleAdapter);
+    if (!values) { values = new Map(); summaryCache.set(accessibleAdapter, values); }
+    values.set(loadedSummary.key, loadedSummary.value);
+  }, [accessibleAdapter, loadedSummary]);
 
   useEffect(() => {
     if (!accessibleAdapter || !agent || !summaryKey || connectionState !== 'ready') return undefined;
@@ -303,9 +277,9 @@ export function AgentSettingsScreen({
       connectionState={connectionState}
       state={state}
       isPro={viewProps.isPro}
+      quotaCard={accessibleAdapter?.capabilities.profileManagement && accessibleAdapter.management?.profile ? <NativeQuotaCard profile={accessibleAdapter.management.profile} online={connectionState === 'ready'} refreshing={refreshing} onPress={() => viewProps.onNavigate('AgentSettingsSection', { connectionId: connection.id, agentId: agent?.agentId ?? '', section: 'usage' })} /> : undefined}
       summary={summary}
       summaryLoading={summaryPendingKey !== null && summaryPendingKey === summaryKey}
-      identityDetail={viewProps.identityDetail}
       errorMessage={errorMessage}
       refreshing={refreshing}
       onRefresh={() => { void refresh(); }}
@@ -322,7 +296,7 @@ export function AgentSettingsView({
   isPro,
   summary,
   summaryLoading = false,
-  identityDetail,
+  quotaCard,
   agentCount,
   errorMessage,
   reconnecting = false,
@@ -352,7 +326,6 @@ export function AgentSettingsView({
     connectionState,
     isPro,
     permissionDenied: state === 'permission',
-    identityDetail,
     summary,
     agentCount,
     now: Date.now(),
@@ -362,7 +335,6 @@ export function AgentSettingsView({
     capabilities,
     connection,
     connectionState,
-    identityDetail,
     isPro,
     state,
     summary,
@@ -389,11 +361,11 @@ export function AgentSettingsView({
   };
 
   // The hero has no static line: the backend is the avatar's corner mark, so the grey text only
-  // appears when it carries something live (heartbeat age) or account-specific (YouMind email).
+  // appears when it carries something live (the heartbeat age).
   const identityDetailLabel = (() => {
     if (!model) return undefined;
     const minutes = model.identity.activeMinutesAgo;
-    if (minutes === null) return model.identity.detail;
+    if (minutes === null) return undefined;
     const formatted = formatConsoleHeartbeatAge(minutes, i18n?.resolvedLanguage ?? i18n?.language ?? 'en');
     const age = formatted.compactText
       ?? (formatted.count === undefined
@@ -552,6 +524,7 @@ export function AgentSettingsView({
               <Text testID="agent-settings-identity-detail" style={styles.profileDetail}>{identityDetailLabel}</Text>
             ) : null}
           </Pressable>
+          {quotaCard}
           <AgentSettingsStats
             stats={model.stats}
             loading={summaryLoading}

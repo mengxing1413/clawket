@@ -61,6 +61,7 @@ import {
   type AgentSettingsSectionRowDescriptor,
   type AgentSettingsSectionState,
 } from './section-model';
+import { NativeProfileScreen, isNativeProfileSection } from './NativeProfileScreen';
 import { ModelsScreen } from './ModelsScreen';
 import { SkillsSection } from './SkillsSection';
 import { SkillDiscoverScreen } from './SkillDiscoverScreen';
@@ -279,8 +280,10 @@ export function AgentSettingsSectionScreen({
   }, [navigation, refreshRoster]);
 
   let sectionContent: React.ReactNode;
-  if (adapter && agent) {
+  if (adapter && agent && !capabilities.profileManagement) {
     const online = runtime.activeState === 'ready';
+    // The foreground grace window: sections keep what they show while the header says Reconnecting….
+    const reconnecting = runtime.recovering === true;
     if (section === 'skills' && !discoveringSkills) {
       sectionContent = (
         <SkillsSection
@@ -344,17 +347,19 @@ export function AgentSettingsSectionScreen({
           adapter={adapter}
           agent={agent}
           online={online}
+          reconnecting={reconnecting}
           saveRequest={toolsSaveRequest}
           onEditorChange={setToolsEditor}
         />
       );
     } else if (section === 'channels-devices') {
-      sectionContent = <ChannelsDevicesSection adapter={adapter} online={online} />;
+      sectionContent = <ChannelsDevicesSection adapter={adapter} online={online} reconnecting={reconnecting} />;
     } else if (section === 'logs') {
       sectionContent = (
         <LogsSection
           adapter={adapter}
           online={online}
+          reconnecting={reconnecting}
           isPro={isPro}
           onReconnect={retry}
           onOpenPaywall={openPaywall}
@@ -401,12 +406,17 @@ export function AgentSettingsSectionScreen({
     section,
   ]);
 
+  if (adapter && agent && !sectionLocked && capabilities.profileManagement && isNativeProfileSection(section)) {
+    return <NativeProfileScreen adapter={adapter} section={section} online={runtime.activeState === 'ready'} isPro={isPro} navigation={navigation} params={route.params} onOpenPaywall={openPaywall} />;
+  }
+
   if (section === 'openclaw' && adapter) {
     return (
       <OpenClawManageScreen
         adapter={adapter}
         isPro={isPro}
         permissionDenied={permissionDenied}
+        reconnecting={runtime.recovering === true}
         onBack={navigation.goBack}
         onOpenPaywall={openPaywall}
       />
@@ -419,6 +429,7 @@ export function AgentSettingsSectionScreen({
         adapter={adapter}
         agent={agent}
         online={runtime.activeState === 'ready'}
+        reconnecting={runtime.recovering === true}
         navigation={navigation}
         isPro={isPro}
         onOpenPaywall={openPaywall}
@@ -433,6 +444,7 @@ export function AgentSettingsSectionScreen({
         adapter={adapter}
         agent={agent}
         online={runtime.activeState === 'ready'}
+        reconnecting={runtime.recovering === true}
         isPro={isPro}
         navigation={navigation}
         openCreateOnMount={route.params.action === 'create-agent'}

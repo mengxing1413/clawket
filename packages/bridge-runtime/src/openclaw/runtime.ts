@@ -1,6 +1,10 @@
+import { OpenClawArtifacts } from './artifacts.js';
 import { OpenClawSessionFiles } from './session-files.js';
 import { OpenClawSkillDocuments } from './skill-documents.js';
+import { RelayOwnerCadence } from '../relay-owner-cadence.js';
 import { relayNetworkOptions } from '../relay-network.js';
+import { advertiseRelayOwnerPong, RelayOwnerPong } from '../relay-owner-pong.js';
+import { advertiseRelayTransfer } from '../relay-transfer-lease.js';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { PeerCertificate } from 'node:tls';
@@ -43,6 +47,8 @@ import {
   type WebSocketFrameData,
 } from '../frame-limit.js';
 import { RelaySessionState } from '../relay-session.js';
+import { BRIDGE_REMOTE_UPDATE_CAPABILITY, BRIDGE_UPDATE_START_METHOD, BRIDGE_UPDATE_STATUS_METHOD } from '@clawket/agent-protocol';
+import { handleRemoteUpdateRequest, type RemoteUpdateControl } from '../remote-update.js';
 
 type PendingGatewayMessage =
   | { kind: 'text'; text: string }
@@ -90,6 +96,8 @@ export type BridgeRuntimeOptions = {
   config: PairingConfig;
   gatewayUrl: string;
   bridgeVersion?: string;
+  /** CLI-injected phone-started update control, answered through Relay controls. */
+  remoteUpdate?: RemoteUpdateControl;
   /** Additive owner negotiation; legacy runtime consumers retain the v1 wire. */
   clientChannels?: boolean;
   reconnectBaseDelayMs?: number;
@@ -150,13 +158,16 @@ export class BridgeRuntime {
   private gatewayConnecting = false;
   private stopped = true;
   private readonly relaySessionState = new RelaySessionState();
+  private ownerPong: RelayOwnerPong | null = null;
+  private relayPingPending = false;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private gatewayRetryTimer: NodeJS.Timeout | null = null;
   private gatewayRetryAttempt = 0;
-  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: RelayOwnerCadence | null = null;
   private challengeWaitTimer: NodeJS.Timeout | null = null;
   private bootstrapRequestsInFlight = 0;
   private skillDocuments: OpenClawSkillDocuments | null = null;
+  private artifacts: OpenClawArtifacts | null = null;
   private sessionFiles: OpenClawSessionFiles | null = null;
   private pendingGatewayMessages: PendingGatewayMessage[] = [];
   private gatewayHandshakeStarted = false;
@@ -263,6 +274,8 @@ export class BridgeRuntime {
     const channelUrl = new URL(buildRelayWsUrl(this.options.config));
     if (this.targetConnectionId) channelUrl.searchParams.set('targetConnectionId', this.targetConnectionId);
     else if (this.options.clientChannels) channelUrl.searchParams.set('capabilities', 'bridge.client-sockets.v1');
+    advertiseRelayOwnerPong(channelUrl);
+    advertiseRelayTransfer(channelUrl);
     const relayUrl = channelUrl.toString();
     const relayHeaders = buildRelayWsHeaders(this.options.config);
     this.log(
@@ -275,6 +288,17 @@ export class BridgeRuntime {
       maxPayload: WEBSOCKET_FRAME_LIMIT_BYTES,
     });
     this.relaySocket = relay;
+    this.ownerPong = new RelayOwnerPong({
+      timeoutMs: this.options.heartbeatTimeoutMs,
+      send: frame => { if (this.relaySocket === relay && !this.stopped) this.sendFrame(relay, frame, 'relay_out'); },
+      onConfirmed: () => {
+        if (this.relaySocket !== relay || this.stopped) return;
+        this.relayPingPending = false;
+        this.relaySessionState.confirmHealth();
+      },
+      onTimeout: () => { if (this.relaySocket === relay && !this.stopped) relay.terminate(); },
+      log: line => this.log(line),
+    });
 
     relay.once('open', () => {
       if (this.stopped || this.relaySocket !== relay) {
@@ -293,11 +317,14 @@ export class BridgeRuntime {
 
     relay.on('message', (data: RawData, isBinary: boolean) => {
       if (this.relaySocket !== relay || this.stopped) return;
+      this.ownerPong?.noteFrameReceived(getWebSocketFrameByteLength(data));
       void this.handleRelayMessage(data, isBinary);
     });
 
-    relay.on('pong', () => {
+    relay.on('pong', (data: Buffer) => {
       if (this.stopped || this.relaySocket !== relay) return;
+      if (this.ownerPong && !this.ownerPong.confirmTransportPong(data?.toString())) return;
+      this.relayPingPending = false;
       if (this.relaySessionState.confirmHealth()) {
         this.log('relay health confirmed; reconnect backoff reset');
       }
@@ -337,7 +364,9 @@ export class BridgeRuntime {
       this.relayConnecting = false;
       void this.stopClientRuntimes();
       this.clientChannelsNegotiated = false;
+      const maximumRetryDelayMs = this.ownerPong?.takeReconnectDelay(Infinity, code);
       this.stopHeartbeat();
+      this.ownerPong?.dispose(); this.ownerPong = null;
       this.clientDemandStartedAtMs = null;
       this.gatewayConnectedAtMs = null;
       this.updateSnapshot({
@@ -348,7 +377,7 @@ export class BridgeRuntime {
       });
       this.log(`relay disconnected code=${code} reason=${reason.toString() || '<none>'}`);
       this.closeGateway();
-      this.scheduleRelayReconnect();
+      this.scheduleRelayReconnect(maximumRetryDelayMs);
     });
   }
 
@@ -373,6 +402,7 @@ export class BridgeRuntime {
       await this.handleRelayControl(control);
       return;
     }
+    if (this.artifacts?.handleRequest(text)) return;
     if (this.sessionFiles?.handleRequest(text)) return;
     if (this.skillDocuments?.handleRequest(text)) return;
     const identity = parseConnectStartIdentity(text);
@@ -391,6 +421,9 @@ export class BridgeRuntime {
     targetClientId?: string;
     count?: number;
   }): Promise<void> {
+    const consumed = this.ownerPong?.handleControl(control);
+    this.heartbeatTimer?.observe(control);
+    if (consumed) return;
     if (control.event === 'client.sockets' && this.options.clientChannels && !this.targetConnectionId) {
       const ids = control.payload?.clients;
       if (!Array.isArray(ids) || ids.length > 128 || ids.some(id => typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id))) return;
@@ -437,6 +470,11 @@ export class BridgeRuntime {
 
     if (control.event === 'doctor-fix.request') {
       await this.handleDoctorFixRequest(control);
+      return;
+    }
+
+    if (control.event === 'bridge-update.request' || control.event === 'bridge-update-status.request') {
+      await this.handleBridgeUpdateRequest(control);
       return;
     }
 
@@ -683,6 +721,35 @@ export class BridgeRuntime {
     }
   }
 
+  /** Phone-started update; only start (no parameters) and status reach the CLI-injected control. */
+  private async handleBridgeUpdateRequest(control: {
+    event: string;
+    requestId?: string;
+    sourceClientId?: string;
+    targetClientId?: string;
+  }): Promise<void> {
+    const requestId = control.requestId?.trim() ?? '';
+    const replyTargetClientId = control.sourceClientId?.trim() || control.targetClientId?.trim() || '';
+    const base = control.event === 'bridge-update.request' ? 'bridge-update' : 'bridge-update-status';
+    if (!requestId) {
+      this.log(`relay ${base} request dropped reason=missing_request_id`);
+      return;
+    }
+    try {
+      const payload = await handleRemoteUpdateRequest(this.options.remoteUpdate,
+        base === 'bridge-update' ? BRIDGE_UPDATE_START_METHOD : BRIDGE_UPDATE_STATUS_METHOD) as Record<string, unknown>;
+      if (base === 'bridge-update') this.log(`relay bridge-update requested accepted=${payload.accepted === true}`);
+      this.sendRelayControl({ event: `${base}.result`, requestId, targetClientId: replyTargetClientId || undefined, payload });
+    } catch {
+      this.sendRelayControl({
+        event: `${base}.error`,
+        requestId,
+        targetClientId: replyTargetClientId || undefined,
+        payload: { code: 'bridge_update_unavailable', message: 'Remote Bridge update is unavailable on this computer' },
+      });
+    }
+  }
+
   private async handlePermissionsRequest(control: {
     requestId?: string;
     sourceClientId?: string;
@@ -849,6 +916,7 @@ export class BridgeRuntime {
     }
     const text = normalizeText(data);
     if (text == null) return;
+    if (this.artifacts?.handleResponse(text)) return;
     if (this.sessionFiles?.handleResponse(text)) return;
     if (this.skillDocuments?.handleResponse(text)) return;
     // A missing connect request cannot be fixed by repeatedly opening only
@@ -874,7 +942,8 @@ export class BridgeRuntime {
       }
       const pending = this.inFlightConnectHandshakes.get(response.id);
       if (response.ok && pending?.bridgeCapabilitiesRequested) {
-        relayText = patchConnectResponseBridgeCapabilities(text, this.bridgeVersion).text;
+        relayText = patchConnectResponseBridgeCapabilities(text, this.bridgeVersion,
+          this.options.remoteUpdate?.available() ? [BRIDGE_REMOTE_UPDATE_CAPABILITY] : []).text;
         // Only isolated full-client channels to a local Gateway can read host files.
         // Legacy shared channels and remote Gateways keep transparent forwarding.
         const hello = JSON.parse(relayText);
@@ -895,7 +964,12 @@ export class BridgeRuntime {
             sendGateway: value => { if (gateway === this.gatewaySocket && gateway) this.sendFrame(gateway, value, 'gateway_out'); },
             sendClient: value => { if (relay === this.relaySocket) this.sendFrame(relay, value, 'relay_out'); },
           });
-          hello.payload.features.methods = [...nativeMethods, ...this.skillDocuments.methods, ...this.sessionFiles.methods];
+          this.artifacts = new OpenClawArtifacts({
+            nativeMethods, scopes: normalizeConnectCapabilities(auth.scopes), gatewayUrl: this.options.gatewayUrl,
+            sendGateway: value => { if (gateway === this.gatewaySocket && gateway) this.sendFrame(gateway, value, 'gateway_out'); },
+            sendClient: value => { if (relay === this.relaySocket) this.sendFrame(relay, value, 'relay_out'); },
+          });
+          hello.payload.features.methods = [...nativeMethods, ...this.skillDocuments.methods, ...this.sessionFiles.methods, ...this.artifacts.methods];
           relayText = JSON.stringify(hello);
         }
       }
@@ -1080,6 +1154,8 @@ export class BridgeRuntime {
   }
 
   private clearSkillDocuments(): void {
+    this.artifacts?.dispose();
+    this.artifacts = null;
     this.sessionFiles?.dispose();
     this.sessionFiles = null;
     this.skillDocuments?.dispose();
@@ -1225,6 +1301,7 @@ export class BridgeRuntime {
   private sendFrame(socket: RuntimeSocket, data: WebSocketFrameData, direction: string): boolean {
     if (this.rejectOversizedFrame(socket, data, direction)) return false;
     socket.send(data as Parameters<RuntimeSocket['send']>[0]);
+    if (socket === this.relaySocket) this.ownerPong?.noteTransfer(getWebSocketFrameByteLength(data));
     return true;
   }
 
@@ -1253,11 +1330,11 @@ export class BridgeRuntime {
     this.inFlightConnectHandshakes.clear();
   }
 
-  private scheduleRelayReconnect(): void {
+  private scheduleRelayReconnect(maximumDelayMs = Infinity): void {
     if (this.stopped || this.reconnectTimer) return;
     const base = this.options.reconnectBaseDelayMs ?? RECONNECT_BASE_DELAY_MS;
     const max = this.options.reconnectMaxDelayMs ?? RECONNECT_MAX_DELAY_MS;
-    const delayMs = this.relaySessionState.reconnectDelayMs(base, max);
+    const delayMs = Math.min(maximumDelayMs, this.relaySessionState.reconnectDelayMs(base, max));
     this.log(`relay reconnect scheduled delayMs=${delayMs}`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -1290,27 +1367,35 @@ export class BridgeRuntime {
   private startHeartbeat(): void {
     this.stopHeartbeat();
     const intervalMs = this.options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS;
-    let lastTickMs = Date.now();
-    this.heartbeatTimer = setInterval(() => {
-      const nowMs = Date.now();
-      const schedulerDelayMs = Math.max(0, nowMs - lastTickMs - intervalMs);
-      lastTickMs = nowMs;
-      const relay = this.relaySocket;
-      if (!relay || relay.readyState !== WebSocket.OPEN) return;
-      this.logSlowConnectHandshakes();
-      const timeoutMs = this.options.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS;
-      if (this.relaySessionState.heartbeatTimedOut(timeoutMs)) {
-        this.log(`relay heartbeat timed out idleMs=${this.relaySessionState.activityAgeMs(nowMs)} timeoutMs=${timeoutMs} schedulerDelayMs=${schedulerDelayMs} queued=${this.pendingGatewayMessages.length} socketKind=${this.targetConnectionId ? 'channel' : 'owner'}`);
-        relay.terminate();
-        return;
-      }
-      relay.ping();
-    }, this.options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer = new RelayOwnerCadence({ idleIntervalMs: intervalMs,
+      negotiated: () => this.ownerPong?.negotiated === true,
+      socketList: this.options.clientChannels && !this.targetConnectionId,
+      onTick: schedulerDelayMs => {
+        const nowMs = Date.now();
+        const relay = this.relaySocket;
+        if (!relay || relay.readyState !== WebSocket.OPEN) return;
+        this.logSlowConnectHandshakes();
+        const timeoutMs = this.options.heartbeatTimeoutMs ?? HEARTBEAT_TIMEOUT_MS;
+        // Presence changes only future cadence. Each ping retains its own deadline;
+        // business traffic cannot clear it. Legacy activity-based liveness is unchanged.
+        if (this.ownerPong?.negotiated) {
+          if (!this.ownerPong.startProtocolPing(Math.min(intervalMs, timeoutMs))) return;
+        } else if (this.relaySessionState.heartbeatTimedOut(timeoutMs)) {
+          this.log(`relay heartbeat timed out idleMs=${this.relaySessionState.activityAgeMs(nowMs)} timeoutMs=${timeoutMs} schedulerDelayMs=${schedulerDelayMs} queued=${this.pendingGatewayMessages.length} socketKind=${this.targetConnectionId ? 'channel' : 'owner'}`);
+          relay.terminate();
+          return;
+        }
+        this.relayPingPending = true;
+        relay.ping(this.ownerPong?.protocolPingPayload);
+      },
+    });
+    this.heartbeatTimer.schedule();
   }
 
   private stopHeartbeat(): void {
+    this.relayPingPending = false;
     if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer.dispose();
       this.heartbeatTimer = null;
     }
   }
@@ -1436,6 +1521,7 @@ export class BridgeRuntime {
   private clearTimers(): void {
     this.clearChallengeWait();
     this.stopHeartbeat();
+    this.ownerPong?.dispose(); this.ownerPong = null;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -1668,6 +1754,7 @@ export function stripConnectRequestBridgeMeta(
 export function patchConnectResponseBridgeCapabilities(
   text: string,
   bridgeVersion?: string,
+  bridgeCapabilities: readonly string[] = [],
 ): { text: string; patched: boolean } {
   try {
     const parsed = JSON.parse(text) as {
@@ -1681,10 +1768,11 @@ export function patchConnectResponseBridgeCapabilities(
     }
     const meta = isRuntimeRecord(parsed.meta) ? parsed.meta : {};
     const { bridgeVersion: _gatewayBridgeVersion, ...preservedMeta } = meta;
-    const capabilities = normalizeConnectCapabilities(meta.capabilities);
+    // Bridge-local capabilities come only from this Bridge, never from the Gateway's metadata.
+    const capabilities = normalizeConnectCapabilities(meta.capabilities).filter(capability => capability !== BRIDGE_REMOTE_UPDATE_CAPABILITY);
     const normalizedBridgeVersion = normalizeBridgeVersion(bridgeVersion);
-    if (!capabilities.includes(BRIDGE_CAPABILITIES_V2)) {
-      capabilities.push(BRIDGE_CAPABILITIES_V2);
+    for (const capability of [BRIDGE_CAPABILITIES_V2, ...bridgeCapabilities]) {
+      if (!capabilities.includes(capability)) capabilities.push(capability);
     }
     return {
       text: JSON.stringify({

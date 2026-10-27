@@ -96,6 +96,28 @@ describe('HermesLocalBridge WebSocket frame limit', () => {
 });
 
 describe('HermesLocalBridge capability advertisement', () => {
+  it('advertises and answers phone-started update only through the injected control', async () => {
+    const stateDir = await mkdtemp(join(tmpdir(), 'clawket-hermes-remote-update-'));
+    const status = { id: '5b0c7a0e-3c1f-4e8e-9b2a-6f1d2c3b4a59', state: 'checking' as const, startedAt: 1 };
+    const start = vi.fn(async () => ({ accepted: true as const, status }));
+    const bridge = (remoteUpdate?: ConstructorParameters<typeof HermesLocalBridge>[0]['remoteUpdate']) => new HermesLocalBridge({
+      host: '127.0.0.1', port: 1, apiBaseUrl: 'http://127.0.0.1:1', bridgeToken: 'remote-update-test', startHermesIfNeeded: false,
+      hermesSourcePath: join(stateDir, 'missing-hermes-source'), hermesHomePath: join(stateDir, 'home'),
+      sessionStorePath: join(stateDir, 'sessions.json'), usageLedgerPath: join(stateDir, 'usage.json'), remoteUpdate,
+    });
+    try {
+      const without = bridge();
+      expect(without.getBridgeCapabilities()).not.toContain('bridge.remote-update.v1');
+      await expect(without.dispatchRequest('bridge.update.start', {})).rejects.toThrow('unavailable');
+      const enabled = bridge({ available: () => true, start, status: () => status });
+      expect(enabled.getBridgeCapabilities()).toContain('bridge.remote-update.v1');
+      expect(await enabled.dispatchRequest('bridge.update.start', { version: '0.0.1' })).toEqual({ accepted: true, status });
+      expect(await enabled.dispatchRequest('bridge.update.status', {})).toEqual({ status });
+      expect(start).toHaveBeenCalledExactlyOnceWith();
+      expect(bridge({ available: () => false, start, status: () => status }).getBridgeCapabilities()).not.toContain('bridge.remote-update.v1');
+    } finally { await rm(stateDir, { recursive: true, force: true }); }
+  });
+
   it('returns the same Bridge version and capabilities across every health path', async () => {
     const port = await reserveAvailablePort();
     const stateDir = await mkdtemp(join(tmpdir(), 'clawket-hermes-capabilities-'));
@@ -115,7 +137,7 @@ describe('HermesLocalBridge capability advertisement', () => {
     try {
       await bridge.start();
       const health = await fetch(`${bridge.getHttpUrl()}/v1/hermes/health`).then((response) => response.json()) as any;
-      expect(health.capabilities).toEqual(['bridge.session-files.v1', 'bridge.capabilities.v2', 'hermes.multi-session.v2']);
+      expect(health.capabilities).toEqual(['bridge.session-files.v1', 'bridge.artifacts.v1', 'bridge.capabilities.v2', 'hermes.multi-session.v2']);
       expect(health.bridgeVersion).toBe('3.0.0-test');
 
       const socket = new WebSocket(bridge.getWsUrl());
@@ -125,7 +147,7 @@ describe('HermesLocalBridge capability advertisement', () => {
         type: 'event',
         event: 'health',
         payload: {
-          capabilities: ['bridge.session-files.v1', 'bridge.capabilities.v2', 'hermes.multi-session.v2'],
+          capabilities: ['bridge.session-files.v1', 'bridge.artifacts.v1', 'bridge.capabilities.v2', 'hermes.multi-session.v2'],
           bridgeVersion: '3.0.0-test',
         },
       });
@@ -138,7 +160,7 @@ describe('HermesLocalBridge capability advertisement', () => {
         id: 'health-1',
         ok: true,
         payload: {
-          capabilities: ['bridge.session-files.v1', 'bridge.capabilities.v2', 'hermes.multi-session.v2'],
+          capabilities: ['bridge.session-files.v1', 'bridge.artifacts.v1', 'bridge.capabilities.v2', 'hermes.multi-session.v2'],
           bridgeVersion: '3.0.0-test',
         },
       });
@@ -188,4 +210,47 @@ describe('Hermes authenticated readiness', () => {
       expect(fetchMock.mock.calls.every(([url]) => url.endsWith('/v1/models'))).toBe(true);
     } finally { vi.unstubAllGlobals(); }
   });
+
+  it('reports a fixed Hermes API issue on Bridge health', async () => {
+    let apiStatus = 401;
+    const api = createServer((request, response) => {
+      response.statusCode = request.url === '/v1/models' ? apiStatus : 404;
+      response.end('{}');
+    });
+    await new Promise<void>((resolve) => api.listen(0, '127.0.0.1', () => resolve()));
+    const stateDir = await mkdtemp(join(tmpdir(), 'clawket-hermes-api-issue-'));
+    const bridge = new HermesLocalBridge({
+      host: '127.0.0.1',
+      port: await reserveAvailablePort(),
+      apiBaseUrl: `http://127.0.0.1:${(api.address() as AddressInfo).port}`,
+      bridgeToken: 'api-issue-test',
+      startHermesIfNeeded: false,
+      hermesSourcePath: join(stateDir, 'missing-hermes-source'),
+      hermesHomePath: join(stateDir, 'home'),
+      hermesPythonPath: (process.platform === 'win32' ? 'python' : 'python3'),
+      sessionStorePath: join(stateDir, 'sessions.json'),
+      usageLedgerPath: join(stateDir, 'usage.json'),
+      gatewayOwnerPath: join(stateDir, 'gateway-owner.json'),
+    });
+    const readHealth = async () => await (await fetch(`${bridge.getHttpUrl()}/health`)).json() as Record<string, unknown>;
+    try {
+      await bridge.start();
+      await expect(readHealth()).resolves.toMatchObject({
+        status: 'degraded',
+        hermesApiReachable: false,
+        hermesApiIssue: 'credential_mismatch',
+      });
+      apiStatus = 503;
+      await expect(readHealth()).resolves.toMatchObject({ hermesApiReachable: false, hermesApiIssue: 'unreachable' });
+      apiStatus = 200;
+      const ready = await readHealth();
+      expect(ready).toMatchObject({ status: 'ok', hermesApiReachable: true });
+      expect(ready).not.toHaveProperty('hermesApiIssue');
+    } finally {
+      await bridge.stop();
+      api.closeAllConnections();
+      await new Promise<void>((resolve) => api.close(() => resolve()));
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

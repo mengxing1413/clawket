@@ -1,14 +1,17 @@
-import type { SessionFilesOperations } from './session-files';
+import type { ArtifactOperations, SessionFilesOperations } from './session-files';
+import type { BridgeUpdateOperations } from './bridge-update';
 import type { Capabilities } from './capabilities';
 import type {
   AgentDescriptor,
   AgentQuestion,
   ProjectDescriptor,
   ApprovalRequest,
+  ChatMessage,
   ConnectionDescriptor,
   FinalMessage,
   PromptInput,
   SessionDescriptor,
+  SessionActivity,
   SessionHistory,
   Usage,
 } from './descriptors';
@@ -28,25 +31,43 @@ export type SessionUpdate =
   | { type: 'question_requested'; sessionKey: string; question: AgentQuestion }
   | { type: 'question_resolved'; sessionKey: string; questionId: string }
   | { type: 'history_reconciled'; sessionKey: string; history: SessionHistory }
-  | { type: 'run_started'; sessionKey: string; runId: string }
-  | { type: 'agent_message_chunk'; sessionKey: string; runId: string; text: string; textMode?: 'snapshot' | 'delta' }
+  | { type: 'run_started'; sessionKey: string; runId: string;
+      turnId?: string; inputMessageId?: string; inputMessageKey?: string }
+  | { type: 'agent_message_chunk'; sessionKey: string; runId: string; text: string; textMode?: 'snapshot' | 'delta'; timestampMs?: number;
+      turnId?: string; inputMessageId?: string; inputMessageKey?: string }
   | { type: 'agent_thought_chunk'; sessionKey: string; runId: string; text: string }
+  /** A commentary paragraph streamed outside the reply text; `text` is that item's whole text so far. */
+  | { type: 'agent_commentary_chunk'; sessionKey: string; runId: string; itemId: string; text: string }
   | {
       type: 'tool_call';
       sessionKey: string;
       runId: string;
       toolCallId: string;
       title: string;
+      turnId?: string;
+      inputMessageId?: string;
+      inputMessageKey?: string;
       kind?: string;
       rawInput?: unknown;
+      /** Omission retains the legacy live-start event; unknown does not prove execution. */
+      status?: 'running' | 'success' | 'error' | 'unknown';
+      /** Producer's native or observed call start (Unix ms); omission keeps receipt timing. */
+      startedAtMs?: number;
     }
   | {
       type: 'tool_call_update';
       sessionKey: string;
       runId: string;
       toolCallId: string;
-      status: 'running' | 'success' | 'error';
+      status: 'running' | 'success' | 'error' | 'unknown';
+      turnId?: string;
+      inputMessageId?: string;
+      inputMessageKey?: string;
       rawOutput?: unknown;
+      /** Producer's call clocks (Unix ms) and native duration (ms); only settled calls carry completion. */
+      startedAtMs?: number;
+      finishedAtMs?: number;
+      durationMs?: number;
     }
   | {
       type: 'run_finished';
@@ -55,6 +76,8 @@ export type SessionUpdate =
       stopReason: 'end_turn' | 'cancelled' | 'error' | 'max_tokens';
       unappliedInput?: string;
       message?: FinalMessage;
+      /** Stable, history-backed system notice for a failed native turn. Never raw provider diagnostics. */
+      terminalMessage?: Pick<ChatMessage, 'id' | 'text' | 'timestampMs'> & { role: 'system' };
       usage?: Usage;
     }
   | { type: 'compaction'; sessionKey: string; phase: 'start' | 'end' }
@@ -68,6 +91,7 @@ export type SessionUpdate =
       kind?: ApprovalRequest['kind'];
       target?: 'device' | 'node';
     }
+  | { type: 'session_activity_update'; activity: SessionActivity }
   | { type: 'session_info_update'; session: Partial<SessionDescriptor> & { key: string } }
   | {
       type: 'usage_update';
@@ -100,14 +124,22 @@ export interface AgentAdapter {
   probe(timeoutMs?: number): Promise<boolean>;
   listAgents(): Promise<AgentDescriptor[]>;
   listSessions(agentId?: string): Promise<SessionDescriptor[]>;
+  /** Optional negotiated, read-only activity for at most 32 visible sessions. */
+  readSessionActivity?(keys: readonly string[]): Promise<SessionActivity[]>;
   loadSession(key: string, options?: { limit?: number; cursor?: string }): Promise<SessionHistory>;
+  /** Optional synchronous local validation; never sends, probes or authorizes retry. */
+  validatePrompt?(key: string, input: PromptInput): void;
   prompt(key: string, input: PromptInput): Promise<{ runId: string }>;
+  /** Read-only receipt lookup. Recorded proves durable Bridge receipt, not native execution. */
+  getPromptStatus?(key: string, idempotencyKey: string): Promise<PromptStatus>;
   cancel(key: string, runId?: string): Promise<void>;
   steer?(key: string, runId: string, text: string): Promise<void>;
   createSession?(agentId: string, options?: { title?: string; fromSession?: string; projectId?: string }): Promise<SessionDescriptor>;
   patchSession?(key: string, patch: { title?: string }): Promise<void>;
   resetSession?(key: string): Promise<void>;
   deleteSession?(key: string): Promise<void>;
+  archiveSession?(key: string, archived: boolean): Promise<void>;
+  listArchivedSessions?(agentId?: string): Promise<SessionDescriptor[]>;
   projects?: { list(): Promise<ProjectDescriptor[]> };
   questions?: {
     list(key: string): Promise<AgentQuestion[]>;
@@ -115,7 +147,12 @@ export interface AgentAdapter {
   };
   management?: ManagementOperations;
   sessionFiles?: SessionFilesOperations;
+  artifacts?: ArtifactOperations;
+  /** Present only while the connected Bridge negotiated `bridgeRemoteUpdate`. */
+  bridgeUpdate?: BridgeUpdateOperations;
   on(event: 'update', listener: (update: SessionUpdate) => void): () => void;
   on(event: 'state', listener: (state: ConnectionState, reason?: string) => void): () => void;
   on(event: 'sessions', listener: (sessions: SessionDescriptor[]) => void): () => void;
 }
+
+export type PromptStatus = { status: 'unknown' } | { status: 'recorded'; runId: string };

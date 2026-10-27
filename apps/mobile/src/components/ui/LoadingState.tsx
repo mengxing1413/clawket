@@ -4,7 +4,7 @@ import Animated, { useAnimatedStyle, useReducedMotion, useSharedValue, withDelay
 import { useTranslation } from 'react-i18next';
 import { COMPACT_SCENE_POOL, rollScene, SCENE_POOL, type CompanionSceneKey } from '../../brand/companion-scenes';
 import { useAppTheme } from '../../theme';
-import { FontSize, LineHeight, Motion, Space } from '../../theme/tokens';
+import { FontSize, FontWeight, LineHeight, Motion, Space } from '../../theme/tokens';
 import { Button } from './Button';
 import { Companion, type CompanionPose } from './Companion';
 import { CompanionScene, type CompanionScenePhase } from './companion/CompanionScene';
@@ -38,6 +38,20 @@ type Props = {
   scene?: CompanionSceneKey;
   /** After `Motion.loadingSlowHint` the wait explains itself and offers this one action. */
   slowAction?: Readonly<{ label: string; onPress: () => void }>;
+  /** A connection may allow more time for its first catalog than a generic page. */
+  slowAfterMs?: number;
+  /** Real progress to a new stage starts a fresh slow-wait clock. */
+  waitKey?: string;
+  /** Offered under the label from the start, such as a manual reconnect beside the automatic one. */
+  action?: Readonly<{ label: string; onPress: () => void }>;
+  /** The label is the page's headline (the onboarding connecting stage): title size, semibold. */
+  headline?: boolean;
+  /**
+   * The color cards have on the page behind the loader, so the scene's furniture (Peek's desk) reads as
+   * one of them. Defaults to the plain canvas's `surface`; a neutral gray turns muddy on a grouped page or
+   * a tinted chat wallpaper (owner feedback 2026-10-02).
+   */
+  surface?: string;
   testID?: string;
 };
 
@@ -49,7 +63,7 @@ type Props = {
  * 2026-09-27). It stays invisible for `Motion.loadingGrace` so fast loads never flash the Companion, while
  * the busy state and its label are exposed to assistive technology immediately.
  */
-export function LoadingState({ message, pose = 'loading', size = 'page', phase = 'wait', scene: pinned, slowAction, testID }: Props): React.JSX.Element {
+export function LoadingState({ message, pose = 'loading', size = 'page', phase = 'wait', scene: pinned, slowAction, slowAfterMs = Motion.loadingSlowHint, waitKey, action, headline = false, surface, testID }: Props): React.JSX.Element {
   const { theme } = useAppTheme();
   const { t } = useTranslation('common');
   const reducedMotion = useReducedMotion();
@@ -100,14 +114,14 @@ export function LoadingState({ message, pose = 'loading', size = 'page', phase =
   }, [phase, pinned, reducedMotion, sceneOpacity, size]);
   const sceneStyle = useAnimatedStyle(() => ({ opacity: sceneOpacity.value }));
 
-  const [slow, setSlow] = useState(false);
+  const [slow, setSlow] = useState<{ waitKey?: string; afterMs: number } | null>(null);
   const hasSlowAction = Boolean(slowAction);
   useEffect(() => {
-    setSlow(false);
+    setSlow(null);
     if (!hasSlowAction || phase !== 'wait') return undefined;
-    const timer = setTimeout(() => setSlow(true), Motion.loadingSlowHint);
+    const timer = setTimeout(() => setSlow({ waitKey, afterMs: slowAfterMs }), slowAfterMs);
     return () => clearTimeout(timer);
-  }, [hasSlowAction, phase]);
+  }, [hasSlowAction, phase, slowAfterMs, waitKey]);
 
   return (
     <View style={compact ? styles.compactRoot : styles.root}>
@@ -127,20 +141,25 @@ export function LoadingState({ message, pose = 'loading', size = 'page', phase =
             <Companion pose={pose} size={compact ? COMPACT_COMPANION : undefined} />
           ) : (
             <Animated.View style={sceneStyle}>
-              <CompanionScene key={`${scene}-${round}`} scene={scene} phase={phase} compact={compact} testID={testID ? `${testID}-scene` : undefined} />
+              <CompanionScene key={`${scene}-${round}`} scene={scene} phase={phase} compact={compact} surface={surface} testID={testID ? `${testID}-scene` : undefined} />
             </Animated.View>
           )}
           {/* The label goes the moment the wait succeeds, so it never reads over the arriving content; its line stays so the cat does not jump. */}
           {message ? (
             <Text
               testID={testID ? `${testID}-message` : undefined}
-              style={[compact ? styles.compactText : styles.text, { color: compact ? theme.colors.inkSecondary : theme.colors.ink }, phase === 'ready' && styles.gone]}
+              style={[compact ? styles.compactText : headline ? styles.headline : styles.text, { color: compact ? theme.colors.inkSecondary : theme.colors.ink }, phase === 'ready' && styles.gone]}
             >
               {message}
             </Text>
           ) : null}
         </View>
-        {slow && slowAction && phase === 'wait' ? (
+        {action ? (
+          // Like the label, the action keeps its line through a success exit so the cat does not jump.
+          <View style={[styles.slow, phase === 'ready' && styles.gone]} pointerEvents={phase === 'ready' ? 'none' : 'auto'}>
+            <Button testID={testID ? `${testID}-action` : undefined} label={action.label} variant="text" size="sm" disabled={phase === 'ready'} onPress={action.onPress} />
+          </View>
+        ) : slow?.waitKey === waitKey && slow?.afterMs === slowAfterMs && slowAction && phase === 'wait' ? (
           <View style={styles.slow}>
             <Text testID={testID ? `${testID}-slow` : undefined} style={[styles.slowText, { color: theme.colors.inkSecondary }]}>
               {t('Taking longer than usual')}
@@ -210,6 +229,13 @@ const styles = StyleSheet.create({
     marginTop: Space.md,
     fontSize: FontSize.secondary,
     lineHeight: LineHeight.secondary,
+    textAlign: 'center',
+  },
+  headline: {
+    marginTop: Space.lg,
+    fontSize: FontSize.title,
+    lineHeight: LineHeight.title,
+    fontWeight: FontWeight.semibold,
     textAlign: 'center',
   },
   slow: {

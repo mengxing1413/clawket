@@ -1,4 +1,6 @@
+import { validTurnIdentity } from './turnIdentity';
 import { normalizeMessageAttribution } from './messageAttribution';
+import { localizeAgentSystemNotice } from './agentSystemNotice';
 import {
   useEffect,
   useRef,
@@ -26,7 +28,7 @@ import {
 type ApprovalStatus = NonNullable<UiMessage['approval']>['status'];
 
 export type AdapterChatUpdate =
-  | Extract<SessionUpdate, { type: 'question_requested' | 'question_resolved' }>
+  | Extract<SessionUpdate, { type: 'question_requested' | 'question_resolved' | 'session_activity_update' }>
   | {
       type: 'history_reconciled';
       sessionKey: string;
@@ -39,6 +41,9 @@ export type AdapterChatUpdate =
       type: 'run_started';
       sessionKey: string;
       runId: string;
+      turnId?: string;
+      inputMessageId?: string;
+      inputMessageKey?: string;
       activeRunId: string;
       isSending: true;
       startedAtMs: number;
@@ -47,8 +52,12 @@ export type AdapterChatUpdate =
       type: 'agent_message_chunk';
       sessionKey: string;
       runId: string;
+      turnId?: string;
+      inputMessageId?: string;
+      inputMessageKey?: string;
       text: string;
       textMode?: 'snapshot' | 'delta';
+      timestampMs?: number;
       activeRunId: string;
       isSending: true;
       visible: boolean;
@@ -63,9 +72,21 @@ export type AdapterChatUpdate =
       isSending: true;
     }
   | {
+      type: 'agent_commentary_chunk';
+      sessionKey: string;
+      runId: string;
+      itemId: string;
+      text: string;
+      activeRunId: string;
+      isSending: true;
+    }
+  | {
       type: 'tool_call';
       sessionKey: string;
       runId: string;
+      turnId?: string;
+      inputMessageId?: string;
+      inputMessageKey?: string;
       toolCallId: string;
       message: UiMessage;
       merge: false;
@@ -76,6 +97,9 @@ export type AdapterChatUpdate =
       type: 'tool_call_update';
       sessionKey: string;
       runId: string;
+      turnId?: string;
+      inputMessageId?: string;
+      inputMessageKey?: string;
       toolCallId: string;
       message: UiMessage;
       merge: true;
@@ -158,6 +182,7 @@ export type UseAdapterChatEventsOptions = AdapterChatEventHandlers & {
 type MappingOptions = {
   now?: () => number;
   translate?: (key: string) => string;
+  cancelledRunNotice?: string;
 };
 
 function mapUsage(usage: Usage | undefined): MessageUsage | undefined {
@@ -188,8 +213,20 @@ function stringifyUnknown(value: unknown): string | undefined {
   }
 }
 
+/** A producer's step clock (Unix ms); anything else keeps this phone's receipt timing. */
+function reportedClock(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 8.64e15 ? value : undefined;
+}
+
+function reportedDuration(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 8.64e15 ? value : undefined;
+}
+
 /** Convert the rendering-neutral protocol message into the current RN message model. */
-export function mapAdapterChatMessage(message: ChatMessage): UiMessage | null {
+export function mapAdapterChatMessage(
+  message: ChatMessage,
+  translate: (key: string) => string = translateChatEvent,
+): UiMessage | null {
   if (
     message.role === 'assistant'
     && (isAssistantDeliveryMirrorMessage(message) || isAssistantSilentReplyMessage(message))
@@ -198,7 +235,7 @@ export function mapAdapterChatMessage(message: ChatMessage): UiMessage | null {
   }
 
   const imageUris = message.attachments
-    ?.filter((attachment) => attachment.type === 'image')
+    ?.filter((attachment) => attachment.type === 'image' && !attachment.artifactId)
     .map((attachment) => {
       if (attachment.uri) return attachment.uri;
       if (!attachment.content) return undefined;
@@ -208,7 +245,7 @@ export function mapAdapterChatMessage(message: ChatMessage): UiMessage | null {
     })
     .filter((uri): uri is string => Boolean(uri));
   const fileAttachments = message.attachments
-    ?.filter((attachment) => attachment.type === 'file')
+    ?.filter((attachment) => attachment.type === 'file' && !attachment.artifactId)
     .map((attachment) => {
       const fileName = attachment.name?.trim();
       const uri = attachment.uri?.trim();
@@ -219,16 +256,19 @@ export function mapAdapterChatMessage(message: ChatMessage): UiMessage | null {
       };
     });
   const tool = message.tool;
+  const reportedUnsettled = tool?.statusReported && (tool.status === 'running' || tool.status === 'unknown');
 
   return {
     id: message.id,
     role: message.role,
+    turnId: validTurnIdentity(message.turnId),
     ...(message.attribution ? { attribution: normalizeMessageAttribution(message.attribution) } : {}),
     ...(message.sentLocally ? { sentLocally: true as const } : {}),
-    text: message.text,
+    text: message.role === 'system' ? localizeAgentSystemNotice(message.text, translate) : message.text,
     userSkill: message.skill,
     idempotencyKey: message.idempotencyKey,
     timestampMs: message.timestampMs,
+    ...(message.attachments?.some(attachment => attachment.artifactId) ? { artifactAttachments: message.attachments.filter(attachment => Boolean(attachment.artifactId)) } : {}),
     imageUris: imageUris && imageUris.length > 0 ? imageUris : undefined,
     fileAttachments: fileAttachments && fileAttachments.length > 0
       ? fileAttachments
@@ -237,13 +277,24 @@ export function mapAdapterChatMessage(message: ChatMessage): UiMessage | null {
     usage: mapUsage(message.usage),
     toolName: tool?.name,
     toolStatus: tool?.status,
+    ...(tool?.statusReported ? { toolStatusReported: true as const } : {}),
     toolSummary: tool?.summary,
     toolArgs: stringifyUnknown(tool?.input),
     toolDetail: stringifyUnknown(tool?.output),
-    ...(tool?.durationMs !== undefined ? { toolDurationMs: tool.durationMs } : {}),
+    // Explicit clears survive active live/history object merges after a gap.
+    ...(reportedUnsettled ? { toolDurationMs: undefined, toolFinishedAt: undefined } : {}),
+    ...(!reportedUnsettled && tool?.durationMs !== undefined ? { toolDurationMs: tool.durationMs } : {}),
     ...(tool?.startedAtMs !== undefined ? { toolStartedAt: tool.startedAtMs } : {}),
-    ...(tool?.finishedAtMs !== undefined ? { toolFinishedAt: tool.finishedAtMs } : {}),
+    ...(!reportedUnsettled && tool?.finishedAtMs !== undefined ? { toolFinishedAt: tool.finishedAtMs } : {}),
   };
+}
+
+function translateChatEvent(key: string): string {
+  switch (key) {
+    case 'Run aborted by user.': return i18n.t('Run aborted by user.', { ns: 'chat' });
+    case 'Compacting context...': return i18n.t('Compacting context...', { ns: 'chat' });
+    default: return localizeAgentSystemNotice(key, i18n.t);
+  }
 }
 
 function mapApprovalStatus(decision: string): ApprovalStatus {
@@ -297,18 +348,14 @@ export function mapAdapterSessionUpdate(
   options: MappingOptions = {},
 ): AdapterChatUpdate {
   const now = options.now ?? Date.now;
-  const translate = options.translate ?? ((key: string) => (
-    key === 'Run aborted by user.'
-      ? i18n.t('Run aborted by user.', { ns: 'chat' })
-      : i18n.t('Compacting context...', { ns: 'chat' })
-  ));
+  const translate = options.translate ?? translateChatEvent;
 
   switch (update.type) {
     case 'question_requested':
     case 'question_resolved': return update;
     case 'history_reconciled': {
       const messages = update.history.messages
-        .map(mapAdapterChatMessage)
+        .map((message) => mapAdapterChatMessage(message, translate))
         .filter((message): message is UiMessage => message !== null);
       return {
         type: update.type,
@@ -346,39 +393,52 @@ export function mapAdapterSessionUpdate(
       };
     }
     case 'agent_thought_chunk':
+    case 'agent_commentary_chunk':
       return {
         ...update,
         activeRunId: update.runId,
         isSending: true,
       };
-    case 'tool_call':
+    case 'tool_call': {
+      const startedAt = reportedClock(update.startedAtMs);
       return {
         ...update,
         message: {
           id: `toolcall_${update.toolCallId}`,
+          ...(validTurnIdentity(update.turnId) ? { turnId: update.turnId } : {}),
           role: 'tool',
           text: '',
           toolName: update.kind ?? update.title,
-          toolStatus: 'running',
+          toolStatus: update.status ?? 'running',
+          ...(update.status !== undefined ? { toolStatusReported: true as const } : {}),
           toolSummary: update.title,
           toolArgs: stringifyUnknown(update.rawInput),
-          toolStartedAt: now(),
+          ...(startedAt !== undefined ? { toolStartedAt: startedAt }
+            : update.status === undefined || update.status === 'running' ? { toolStartedAt: now() } : {}),
         },
         merge: false,
         activeRunId: update.runId,
         isSending: true,
       };
+    }
     case 'tool_call_update': {
       const timestampMs = now();
+      const settled = update.status === 'success' || update.status === 'error';
+      const startedAt = reportedClock(update.startedAtMs);
+      const durationMs = settled ? reportedDuration(update.durationMs) : undefined;
       return {
         ...update,
         message: {
           id: `toolcall_${update.toolCallId}`,
+          ...(validTurnIdentity(update.turnId) ? { turnId: update.turnId } : {}),
           role: 'tool',
           text: '',
           toolStatus: update.status,
+          toolStatusReported: true,
           toolDetail: stringifyUnknown(update.rawOutput),
-          ...(update.status === 'running' ? {} : { toolFinishedAt: timestampMs }),
+          ...(startedAt !== undefined ? { toolStartedAt: startedAt } : {}),
+          toolFinishedAt: settled ? reportedClock(update.finishedAtMs) ?? timestampMs : undefined,
+          ...(durationMs !== undefined ? { toolDurationMs: durationMs } : {}),
         },
         merge: true,
         activeRunId: update.runId,
@@ -391,29 +451,43 @@ export function mapAdapterSessionUpdate(
       const isSilent = update.message
         ? isAssistantSilentReplyMessage({ role: 'assistant', text: update.message.content })
         : false;
-      const finalMessage = update.message && !isSilent && update.message.content.trim()
+      const finalMessage = update.message && !isSilent && (update.message.content.trim() || update.message.attachments?.length)
         ? {
+            ...mapAdapterChatMessage({ id: `final_${update.runId}`, role: 'assistant', text: update.message.content, attachments: update.message.attachments }, translate),
             id: `final_${update.runId}`,
             role: 'assistant' as const,
             text: update.message.content,
-            timestampMs,
+            timestampMs: typeof update.message.timestampMs === 'number' && update.message.timestampMs > 0
+              && Number.isFinite(new Date(update.message.timestampMs).getTime()) ? update.message.timestampMs : timestampMs,
             modelLabel: modelLabel(update.message.provider, update.message.model),
             usage,
           }
         : undefined;
-      const systemMessage = update.stopReason === 'cancelled'
+      const terminal = update.stopReason === 'error' ? update.terminalMessage : undefined;
+      const failedMessage = terminal?.role === 'system'
+        && typeof terminal.id === 'string' && terminal.id.length > 0 && terminal.id.length <= 256
+        && typeof terminal.text === 'string' && terminal.text.trim().length > 0
+        ? {
+            id: terminal.id,
+            role: 'system' as const,
+            text: localizeAgentSystemNotice(terminal.text, translate),
+            timestampMs: typeof terminal.timestampMs === 'number' && Number.isFinite(terminal.timestampMs)
+              ? terminal.timestampMs : timestampMs,
+          }
+        : undefined;
+      const systemMessage = failedMessage ?? (update.stopReason === 'cancelled'
         ? {
             id: `sys_abort_${update.runId}`,
             role: 'system' as const,
-            text: translate('Run aborted by user.'),
+            text: options.cancelledRunNotice ?? translate('Run aborted by user.'),
             timestampMs,
           }
-        : undefined;
+        : undefined);
       return {
         ...update,
         activeRunId: null,
         isSending: false,
-        finalMessage,
+        finalMessage: failedMessage && update.message?.content === terminal?.text ? undefined : finalMessage,
         systemMessage,
         usage,
         rawUsage: update.usage,
@@ -438,6 +512,7 @@ export function mapAdapterSessionUpdate(
         status: mapApprovalStatus(update.decision),
         messageId: `approval_${update.approvalId}`,
       };
+    case 'session_activity_update':
     case 'session_info_update':
     case 'usage_update':
       return update;
@@ -494,7 +569,15 @@ export function useAdapterChatEvents(options: UseAdapterChatEventsOptions): void
       handlersRef.current.onSessions?.(sessions);
     });
     const offUpdate = adapter.on('update', (update) => {
-      handlersRef.current.onUpdate?.(mapAdapterSessionUpdate(update, { now: nowRef.current }));
+      // List evidence is neither chat content nor transport health confirmation.
+      if (update.type === 'session_activity_update') return;
+      handlersRef.current.onUpdate?.(mapAdapterSessionUpdate(update, {
+        now: nowRef.current,
+        cancelledRunNotice: adapter.connection.backendKind === 'codex'
+          && update.type === 'run_finished' && update.stopReason === 'cancelled'
+          ? i18n.t('Reply stopped. Commands already running may continue.', { ns: 'chat' })
+          : undefined,
+      }));
     });
 
     handlersRef.current.onState?.(adapter.state);

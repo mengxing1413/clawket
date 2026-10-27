@@ -2,6 +2,8 @@ import { createServer, type Server } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import WebSocket, { WebSocketServer } from 'ws';
 import { WEBSOCKET_FRAME_LIMIT_BYTES, isWebSocketMaxPayloadError } from '../frame-limit.js';
+import { allowsLocalWebSocketOrigin, MAX_LOCAL_BRIDGE_SOCKETS } from '../local-websocket-policy.js';
+import { sessionActivityKeys } from '../session-activity.js';
 import { CodexService, type CodexRequest } from './service.js';
 
 export class CodexServer {
@@ -9,11 +11,19 @@ export class CodexServer {
   private ws: WebSocketServer | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private clients = new Set<WebSocket>();
+  private activityClients = new Map<WebSocket, { keys: Set<string>; expires: number }>();
   private readonly service: CodexService;
   private readonly update = (value: unknown) => {
+    const isActivity = (value as { type?: string } | null)?.type === 'session_activity_update';
+    const activity = isActivity ? (value as { activity?: { key?: string } }).activity : undefined;
+    if (isActivity && typeof activity?.key !== 'string') return;
     const data = JSON.stringify({ type: 'event', event: 'codex.update', payload: value });
     if (Buffer.byteLength(data) > WEBSOCKET_FRAME_LIMIT_BYTES) return;
     for (const socket of this.clients) {
+      if (isActivity) {
+        const subscription = this.activityClients.get(socket);
+        if (!subscription || subscription.expires <= Date.now() || !subscription.keys.has(activity!.key!)) continue;
+      }
       if (socket.readyState === WebSocket.OPEN && socket.bufferedAmount < WEBSOCKET_FRAME_LIMIT_BYTES) socket.send(data);
       else socket.terminate();
     }
@@ -31,6 +41,8 @@ export class CodexServer {
     this.ws = new WebSocketServer({ noServer: true, maxPayload: WEBSOCKET_FRAME_LIMIT_BYTES });
     this.http.on('upgrade', (request, socket, head) => {
       if (request.url !== '/v1/codex/ws') { socket.destroy(); return; }
+      if (!allowsLocalWebSocketOrigin(request)) { socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); return; }
+      if (this.ws!.clients.size >= MAX_LOCAL_BRIDGE_SOCKETS) { socket.end('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n'); return; }
       this.ws!.handleUpgrade(request, socket, head, client => this.accept(client));
     });
     this.conversation.on('update', this.update);
@@ -60,7 +72,7 @@ export class CodexServer {
     let pending = 0;
     const timeout = setTimeout(() => socket.close(1008, 'authentication_required'), 10_000);
     socket.on('error', error => { if (isWebSocketMaxPayloadError(error)) this.log('codex client rejected code=frame_too_large source=ws_max_payload'); });
-    socket.on('close', () => { clearTimeout(timeout); this.clients.delete(socket); });
+    socket.on('close', () => { clearTimeout(timeout); this.clients.delete(socket); this.activityClients.delete(socket); });
     socket.on('message', raw => {
       if (++pending > 16) { socket.close(1008, 'too_many_requests'); return; }
       void (async () => {
@@ -75,7 +87,11 @@ export class CodexServer {
               socket.close(1008, 'unauthorized'); return;
             }
             clearTimeout(timeout); authenticated = true; this.clients.add(socket); this.ws!.emit('connection', socket);
-            const payload = await this.service.request({ type: 'req', id, method: 'health' });
+            // Authenticated lifecycle control must still work when the native child
+            // is unavailable. Normal phone handshakes continue to require health.
+            const payload = frame.params?.controlOnly === true
+              ? { backend: 'codex', controlReady: true }
+              : await this.service.request({ type: 'req', id, method: 'health' });
             this.send(socket, { type: 'res', id, ok: true, payload });
             return;
           }
@@ -83,6 +99,9 @@ export class CodexServer {
             socket.send(JSON.stringify({ type: 'res', id, ok: true, payload: { ok: true } }), () => this.conversation.emit('shutdown'));
             return;
           }
+          if (frame.type === 'req' && id && frame.method === 'sessions.activity') this.activityClients.set(socket, {
+            keys: new Set(sessionActivityKeys(frame.params?.keys)), expires: Date.now() + 45_000,
+          });
           const payload = await this.service.request(frame);
           if (socket.readyState === WebSocket.OPEN) this.send(socket, { type: 'res', id, ok: true, payload });
         } catch (error) {
@@ -97,7 +116,7 @@ export class CodexServer {
     this.heartbeat = null;
     this.conversation.off('update', this.update);
     for (const socket of this.ws?.clients ?? []) socket.terminate();
-    this.clients.clear();
+    this.clients.clear(); this.activityClients.clear();
     this.ws?.close(); this.ws = null;
     const server = this.http; this.http = null;
     if (server) await new Promise<void>(resolve => server.close(() => resolve()));

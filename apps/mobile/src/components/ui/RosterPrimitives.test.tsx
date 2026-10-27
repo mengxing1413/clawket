@@ -78,8 +78,12 @@ jest.mock('react-native-reanimated', () => {
     Easing: {
       ease: 'ease',
       linear: 'linear',
+      cubic: 'cubic',
       inOut: (value: unknown) => value,
+      out: (value: unknown) => value,
     },
+    FadeIn: { duration: () => 'fade-in' },
+    FadeOut: { duration: () => 'fade-out' },
     interpolateColor: jest.fn((_value: number, _input: number[], output: string[]) => output[0]),
     useAnimatedStyle: (factory: () => unknown) => factory(),
     useReducedMotion: () => mockReducedMotion,
@@ -324,28 +328,49 @@ describe.each(['light', 'dark'] as const)('%s roster primitives', (scheme) => {
     });
   });
 
-  it('replaces the header subtitle with lifting dots while the Agent works', () => {
+  it('turns an accent ring and says what the Agent is doing while it works', () => {
     const theme = activeTheme(scheme);
     const result = render(
-      <HeaderPill testID="header-pill" agentId="main" name="Main" subtitle="Thinking…" working />,
+      <HeaderPill testID="header-pill" agentId="main" name="Main" subtitle="Running a command…" presence="working" />,
     );
-    expect(result.queryByText('Thinking…')).toBeNull();
-    const dots = result.getByTestId('header-pill-working');
-    expect(dots.props.accessibilityRole).toBe('progressbar');
-    expect(result.getAllByTestId(/typing-dot-\d/)).toHaveLength(3);
-    expect(flattenStyle(result.getByTestId('typing-dot-0').props.style)).toMatchObject({
-      width: Space.xs,
-      height: Space.xs,
-      borderRadius: Radius.full,
-      backgroundColor: theme.colors.inkSecondary,
-    });
-    // No avatar badge competes with the dots.
+    // The status sentence replaces the idle subtitle, in the conversation accent.
+    expect(result.UNSAFE_getByProps({ children: 'Running a command…' }).props.style)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ color: theme.colors.accent })]));
+    const ring = result.getByTestId('header-pill-working');
+    expect(ring.props.pointerEvents).toBe('none');
+    expect(ring.findAll((node) => (node.type as unknown) === 'Path')).toHaveLength(1);
+    // No avatar badge competes with the ring.
     expect(result.queryByTestId('header-pill-avatar-working')).toBeNull();
 
+    result.rerender(<HeaderPill testID="header-pill" agentId="main" name="Main" subtitle="Waiting for your approval" presence="attention" />);
+    const attention = result.getByTestId('header-pill-attention');
+    expect(attention.findAll((node) => (node.type as unknown) === 'Path')).toHaveLength(0);
+    expect(attention.findAll((node) => (node.type as unknown) === 'Circle')[0]?.props.stroke).toBe(theme.colors.warn);
+    expect(result.queryByTestId('header-pill-working')).toBeNull();
+
     result.rerender(<HeaderPill testID="header-pill" agentId="main" name="Main" subtitle="Model · 54%" />);
-    // The subtitle is an Animated.Text host in this mock, so match it by props.
     expect(result.UNSAFE_getByProps({ children: 'Model · 54%' })).toBeTruthy();
     expect(result.queryByTestId('header-pill-working')).toBeNull();
+    expect(result.queryByTestId('header-pill-attention')).toBeNull();
+  });
+
+  it('fades a new status sentence in as it rises, and fades the ring in and out', () => {
+    const { withTiming } = jest.requireMock('react-native-reanimated') as { withTiming: jest.Mock };
+    const result = render(<HeaderPill testID="header-pill" agentId="main" name="Main" subtitle="Online" />);
+    // The sentence on screen when the header appears stays still, even after a re-render.
+    result.rerender(<HeaderPill testID="header-pill" agentId="main" name="Main" subtitle="Online" />);
+    expect(result.getByTestId('header-pill-subtitle-motion').props.entering).toBeUndefined();
+    withTiming.mockClear();
+    result.rerender(<HeaderPill testID="header-pill" agentId="main" name="Main" subtitle="Thinking…" presence="working" />);
+    expect(result.getByTestId('header-pill-subtitle').props.children).toBe('Thinking…');
+    // A+ motion: the new words enter from their first frame, 4 points low and transparent, over 200 ms.
+    const entering = result.getByTestId('header-pill-subtitle-motion').props.entering as () => { initialValues: unknown };
+    expect(entering().initialValues).toEqual({ opacity: 0, transform: [{ translateY: Motion.status.rise }] });
+    expect(withTiming).toHaveBeenCalledWith(1, expect.objectContaining({ duration: Motion.status.duration }));
+    const ringLayer = result.UNSAFE_getAllByType('AnimatedView' as unknown as React.ComponentType)
+      .find((node) => node.props.entering === 'fade-in');
+    expect(ringLayer?.props.exiting).toBe('fade-out');
+    expect(ringLayer?.findByProps({ testID: 'header-pill-working' })).toBeTruthy();
   });
 
   it('renders a borderless 84pt roster row with tokenized pressed feedback', () => {
@@ -596,27 +621,27 @@ describe('AgentAvatar states and motion', () => {
   it('renders an image avatar with initials as its fallback and preserves an explicit emoji', () => {
     const image = render(
       <AgentAvatar
-        testID="sprite-avatar"
-        agentId="sprite"
-        name="Sprite"
-        avatarUrl=" https://cdn.example.invalid/sprite.png "
+        testID="atlas-avatar"
+        agentId="atlas"
+        name="Atlas"
+        avatarUrl=" https://cdn.example.invalid/atlas.png "
       />,
     );
-    expect(image.getByTestId('sprite-avatar-image').props.source).toEqual({
-      uri: 'https://cdn.example.invalid/sprite.png',
+    expect(image.getByTestId('atlas-avatar-image').props.source).toEqual({
+      uri: 'https://cdn.example.invalid/atlas.png',
     });
-    expect(image.getByText('SP')).toBeTruthy();
+    expect(image.getByText('AT')).toBeTruthy();
 
     image.rerender(
       <AgentAvatar
-        testID="sprite-avatar"
-        agentId="sprite"
-        name="Sprite"
+        testID="atlas-avatar"
+        agentId="atlas"
+        name="Atlas"
         emoji="✨"
-        avatarUrl="https://cdn.example.invalid/sprite.png"
+        avatarUrl="https://cdn.example.invalid/atlas.png"
       />,
     );
-    expect(image.queryByTestId('sprite-avatar-image')).toBeNull();
+    expect(image.queryByTestId('atlas-avatar-image')).toBeNull();
     expect(image.getByText('✨')).toBeTruthy();
   });
 
@@ -729,8 +754,8 @@ describe('AgentAvatar states and motion', () => {
       expect(other.getByTestId('p-face')).toBeTruthy();
       other.unmount();
     }
-    // OpenClaw Agents and YouMind Sprites keep their own faces.
-    for (const platform of ['openclaw', 'youmind'] as const) {
+    // OpenClaw Agents keep their own faces.
+    for (const platform of ['openclaw'] as const) {
       const own = render(<AgentAvatar testID="own" agentId="main" name="Main" emoji="C" platform={platform} />);
       expect(own.queryByTestId('own-face')).toBeNull();
       expect(own.getByText('C')).toBeTruthy();

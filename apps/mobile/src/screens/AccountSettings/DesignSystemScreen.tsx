@@ -13,6 +13,8 @@ import type { CompanionSceneKey } from '../../brand/companion-scenes';
 
 const GALLERY_SCENES: ReadonlyArray<CompanionSceneKey> = ['peek', 'fetch', 'yarn', 'pounce', 'listen'];
 import { Bubble } from '../../components/ui/Bubble';
+import { ChatBackgroundLayer } from '../../components/chat/ChatBackgroundLayer';
+import { DEFAULT_CHAT_APPEARANCE } from '../../features/chat-appearance/defaults';
 import { AgentAvatar } from '../../components/ui/AgentAvatar';
 import { RosterRow } from '../../components/ui/RosterRow';
 import { ReplyFailureSheet } from '../../components/chat/ReplyFailureSheet';
@@ -135,8 +137,8 @@ export function DesignSystemScreen({
 
   if (pagePreview) return <OnboardingScreen onClose={() => { setPagePreview(false); setPreviewError(false); }} environment="preview"
     status={previewError ? { kind: 'error', code: 'pairing_expired' } : { kind: 'idle' }}
-    onSubmitPairing={() => setPreviewError(true)} onScanQr={() => setPreviewError(true)} onImportQr={() => setPreviewError(true)}
-    onOpenYouMind={() => setPagePreview(false)} onOpenWebsite={() => setPagePreview(false)}
+    onSubmitPairing={() => setPreviewError(true)} onScanQr={() => setPreviewError(true)}
+    onOpenWebsite={() => setPagePreview(false)}
     onErrorAction={() => setPreviewError(false)} onPastePairingCode={() => '123456'} onCopyCommand={() => {}} onCopyAgentPrompt={() => {}} />;
 
   return (
@@ -340,8 +342,12 @@ export function DesignSystemScreen({
               actionLabel={t('Details', { ns: 'chat' })} onAction={() => setReplyFailureVisible(true)} testID="design-reply-failure" />
             </FormStep>
             <FormStep number="04" title={t('Conversation')}>
-              <Bubble role="user">{t('A little more room to think.')}</Bubble>
-              <Bubble role="assistant">{t('Clear words. Calm surfaces. Familiar controls.')}</Bubble>
+              {/* Bubbles are drawn for the built-in chat wallpaper, so they sit on it here too. */}
+              <View style={styles.conversationSample}>
+                <ChatBackgroundLayer appearance={DEFAULT_CHAT_APPEARANCE} />
+                <Bubble role="user">{t('A little more room to think.')}</Bubble>
+                <Bubble role="assistant">{t('Clear words. Calm surfaces. Familiar controls.')}</Bubble>
+              </View>
             </FormStep>
             <FormStep number="05" title={t('Secondary actions')}>
 
@@ -360,6 +366,10 @@ export function DesignSystemScreen({
               variant="secondary"
               onPress={() => setSheetVisible(true)}
             />
+            {/* The same action directly on a grouped page takes the white card material, never a border. */}
+            <View testID="design-system-grouped-actions" style={[styles.groupedSample, { backgroundColor: theme.colors.canvasGrouped }]}>
+              <Button label={t('Reconnect', { ns: 'common' })} variant="card" onPress={() => setSheetVisible(true)} />
+            </View>
             </FormStep>
             <FormStep number="06" title={t('Icon actions')}>
               <Text style={[styles.secondarySample, { color: theme.colors.inkSecondary }]}>{t('Navigation · plain icons')}</Text>
@@ -425,6 +435,8 @@ const styles = StyleSheet.create({
   stack: { gap: Space.xxl },
   tokenGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: Space.sm },
   tokenCard: { width: '47%', flexGrow: 1, padding: Space.md, borderRadius: Radius.card, gap: Space.sm },
+  groupedSample: { padding: Space.md, borderRadius: Radius.card },
+  conversationSample: { padding: Space.lg, gap: Space.md, borderRadius: Radius.card, overflow: 'hidden' },
   tokenPaint: { height: ControlSize.floatingButton, borderRadius: Radius.settingsGroup },
   swatch: {
     width: IconSize.md,

@@ -1,13 +1,14 @@
-import React, { useMemo } from 'react';
-import { Pressable, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import React, { useMemo, useRef } from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { BottomSheetFlatList } from '@gorhom/bottom-sheet';
 import * as Haptics from 'expo-haptics';
 import { Check } from 'lucide-react-native';
 import { useTranslation } from 'react-i18next';
 import { Sheet } from '../ui';
+import { Button } from '../ui/Button';
 import { ListSkeleton } from '../ui/ListSkeleton';
 import { useAppTheme } from '../../theme';
-import { FontSize, FontWeight, Radius, Space } from '../../theme/tokens';
+import { FontSize, FontWeight, Space } from '../../theme/tokens';
 
 export type CommandPickerItem = {
   value: string;
@@ -40,39 +41,40 @@ export function CommandOptionPickerModal({
   onClose,
   onRetry,
   onSelectOption,
-}: Props): React.JSX.Element | null {
+}: Props): React.JSX.Element {
   const { t } = useTranslation('chat');
   const { theme } = useAppTheme();
   const styles = useMemo(() => createStyles(theme.colors), [theme]);
-
-  if (!visible) return null;
+  // Closing clears the picker at once. The sheet slides away showing what it showed, instead of
+  // unmounting mid-frame (no dismiss animation) or flashing "No options available" on the way out.
+  const shown = useRef({ title, loading, error, options });
+  if (visible) shown.current = { title, loading, error, options };
+  const view = shown.current;
 
   return (
     <Sheet
       visible={visible}
       onClose={onClose}
       closeAccessibilityLabel={t('Close', { ns: 'common' })}
-      title={title}
+      title={view.title}
       snapPoints={SNAP_POINTS}
       testID="command-option-sheet"
     >
-      {loading ? (
+      {view.loading ? (
         <ListSkeleton testID="command-option-loading" accessibilityLabel={t('Loading options...')} trailing="none" rows={4} style={styles.skeleton} />
-      ) : error ? (
+      ) : view.error ? (
         <View style={styles.stateWrap}>
-          <Text style={styles.stateText}>{error}</Text>
-          <TouchableOpacity style={styles.retryBtn} onPress={onRetry}>
-            <Text style={styles.retryText}>{t('Retry')}</Text>
-          </TouchableOpacity>
+          <Text style={styles.stateText}>{view.error}</Text>
+          <Button testID="command-option-retry" label={t('Retry')} variant="secondary" size="sm" onPress={onRetry} style={styles.retry} />
         </View>
-      ) : options.length === 0 ? (
+      ) : view.options.length === 0 ? (
         <View style={styles.stateWrap}>
           <Text style={styles.stateText}>{t('No options available')}</Text>
         </View>
       ) : (
         <BottomSheetFlatList
           testID="command-option-list"
-          data={options}
+          data={view.options}
           keyExtractor={(item: CommandPickerItem) => item.value}
           renderItem={({ item }: { item: CommandPickerItem }) => (
             <Pressable
@@ -138,19 +140,6 @@ function createStyles(colors: ReturnType<typeof useAppTheme>['theme']['colors'])
       textAlign: 'center',
       lineHeight: 20,
     },
-    retryBtn: {
-      marginTop: Space.md,
-      paddingHorizontal: 14,
-      paddingVertical: Space.sm,
-      borderRadius: Radius.full,
-      borderWidth: StyleSheet.hairlineWidth,
-      borderColor: colors.line,
-      backgroundColor: colors.surface,
-    },
-    retryText: {
-      color: colors.ink,
-      fontSize: FontSize.caption,
-      fontWeight: FontWeight.semibold,
-    },
+    retry: { marginTop: Space.md },
   });
 }

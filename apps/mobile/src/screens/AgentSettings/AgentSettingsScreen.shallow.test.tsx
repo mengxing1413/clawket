@@ -1,5 +1,5 @@
 import React from 'react';
-import { fireEvent, render, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, waitFor } from '@testing-library/react-native';
 import {
   CAPABILITY_MATRIX,
   createMockAdapter,
@@ -7,7 +7,6 @@ import {
   type ConnectionDescriptor,
 } from '@clawket/agent-protocol';
 import {
-  AgentSettingsRuntimeScreen,
   AgentSettingsScreen,
   AgentSettingsRouteLoading,
   AgentSettingsView,
@@ -15,6 +14,8 @@ import {
 } from './AgentSettingsScreen';
 
 const mockLoadSummary = jest.fn();
+
+jest.mock('@react-navigation/native', () => ({ useIsFocused: () => true }));
 
 jest.mock('../../components/ui/Sheet', () => ({ Sheet: ({ visible, children, onAfterClose }: any) => {
   const ReactRuntime = require('react');
@@ -266,6 +267,28 @@ describe('AgentSettingsView shallow states', () => {
     expect(mockLoadSummary).toHaveBeenCalledWith(adapter, agent, expect.any(Number), expect.any(Function));
   });
 
+  it('reopens from the summary this adapter last answered and refreshes it in place', async () => {
+    mockLoadSummary.mockResolvedValueOnce({ modelCount: 12 });
+    const adapter = createMockAdapter({ connection, agents: [agent], initialState: 'ready' });
+    const first = render(<AgentSettingsScreen {...viewProps()} adapter={adapter} />);
+    await waitFor(() => expect(first.getByTestId('agent-settings-stat-models-value').props.children).toBe('12'));
+    first.unmount();
+
+    let finish!: (summary: { modelCount: number }) => void;
+    mockLoadSummary.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const reopened = render(<AgentSettingsScreen {...viewProps()} adapter={adapter} />);
+    expect(reopened.getByTestId('agent-settings-stat-models-value').props.children).toBe('12');
+    expect(reopened.queryByTestId('agent-settings-stat-models-loading')).toBeNull();
+    await act(async () => { finish({ modelCount: 13 }); });
+    expect(reopened.getByTestId('agent-settings-stat-models-value').props.children).toBe('13');
+    reopened.unmount();
+
+    // Another adapter for the same connection never borrows that answer.
+    mockLoadSummary.mockImplementationOnce(() => new Promise(() => undefined));
+    const replaced = render(<AgentSettingsScreen {...viewProps()} adapter={createMockAdapter({ connection, agents: [agent], initialState: 'ready' })} />);
+    expect(replaced.queryByTestId('agent-settings-stat-models-value')).toBeNull();
+  });
+
   it('reloads the summary and the route on pull-to-refresh', async () => {
     mockLoadSummary.mockResolvedValueOnce({ modelCount: 12 }).mockResolvedValueOnce({ modelCount: 13 });
     const adapter = createMockAdapter({
@@ -310,40 +333,6 @@ describe('AgentSettingsView shallow states', () => {
 
     await waitFor(() => expect(onRefresh).toHaveBeenCalledTimes(1));
     expect(mockLoadSummary).not.toHaveBeenCalled();
-  });
-
-  it('renders the authenticated YouMind email through the route-scoped container', async () => {
-    const youmindConnection: ConnectionDescriptor = {
-      id: 'connection-youmind',
-      backendKind: 'youmind',
-      transportKind: 'https',
-      label: 'YouMind',
-      createdAt: 2,
-      isFreeSlot: true,
-    };
-    const sprite: AgentDescriptor = {
-      connectionId: youmindConnection.id,
-      agentId: 'sprite-one',
-      name: 'My Sprite',
-      isMain: true,
-      mainSessionKey: 'main',
-    };
-    const loadIdentityDetail = jest.fn(async () => 'owner@example.com');
-    const view = render(
-      <AgentSettingsRuntimeScreen
-        {...viewProps({
-          connection: youmindConnection,
-          agent: sprite,
-          capabilities: { ...CAPABILITY_MATRIX.youmind },
-        })}
-        adapter={null}
-        loadIdentityDetail={loadIdentityDetail}
-      />,
-    );
-
-    await waitFor(() => expect(view.getByText('owner@example.com')).toBeTruthy());
-    expect(loadIdentityDetail).toHaveBeenCalledWith(youmindConnection);
-    expect(view.queryByTestId('agent-settings-identity')).toBeNull();
   });
 
   it('does not expose a locked Agent to management summary calls', async () => {

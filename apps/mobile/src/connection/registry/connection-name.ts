@@ -1,3 +1,4 @@
+import type { BackendKind } from '@clawket/agent-protocol';
 import type { GatewayBackendKind, GatewayTransportKind } from '../../types';
 
 export function resolveSavedGatewayName(input: {
@@ -11,11 +12,6 @@ export function resolveSavedGatewayName(input: {
   const trimmedName = input.name.trim();
   const relayDisplayName = input.relayDisplayName?.trim();
   const hermesDisplayName = input.hermesDisplayName?.trim();
-  if (input.backendKind === 'youmind') {
-    if (trimmedName) return trimmedName;
-    const host = parseHost(input.url);
-    return host ? `YouMind (${host})` : 'YouMind';
-  }
   if (hermesDisplayName && input.backendKind === 'hermes') {
     if (!trimmedName) return hermesDisplayName;
     if (trimmedName === hermesDisplayName) return hermesDisplayName;
@@ -41,4 +37,9 @@ function parseHost(url: string): string {
   } catch {
     return '';
   }
+}
+
+/** These backends expose one device Agent whose local identity is the connection label. */
+export function connectionAgentDefaultName(backend: BackendKind | undefined): string | undefined {
+  return backend === 'codex' ? 'Codex' : backend === 'claude-code' ? 'Claude Code' : undefined;
 }

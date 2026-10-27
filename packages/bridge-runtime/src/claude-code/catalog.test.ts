@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -20,6 +20,93 @@ function row(cwd: string, index: number): SDKSessionInfo {
 }
 
 describe('Claude project and native session discovery', () => {
+  it.each([false, true])('excludes SDK rows with optional cwd absent without failing the authorized catalog (device=%s)', async device => {
+    const { project, sdk } = await fixture();
+    const unscoped = row(project, 2); delete unscoped.cwd;
+    sdk.listSessions.mockResolvedValue([row(project, 1), unscoped]);
+    const catalog = new ClaudeCatalog({ project, device }, sdk, async () => []);
+    const result = await catalog.discover();
+    expect(result).toMatchObject({ complete: true, truncated: false });
+    expect(result.sessions.map(session => session.title)).toEqual(['Task 1']);
+    expect(sdk.getSessionMessages).toHaveBeenCalledTimes(1);
+    expect(sdk.getSessionMessages).toHaveBeenCalledWith(row(project, 1).sessionId, { dir: project });
+    expect(catalog.listProjects()).toHaveLength(1);
+    expect(catalog.hasNativeEntry(unscoped.sessionId)).toBe(false);
+  });
+
+  it('continues past a full page with no eligible projects and excludes later unscoped entries', async () => {
+    const { project, other, sdk } = await fixture();
+    const unscoped = Array.from({ length: 100 }, (_, index) => { const info = row(project, index); delete info.cwd; return info; });
+    sdk.listSessions.mockResolvedValueOnce(unscoped).mockResolvedValueOnce([row(other, 100), row(project, 101)]);
+    const catalog = new ClaudeCatalog({ project, device: false }, sdk, async () => []);
+    const result = await catalog.discover();
+    expect(result).toMatchObject({ complete: true, truncated: false });
+    expect(result.sessions.map(session => session.title)).toEqual(['Task 101']);
+    expect(sdk.listSessions).toHaveBeenNthCalledWith(2, expect.objectContaining({ offset: 100, dir: await realpath(project) }));
+    expect(sdk.getSessionMessages).toHaveBeenCalledTimes(1);
+    expect(sdk.getSessionMessages).toHaveBeenCalledWith(row(project, 101).sessionId, { dir: project });
+  });
+
+  it('withdraws an unscoped native lookup instead of borrowing its former project', async () => {
+    const { project, sdk } = await fixture();
+    const catalog = new ClaudeCatalog({ project, device: true }, sdk, async () => []);
+    sdk.listSessions.mockResolvedValue([row(project, 1)]);
+    const key = (await catalog.discover()).sessions[0].key;
+    const unscoped = row(project, 1); delete unscoped.cwd;
+    sdk.listSessions.mockResolvedValue([unscoped]); sdk.getSessionMessages.mockClear();
+    expect(await catalog.discover()).toMatchObject({ complete: true, sessions: [] });
+    expect(() => catalog.native(key)).toThrow('Unknown');
+    await expect(catalog.history(key)).rejects.toThrow('Unknown');
+    expect(sdk.getSessionMessages).not.toHaveBeenCalled();
+  });
+
+  it('detects repeated identities even when one occurrence has no cwd', async () => {
+    const { project, sdk } = await fixture();
+    const unscoped = row(project, 1); delete unscoped.cwd;
+    sdk.listSessions.mockResolvedValue([row(project, 1), unscoped]);
+    const result = await new ClaudeCatalog({ project, device: true }, sdk, async () => []).discover();
+    expect(result.complete).toBe(false);
+    expect(result.sessions).toHaveLength(1);
+  });
+
+  it('retains the scan cap when every page has fresh unscoped identities', async () => {
+    const { project, sdk } = await fixture();
+    sdk.listSessions.mockImplementation(async (...args) => {
+      const { offset } = args[0] as { offset: number };
+      return Array.from({ length: 100 }, (_, index) => { const info = row(project, offset + index); delete info.cwd; return info; });
+    });
+    expect(await new ClaudeCatalog({ project, device: true }, sdk, async () => []).discover())
+      .toMatchObject({ complete: false, truncated: true, sessions: [] });
+    expect(sdk.listSessions).toHaveBeenCalledTimes(20);
+    expect(sdk.getSessionMessages).not.toHaveBeenCalled();
+  });
+
+  it.each([null, '', 'relative/project', 42])('keeps malformed present cwd incomplete (%s)', async cwd => {
+    const { project, sdk } = await fixture();
+    const catalog = new ClaudeCatalog({ project, device: true }, sdk, async () => []);
+    sdk.listSessions.mockResolvedValue([row(project, 1)]);
+    const key = (await catalog.discover()).sessions[0].key;
+    sdk.listSessions.mockResolvedValue([{ ...row(project, 1), cwd } as SDKSessionInfo]);
+    expect(await catalog.discover()).toMatchObject({ complete: false, sessions: [] });
+    await expect(catalog.history(key)).resolves.toMatchObject({ messages: [] });
+  });
+
+  it('preserves known history through incomplete scans while admitting only bounded positive same-scope entries', async () => {
+    const { project, other, sdk } = await fixture();
+    const catalog = new ClaudeCatalog({ project, device: false }, sdk, async () => []);
+    sdk.listSessions.mockResolvedValue([row(project, 1)]);
+    const first = await catalog.discover(), knownKey = first.sessions[0].key;
+    sdk.listSessions.mockResolvedValue([row(project, 2), row(other, 3), { sessionId: 'invalid' } as SDKSessionInfo]);
+    const incomplete = await catalog.discover();
+    expect(incomplete.complete).toBe(false); expect(incomplete.sessions).toHaveLength(1);
+    await expect(catalog.history(knownKey)).resolves.toMatchObject({ messages: [] });
+    await expect(catalog.history(incomplete.sessions[0].key)).resolves.toMatchObject({ messages: [] });
+    expect(sdk.getSessionMessages.mock.calls.every(call => call[1].dir !== other)).toBe(true);
+    sdk.listSessions.mockResolvedValue([]);
+    expect(await catalog.discover()).toMatchObject({ complete: true, sessions: [] });
+    await expect(catalog.history(knownKey)).rejects.toThrow('Unknown');
+    await expect(catalog.history(incomplete.sessions[0].key)).rejects.toThrow('Unknown');
+  });
   it('enforces project scope even if native discovery returns an unrelated path', async () => {
     const { project, other, sdk } = await fixture();
     sdk.listSessions.mockResolvedValue([row(project, 1), row(other, 2)]);
@@ -80,5 +167,17 @@ describe('Claude project and native session discovery', () => {
     expect((await catalog.discover()).sessions[0]).toMatchObject({ preview: 'Latest reply', lastActivityAt: Date.parse('2026-09-27T10:01:00.000Z') });
     await catalog.discover();
     expect(sdk.getSessionMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('projects native model metadata and rereads the selected conversation without a cached default', async () => {
+    const { project, sdk } = await fixture(); const info = row(project, 1);
+    sdk.listSessions.mockResolvedValue([info]);
+    sdk.getSessionMessages.mockResolvedValue([{ uuid: 'reply', type: 'assistant', message: { model: 'claude-old', content: [] } }]);
+    const catalog = new ClaudeCatalog({ project, device: false }, sdk, async () => []);
+    expect((await catalog.discover()).sessions[0].model).toBe('claude-old');
+    sdk.getSessionMessages.mockResolvedValue([{ uuid: 'new', type: 'assistant', message: { model: 'claude-new', content: [] } }]);
+    expect(await catalog.readModel(info.sessionId, project)).toBe('claude-new');
+    sdk.getSessionMessages.mockResolvedValue([{ uuid: 'synthetic', type: 'assistant', message: { model: '<synthetic>', content: [] } }]);
+    expect(await catalog.readModel(info.sessionId, project)).toBeUndefined();
   });
 });

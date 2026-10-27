@@ -2,7 +2,7 @@ import React from 'react';
 import { act, render } from '@testing-library/react-native';
 import { CompanionScene } from './CompanionScene';
 import { LoadingState, useLoadingHandoff } from '../LoadingState';
-import { Motion } from '../../../theme/tokens';
+import { FontSize, FontWeight, Motion } from '../../../theme/tokens';
 
 jest.mock('react-native', () => {
   const R = require('react');
@@ -54,6 +54,16 @@ it.each(['peek', 'fetch', 'yarn', 'pounce', 'listen'] as const)('draws the %s sc
   // The Companion is always part of the stage: its face path comes from the shared geometry.
   expect(view.UNSAFE_getAllByType('Path' as unknown as React.ComponentType).length).toBeGreaterThan(3);
   view.unmount();
+});
+
+it('sets Peek\'s desk in the page\'s card color, defaulting to the canvas surface', () => {
+  const desk = (view: ReturnType<typeof render>) => view.UNSAFE_getAllByType('Rect' as unknown as React.ComponentType)
+    .find((rect) => rect.props.width === 164)?.props.fill;
+  const plain = render(<CompanionScene scene="peek" phase="wait" testID="scene" />);
+  expect(desk(plain)).toBe('#f2f2f4');
+  plain.unmount();
+  const loader = render(<LoadingState scene="peek" surface="#FFFFFF" />);
+  expect(desk(loader)).toBe('#FFFFFF');
 });
 
 it('answers a tap with a press, a happy flavour and a light haptic, then rests', () => {
@@ -163,6 +173,27 @@ it('starts the slow-wait hint from zero when a new wait follows success', () => 
   expect(view.queryByTestId('loading-slow')).toBeNull();
   act(() => { jest.advanceTimersByTime(1); });
   expect(view.getByTestId('loading-slow')).toBeTruthy();
+});
+
+it('offers a headline label and an immediate action whose line survives the success exit', () => {
+  const onPress = jest.fn();
+  const action = { label: 'Reconnect', onPress };
+  const view = render(<LoadingState testID="loading" scene="fetch" message="Connecting" headline action={action} />);
+  expect(view.getByTestId('loading-message').props.style)
+    .toContainEqual(expect.objectContaining({ fontSize: FontSize.title, fontWeight: FontWeight.semibold }));
+  // There from the start, without a slow hint, and outside the progress group so it stays reachable.
+  expect(view.queryByTestId('loading-slow')).toBeNull();
+  expect(view.getByTestId('loading').props.children).not.toContainEqual(expect.objectContaining({ props: expect.objectContaining({ testID: 'loading-action' }) }));
+  view.getByTestId('loading-action').props.onPress();
+  expect(onPress).toHaveBeenCalledTimes(1);
+  view.rerender(<LoadingState testID="loading" scene="fetch" message="Connecting" headline action={action} phase="ready" />);
+  const exiting = view.getByTestId('loading-action');
+  expect(exiting.props.disabled).toBe(true);
+  // The nearest host element above the button is the slot that keeps the action's line.
+  let slot = exiting.parent;
+  while (slot && typeof slot.type !== 'string') slot = slot.parent;
+  expect(slot?.props.style).toContainEqual({ opacity: 0 });
+  expect(slot?.props.pointerEvents).toBe('none');
 });
 
 it('plays a fresh scene when a new wait follows a success exit', () => {

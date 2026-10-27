@@ -12,6 +12,7 @@ export type AgentSettingsSection =
   | 'connection'
   | 'openclaw'
   | 'tools'
+  | 'plugins'
   | 'channels-devices'
   | 'logs';
 
@@ -35,6 +36,7 @@ export type RootStackParamList = {
     initialBackend?: BackendKind;
     pairingUrl?: string;
   } | undefined;
+  OpenClawDirect: undefined;
   Roster: undefined;
   Thread: {
     connectionId: string;
@@ -61,6 +63,8 @@ export type RootStackParamList = {
     skillKey?: string;
     skillName?: string;
     skillFilePath?: string;
+    profileProjectId?: string;
+    profileDocument?: { id: string; name: string };
   };
   Connections: undefined;
   Connection: { connectionId: string };
@@ -82,6 +86,7 @@ export type RootStackParamList = {
 
 export const ROOT_ROUTE_NAMES = [
   'Onboarding',
+  'OpenClawDirect',
   'Roster',
   'Thread',
   'AgentSettings',

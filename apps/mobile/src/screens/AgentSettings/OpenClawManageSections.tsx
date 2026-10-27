@@ -180,7 +180,7 @@ export function ConfigurationSection({
         <Button
           testID="openclaw-configuration-edit"
           label={t('Edit', { ns: 'common' })}
-          variant="secondary"
+          variant="card"
           disabled={!online}
           onPress={gate?.locked ? () => gate.open(onEdit) : onEdit}
         />
@@ -307,7 +307,7 @@ export function PermissionsSection({
             <Button
               testID="openclaw-permissions-repair"
               label={t('Repair Now')}
-              variant="secondary"
+              variant="card"
               loading={repairing}
               disabled={!online}
               onPress={gate?.locked ? () => gate.open(onRepair) : onRepair}
@@ -364,6 +364,8 @@ export type DiagnosticsSectionProps = Readonly<{
   canRepair: boolean;
   online: boolean;
   repairing: boolean;
+  /** A re-run is reading: the report stays and Run diagnostics again spins in place. */
+  diagnosing?: boolean;
   gate?: ManageSectionGate;
   onDiagnose: () => void;
   onRepair: () => void;
@@ -375,6 +377,7 @@ export function DiagnosticsSection({
   canRepair,
   online,
   repairing,
+  diagnosing = false,
   gate,
   onDiagnose,
   onRepair,
@@ -466,8 +469,10 @@ export function DiagnosticsSection({
         <Button
           testID="openclaw-diagnostics-run"
           label={t('Run diagnostics again')}
-          variant="outline"
+          variant="card"
           multiline
+          // After Attempt Fix the re-read belongs to that button's spinner.
+          loading={diagnosing && !repairing}
           disabled={!online || repairing}
           onPress={onDiagnose}
           style={styles.buttonGrow}
@@ -477,7 +482,7 @@ export function DiagnosticsSection({
             testID="openclaw-diagnostics-repair"
             label={t('Attempt Fix')}
             loading={repairing}
-            disabled={!online}
+            disabled={!online || diagnosing}
             onPress={gate?.locked ? () => gate.open(onRepair) : onRepair}
             style={styles.buttonGrow}
           />
@@ -613,7 +618,9 @@ export function BackupsSection({
 
 export function ManageSectionLoading({ diagnostics = false }: { diagnostics?: boolean }): React.JSX.Element {
   const { t } = useTranslation(['config', 'common']);
-  return <LoadingState testID="openclaw-manage-loading"
+  const { theme } = useAppTheme();
+  // The manage page is grouped: its cards (and the cat's desk) are the floating surface.
+  return <LoadingState testID="openclaw-manage-loading" surface={theme.colors.surfaceFloating}
     message={diagnostics ? t('Diagnosing — this may take a few seconds…') : t('Loading settings')} />;
 }
 

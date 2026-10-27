@@ -2,10 +2,8 @@ import React from 'react';
 import { act, render, waitFor } from '@testing-library/react-native';
 import type { OnboardingScreenProps } from './OnboardingScreen';
 import { OnboardingRoute, type OnboardingRouteProps } from './OnboardingRoute';
-import type { YouMindOnboardingScreenProps } from './YouMindOnboardingScreen';
 
 let mockScreenProps: OnboardingScreenProps | null = null;
-let mockYouMindScreenProps: YouMindOnboardingScreenProps | null = null;
 let mockRuntime: Record<string, unknown>;
 let mockApp: {
   debugMode: boolean;
@@ -17,20 +15,13 @@ const mockCoordinator = {
   getSnapshot: jest.fn(),
   probeActive: jest.fn(async () => true),
 };
-const mockYouMindClient = {
-  sendOtp: jest.fn(),
-  verifyOtp: jest.fn(),
-  clearSession: jest.fn(),
-};
 const mockConnectBackendPairingCode: jest.Mock = jest.fn();
 const mockConnectBackendPairingLink: jest.Mock = jest.fn();
 const mockConnectBackendPairingPayload: jest.Mock = jest.fn();
-const mockCreateYouMindOnboardingConnection: jest.Mock = jest.fn();
-const mockYouMindFinish: jest.Mock = jest.fn();
-const mockYouMindDiscard: jest.Mock = jest.fn();
 const mockClipboardSetString = jest.fn(async (_value: string) => true);
 const mockClipboardGetString = jest.fn(async () => '123456');
 const mockOpenUrl = jest.fn(async (_url: string) => true);
+const mockShowNoticeAlert = jest.fn();
 
 jest.mock('./WelcomeScreen', () => ({ WelcomeScreen: () => null }));
 
@@ -54,15 +45,23 @@ jest.mock('expo-linking', () => ({
   openURL: (url: string) => mockOpenUrl(url),
 }));
 
+jest.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
+
+jest.mock('../../utils/notice-alert', () => ({
+  showNoticeAlert: (...args: unknown[]) => mockShowNoticeAlert(...args),
+}));
+
 jest.mock('../../connection', () => ({
   getConnectionRuntime: () => mockCoordinator,
   useConnections: () => mockRuntime,
   connectBackendPairingCode: (...args: unknown[]) => mockConnectBackendPairingCode(...args),
   connectBackendPairingLink: (...args: unknown[]) => mockConnectBackendPairingLink(...args),
   connectBackendPairingPayload: (...args: unknown[]) => mockConnectBackendPairingPayload(...args),
-  createYouMindOnboardingConnection: (...args: unknown[]) => (
-    mockCreateYouMindOnboardingConnection(...args)
-  ),
+  // The real resolver is covered in gateway-scan-flow tests; the route only forwards its answer.
+  resolvePairingPayloadBackend: (payload: { backendKind?: string }) => payload.backendKind ?? null,
+  resolvePairingValidationReason: jest.requireActual('../../connection/pairing/pairing-validation').resolvePairingValidationReason,
 }));
 
 jest.mock('../../contexts/AppContext', () => ({
@@ -88,17 +87,6 @@ jest.mock('./OnboardingScreen', () => {
   };
 });
 
-jest.mock('./YouMindOnboardingScreen', () => {
-  const ReactRuntime = require('react');
-  const { View } = require('react-native');
-  return {
-    YouMindOnboardingScreen: (props: YouMindOnboardingScreenProps) => {
-      mockYouMindScreenProps = props;
-      return ReactRuntime.createElement(View, { testID: 'youmind-onboarding-route-view' });
-    },
-  };
-});
-
 function createProps(overrides: Partial<OnboardingRouteProps> = {}): OnboardingRouteProps {
   return {
     navigation: {
@@ -116,7 +104,7 @@ function createProps(overrides: Partial<OnboardingRouteProps> = {}): OnboardingR
 
 function connectionSnapshot(input: {
   id?: string;
-  backendKind?: 'openclaw' | 'hermes' | 'youmind';
+  backendKind?: 'openclaw' | 'hermes';
   state?: 'idle' | 'ready' | 'offline';
 } = {}) {
   const id = input.id ?? 'connection-1';
@@ -131,11 +119,16 @@ function connectionSnapshot(input: {
 }
 
 describe('OnboardingRoute', () => {
+  it('navigates to the independent direct setup page', () => {
+    const props = createProps();
+    render(<OnboardingRoute {...props} />);
+    act(() => mockScreenProps?.onOpenCustomConnection?.());
+    expect(props.navigation.navigate).toHaveBeenCalledWith('OpenClawDirect');
+  });
   let consoleErrorSpy: jest.SpyInstance;
 
   beforeEach(() => {
     mockScreenProps = null;
-    mockYouMindScreenProps = null;
     mockRuntime = {
       initialized: true,
       connections: [],
@@ -156,10 +149,6 @@ describe('OnboardingRoute', () => {
     mockCoordinator.getSnapshot.mockReset();
     mockCoordinator.getSnapshot.mockReturnValue(connectionSnapshot({ state: 'idle' }));
     mockCoordinator.probeActive.mockClear();
-    mockYouMindClient.sendOtp.mockReset();
-    mockYouMindClient.verifyOtp.mockReset();
-    mockYouMindClient.clearSession.mockReset();
-    mockYouMindClient.clearSession.mockResolvedValue(undefined);
     mockConnectBackendPairingCode.mockReset();
     mockConnectBackendPairingCode.mockResolvedValue({
       backendKind: 'openclaw',
@@ -175,22 +164,10 @@ describe('OnboardingRoute', () => {
       backendKind: 'openclaw',
       connectionId: 'connection-1',
     });
-    mockYouMindFinish.mockReset();
-    mockYouMindFinish.mockResolvedValue({
-      backendKind: 'youmind',
-      connectionId: 'youmind-connection',
-    });
-    mockYouMindDiscard.mockReset();
-    mockYouMindDiscard.mockResolvedValue(undefined);
-    mockCreateYouMindOnboardingConnection.mockReset();
-    mockCreateYouMindOnboardingConnection.mockReturnValue({
-      client: mockYouMindClient,
-      finish: mockYouMindFinish,
-      discard: mockYouMindDiscard,
-    });
     mockClipboardSetString.mockClear();
     mockClipboardGetString.mockClear();
     mockOpenUrl.mockClear();
+    mockShowNoticeAlert.mockClear();
     consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation((message?: unknown) => {
       if (typeof message === 'string' && message.includes('react-test-renderer is deprecated')) return;
     });
@@ -455,6 +432,108 @@ describe('OnboardingRoute', () => {
     });
   });
 
+  it('keeps the fixed local validation reason when the first QR fails immediately', async () => {
+    mockConnectBackendPairingPayload.mockRejectedValueOnce({ code: 'unsupported', pairingReason: 'official_environment_mismatch', message: 'private detail' });
+    render(<OnboardingRoute {...createProps()} />);
+    act(() => mockScreenProps?.onScanQr('openclaw'));
+    await act(async () => {
+      await mockScanner.openGatewayScanner.mock.calls[0][0].onScanned({ url: '', mode: 'relay', relay: { serverUrl: 'https://registry.clawket.ai', gatewayId: 'gateway', accessCode: 'synthetic' } });
+    });
+    expect(mockScreenProps?.status).toEqual({ kind: 'error', code: 'unsupported', pairingReason: 'official_environment_mismatch' });
+  });
+
+  // A photo chosen inside the scanner returns through these same callbacks (GatewayScannerContext tests).
+  it.each([
+    ['openclaw', 'camera'], ['codex', 'camera'],
+    ['openclaw', 'header'], ['codex', 'header'],
+    ['hermes', 'header'], ['claude-code', 'header'],
+  ] as const)(
+    'uses current settings for the first %s %s scan delivered after opening', async (backendKind, method) => {
+      mockApp.debugMode = true;
+      mockConnectBackendPairingPayload.mockImplementationOnce(async (input) => {
+        const assessment = jest.requireActual('../../connection/pairing/gateway-scan-flow').assessPairingPayload({
+          payload: input.payload, expectedBackendKind: input.backendKind,
+          selectedEnvironment: input.environment, debugMode: input.debugMode,
+        });
+        if (assessment.kind === 'rejected') throw { code: 'unsupported', pairingReason: assessment.reason };
+        return null;
+      });
+      const props = createProps();
+      const view = render(<OnboardingRoute {...props} />);
+      act(() => {
+        if (method === 'header') mockScreenProps?.onScanAnyQr?.();
+        else mockScreenProps?.onScanQr(backendKind);
+      });
+      const firstCameraCallback = mockScanner.openGatewayScanner.mock.calls[0][0].onScanned;
+      // Preserve the callback already held by the native camera, across a context update.
+      mockApp.debugMode = false;
+      view.rerender(<OnboardingRoute {...props} />);
+      await act(async () => {
+        await firstCameraCallback({ backendKind, mode: backendKind === 'hermes' ? 'hermes' : 'relay', relay: { serverUrl: backendKind === 'codex' ? 'https://clawket-codex-registry.clawket.workers.dev' : 'https://registry.clawket.ai', gatewayId: 'gateway', accessCode: 'synthetic' } });
+      });
+      expect(mockConnectBackendPairingPayload).toHaveBeenCalledWith(expect.objectContaining({
+        backendKind, environment: 'production', debugMode: false,
+      }));
+      expect(mockScreenProps?.status).toEqual({ kind: 'idle' });
+    },
+  );
+
+  it('pairs a header-scanned QR with the backend the QR names', async () => {
+    const props = createProps({ route: { key: 'Onboarding-key', name: 'Onboarding', params: { presentation: 'modal' } } } as Partial<OnboardingRouteProps>);
+    render(<OnboardingRoute {...props} />);
+    expect(mockScreenProps?.initialBackend).toBeUndefined();
+    act(() => mockScreenProps?.onScanAnyQr?.());
+    const options = mockScanner.openGatewayScanner.mock.calls[0][0];
+    const qr = {
+      url: 'wss://relay.example/ws',
+      backendKind: 'codex' as const,
+      transportKind: 'relay' as const,
+      mode: 'relay' as const,
+      relay: { serverUrl: 'https://codex-registry.example', gatewayId: 'bridge-1', accessCode: 'secret' },
+    };
+    mockConnectBackendPairingPayload.mockReturnValueOnce(new Promise(() => {}));
+
+    await act(async () => {
+      void options.onScanned(qr);
+    });
+
+    expect(mockConnectBackendPairingPayload).toHaveBeenCalledWith({
+      runtime: mockCoordinator,
+      payload: qr,
+      backendKind: 'codex',
+      environment: 'production',
+      debugMode: false,
+    });
+    // The chooser moves to the scanned backend's step so its progress is visible.
+    expect(mockScreenProps?.initialBackend).toBe('codex');
+    expect(mockScreenProps?.status).toEqual({ kind: 'connecting', phase: 'relay_connected' });
+  });
+
+  it('rejects a header-scanned QR without backend identity before claiming it', async () => {
+    render(<OnboardingRoute {...createProps()} />);
+    act(() => mockScreenProps?.onScanAnyQr?.());
+    const options = mockScanner.openGatewayScanner.mock.calls[0][0];
+
+    await act(async () => {
+      await options.onScanned({ url: 'wss://unknown.example/ws' });
+    });
+
+    expect(mockShowNoticeAlert).toHaveBeenCalledWith('Invalid QR Code', 'This QR code does not contain valid connection info.');
+    expect(mockConnectBackendPairingPayload).not.toHaveBeenCalled();
+  });
+
+  it('gates the header scan behind the additional-connection paywall', () => {
+    mockRuntime = connectionSnapshot();
+    const onOpenPaywall = jest.fn();
+    render(<OnboardingRoute {...createProps({ onOpenPaywall })} />);
+    act(() => mockScreenProps?.onScanAnyQr?.());
+    expect(onOpenPaywall).toHaveBeenCalledWith('gatewayConnections', expect.any(Function));
+    expect(mockScanner.openGatewayScanner).not.toHaveBeenCalled();
+
+    act(() => onOpenPaywall.mock.calls[0]?.[1]?.());
+    expect(mockScanner.openGatewayScanner).toHaveBeenCalledTimes(1);
+  });
+
   it('resumes an additional connection flow after the host Pro gate succeeds', () => {
     mockRuntime = connectionSnapshot();
     const onOpenPaywall = jest.fn();
@@ -492,21 +571,37 @@ describe('OnboardingRoute', () => {
     ));
   });
 
-  it('routes a pasted invitation through secure link pairing without putting it in the code field', async () => {
+  it.each(['openclaw', 'hermes', 'codex', 'claude-code', 'pi'] as const)('routes a pasted invitation through the selected %s backend without putting it in the code field', async (backend) => {
     const invitation = 'https://clawket.ai/pair/example#test-fragment';
     mockClipboardGetString.mockResolvedValueOnce(` ${invitation} `);
     render(<OnboardingRoute {...createProps()} />);
     let pasted: string | null | undefined;
     await act(async () => {
-      pasted = await mockScreenProps?.onPastePairingCode?.('openclaw');
+      pasted = await mockScreenProps?.onPastePairingCode?.(backend);
     });
     expect(pasted).toBeNull();
-    expect(mockConnectBackendPairingLink).toHaveBeenCalledWith(expect.objectContaining({ url: invitation }));
+    expect(mockConnectBackendPairingLink).toHaveBeenCalledWith(expect.objectContaining({ url: invitation, backendKind: backend }));
     expect(mockConnectBackendPairingCode).not.toHaveBeenCalled();
   });
 
-  it('binds clipboard, official docs, YouMind, modal close, and retry', async () => {
-    const onOpenYouMind = jest.fn();
+  it('does not claim a pasted invitation after the form scope changes during the clipboard read', async () => {
+    let resolveClipboard!: (value: string) => void;
+    mockClipboardGetString.mockImplementationOnce(() => new Promise<string>((resolve) => { resolveClipboard = resolve; }));
+    render(<OnboardingRoute {...createProps()} />);
+    let current = true;
+    let result: string | null | undefined;
+    await act(async () => {
+      const pending = mockScreenProps?.onPastePairingCode?.('hermes', () => current);
+      current = false;
+      resolveClipboard('https://clawket.ai/pair/example#test-fragment');
+      result = await pending;
+    });
+    expect(result).toBeNull();
+    expect(mockConnectBackendPairingLink).not.toHaveBeenCalled();
+    expect(mockConnectBackendPairingCode).not.toHaveBeenCalled();
+  });
+
+  it('binds clipboard, official docs, modal close, and retry', async () => {
     const onDocsOpened = jest.fn();
     const onAgentPromptCopied = jest.fn();
     const navigation = { goBack: jest.fn(), navigate: jest.fn() };
@@ -519,7 +614,6 @@ describe('OnboardingRoute', () => {
         name: 'Onboarding',
         params: { presentation: 'modal', initialBackend: 'openclaw' },
       } as never,
-      onOpenYouMind,
       onDocsOpened,
       onAgentPromptCopied,
     });
@@ -543,18 +637,7 @@ describe('OnboardingRoute', () => {
     expect(onAgentPromptCopied).toHaveBeenCalledWith('openclaw');
     act(() => mockScreenProps?.onOpenWebsite('hermes'));
     expect(mockOpenUrl).toHaveBeenCalledWith('https://hermes-agent.nousresearch.com');
-    act(() => mockScreenProps?.onOpenWebsite('youmind'));
-    expect(mockOpenUrl).toHaveBeenCalledWith('https://youmind.com');
-    expect(onDocsOpened).toHaveBeenLastCalledWith('youmind');
-    act(() => mockScreenProps?.onOpenYouMind());
-    expect(onOpenYouMind).toHaveBeenCalledTimes(1);
-    expect(mockCreateYouMindOnboardingConnection).toHaveBeenCalledWith({
-      runtime: mockCoordinator,
-      debugMode: false,
-    });
-    expect(mockYouMindScreenProps).not.toBeNull();
-    act(() => mockYouMindScreenProps?.onBack());
-    expect(mockYouMindDiscard).toHaveBeenCalledTimes(1);
+    expect(onDocsOpened).toHaveBeenLastCalledWith('hermes');
     act(() => mockScreenProps?.onClose?.());
     expect(navigation.goBack).toHaveBeenCalledTimes(1);
     // Nothing was paired here, so retry has nothing to probe or replay.
@@ -601,29 +684,5 @@ describe('OnboardingRoute', () => {
     });
     act(() => mockScreenProps?.onRetry?.());
     expect(mockCoordinator.probeActive).toHaveBeenCalledTimes(1);
-  });
-
-  it('adds, activates, and announces a signed-in YouMind Sprite connection', async () => {
-    const onConnected = jest.fn();
-    render(<OnboardingRoute {...createProps({ onConnected })} />);
-
-    act(() => mockScreenProps?.onOpenYouMind());
-    const session = {
-      accessToken: 'access',
-      refreshToken: 'refresh',
-      expiresIn: 3600,
-      createdAtMs: 1,
-      user: { id: 'user-1', email: 'lucy@example.com' },
-    };
-    await act(async () => {
-      await mockYouMindScreenProps?.onSignedIn(session);
-    });
-
-    expect(mockYouMindFinish).toHaveBeenCalledWith(session);
-    expect(onConnected).toHaveBeenCalledWith({
-      connectionId: 'youmind-connection',
-      backendKind: 'youmind',
-    });
-    expect(mockYouMindDiscard).not.toHaveBeenCalled();
   });
 });

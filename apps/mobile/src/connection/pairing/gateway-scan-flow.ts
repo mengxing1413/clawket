@@ -16,6 +16,7 @@ import { buildRelayClaimKey } from './connection-form-utils';
 
 export type GatewayScanPayload = {
   url: string;
+  displayName?: string;
   token?: string;
   password?: string;
   bootstrap?: GatewayConfig['bootstrap'];
@@ -162,9 +163,6 @@ export async function claimRelayPairing(
   const handler = selectByBackend<RelayClaimHandler>(payload, {
     openclaw: claimOpenClawRelay,
     hermes: claimHermesRelay,
-    // Relay pairing is not a YouMind flow. Retaining the historical OpenClaw
-    // fallback keeps malformed legacy payload handling backward compatible.
-    youmind: claimOpenClawRelay,
   });
   const task = handler(payload, claimableRelay).finally(() => {
     inFlightRef.current.delete(claimKey);
@@ -179,6 +177,7 @@ async function claimOpenClawRelay(
   relay: RelayClaimInput,
 ): Promise<GatewayScanPayload> {
   const claimed = await RelayPairingService.claim({
+    backendKind: resolvePairingPayloadBackend(payload) ?? undefined,
     serverUrl: relay.serverUrl,
     gatewayId: relay.gatewayId,
     accessCode: relay.accessCode,

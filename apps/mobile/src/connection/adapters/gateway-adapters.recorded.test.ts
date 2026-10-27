@@ -16,6 +16,7 @@ import {
   mapOpenClawSession,
   OPENCLAW_BRIDGE_CAPABILITY,
   OpenClawAdapter,
+  readOpenClawSessionThinking,
   resolveOpenClawActivityAt,
 } from './openclaw';
 import { readConnectionRuntimeMetadata } from '../runtime-details';
@@ -26,6 +27,7 @@ type GatewayEventName =
   | 'seqGap'
   | 'chatRunStart'
   | 'chatDelta'
+  | 'chatCommentary'
   | 'chatTool'
   | 'chatFinal'
   | 'chatAborted'
@@ -176,6 +178,31 @@ function packet(label: string): any {
 }
 
 describe('OpenClawAdapter recorded v1 boundary', () => {
+  it.each([undefined, 'off', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const)(
+    'preserves the distinction between inherited and explicit thinking (%s)', async thinkingLevel => {
+      const fake = new RecordedGateway();
+      const adapter = new OpenClawAdapter(connection('openclaw'), { gateway: gateway(fake), historyCache: null });
+      await adapter.prompt('agent:main:main', { text: 'hello', idempotencyKey: 'thinking-test', thinkingLevel });
+      const params = fake.requests.at(-1)!.params;
+      expect(params).toEqual({
+        sessionKey: 'agent:main:main', message: 'hello', deliver: false, idempotencyKey: 'thinking-test',
+        ...(thinkingLevel !== undefined ? { thinking: thinkingLevel } : {}),
+      });
+      expect(Object.prototype.hasOwnProperty.call(params, 'thinking')).toBe(thinkingLevel !== undefined);
+    },
+  );
+
+  it.each(['/think high', 'describe this image'])('does not override inherited thinking for %s', async text => {
+    const fake = new RecordedGateway();
+    const adapter = new OpenClawAdapter(connection('openclaw'), { gateway: gateway(fake), historyCache: null });
+    const attachments = text.startsWith('/think') ? undefined : [{ type: 'image' as const, mimeType: 'image/png', content: 'cG5n' }];
+    await adapter.prompt('agent:main:main', { text, idempotencyKey: 'inherited-test', attachments });
+    expect(fake.requests).toEqual([{ method: 'chat.send', params: {
+      sessionKey: 'agent:main:main', message: text, deliver: false, idempotencyKey: 'inherited-test',
+      ...(attachments ? { attachments } : {}),
+    } }]);
+  });
+
   it.each(['main', 'daily'])('scopes the gateway main alias %s to each agent', async (alias) => {
     const fake = new RecordedGateway();
     fake.listAgents = async () => ({
@@ -208,6 +235,80 @@ describe('OpenClawAdapter recorded v1 boundary', () => {
     await adapter.management.models!.setSelection!({ scope: 'global', model: 'next', provider: 'openai' });
     expect(patchConfig).toHaveBeenCalledWith(JSON.stringify({ agents: { defaults: { model: { primary: 'openai/next' } } } }), 'version-1');
     expect(fake.requests.some(({ method }) => method === 'model.get' || method === 'model.set')).toBe(false);
+  });
+
+  it('reads the thinking levels a 2026.x Gateway reports per session and writes them with sessions.patch', async () => {
+    const fake = new RecordedGateway();
+    const levels = (...ids: string[]) => ids.map((id) => ({ id, label: id }));
+    fake.sessions = [{
+      key: 'agent:main:main', model: 'gpt-6-astra', modelProvider: 'openai',
+      // The stored level stays as written; the Gateway reports the one in effect for this model.
+      thinkingLevel: 'adaptive', effectiveThinkingLevel: 'medium', thinkingDefault: 'medium',
+      thinkingLevels: levels('off', 'low', 'medium', 'high', 'xhigh', 'max'),
+      thinkingOptions: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
+    }];
+    Object.assign(fake, { listModels: jest.fn(async () => [{ id: 'gpt-6-astra', name: 'GPT-6-Astra', provider: 'openai' }]) });
+    const adapter = new OpenClawAdapter(connection('openclaw'), { gateway: gateway(fake) });
+    // Until the Gateway has reported levels, choices keep the `/think` command path.
+    expect(adapter.management.models!.setThinkingLevel).toBeUndefined();
+    await expect(adapter.management.models!.getSelection!('agent:main:main')).resolves.toMatchObject({
+      currentModel: 'gpt-6-astra', thinkingLevel: 'medium', thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
+    });
+
+    fake.requestHandler = async (method) => (method === 'sessions.patch' ? {
+      ok: true,
+      key: 'agent:main:main',
+      resolved: {
+        modelProvider: 'anthropic', model: 'claude-fable-5', thinkingLevel: 'high',
+        // OpenClaw lists adaptive between medium and high; the sheet keeps it last and drops unknown ids.
+        thinkingLevels: levels('minimal', 'low', 'medium', 'adaptive', 'high', 'xhigh', 'max', 'turbo'),
+      },
+    } : undefined);
+    await expect(adapter.management.models!.setSelection!({
+      scope: 'session', sessionKey: 'agent:main:main', model: 'claude-fable-5', provider: 'anthropic',
+    })).resolves.toMatchObject({
+      currentModel: 'claude-fable-5', thinkingLevel: 'high',
+      thinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'adaptive'],
+    });
+    await expect(adapter.management.models!.setThinkingLevel!('agent:main:main', 'high')).resolves.toMatchObject({
+      currentModel: 'claude-fable-5', currentProvider: 'anthropic', thinkingLevel: 'high',
+    });
+    expect(fake.requests.at(-1)).toEqual({ method: 'sessions.patch', params: { key: 'agent:main:main', thinkingLevel: 'high' } });
+
+    // A result shape without the resolved model reads the session back instead of clearing it.
+    fake.requestHandler = async () => ({ ok: true, key: 'agent:main:main' });
+    await expect(adapter.management.models!.setThinkingLevel!('agent:main:main', 'low')).resolves.toMatchObject({
+      currentModel: 'gpt-6-astra', thinkingLevels: ['off', 'low', 'medium', 'high', 'xhigh', 'max'],
+    });
+  });
+
+  it('keeps older Gateway sessions on the static levels and the /think command', async () => {
+    const fake = new RecordedGateway();
+    fake.onConnect = () => fake.emit('connection', { state: 'ready' });
+    fake.sessions = [{ key: 'agent:main:main', model: 'gpt-5.6-sol', modelProvider: 'openai', thinkingLevel: 'high' }];
+    Object.assign(fake, { listModels: jest.fn(async () => []) });
+    const adapter = new OpenClawAdapter(connection('openclaw'), { gateway: gateway(fake) });
+    const selection = await adapter.management.models!.getSelection!('agent:main:main');
+    expect(selection).not.toHaveProperty('thinkingLevels');
+    expect(selection).not.toHaveProperty('thinkingLevel');
+    await adapter.listSessions();
+    expect(adapter.management.models!.setThinkingLevel).toBeUndefined();
+    expect(adapter.management.models!.listThinkingLevels!()).toEqual(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive']);
+
+    fake.sessions = [{ ...fake.sessions[0], thinkingLevels: [{ id: 'low', label: 'low' }] }];
+    await adapter.listSessions();
+    expect(adapter.management.models!.setThinkingLevel).toEqual(expect.any(Function));
+  });
+
+  it('reads the reported OpenClaw thinking levels defensively', () => {
+    expect(readOpenClawSessionThinking(null)).toEqual({});
+    expect(readOpenClawSessionThinking({ thinkingLevels: 'high' })).toEqual({});
+    expect(readOpenClawSessionThinking({ thinkingLevels: [{ id: 'turbo' }], thinkingLevel: 'high' })).toEqual({});
+    // Older rows carry labels only.
+    expect(readOpenClawSessionThinking({ thinkingOptions: ['High', 'low'], thinkingDefault: 'LOW' }))
+      .toEqual({ thinkingLevels: ['low', 'high'], thinkingLevel: 'low' });
+    expect(readOpenClawSessionThinking({ thinkingLevels: [{ id: 'medium' }], effectiveThinkingLevel: 'unknown' }))
+      .toEqual({ thinkingLevels: ['medium'] });
   });
 
   it('reads and writes OpenClaw channel routing through versioned config', async () => {
@@ -395,6 +496,7 @@ describe('OpenClawAdapter recorded v1 boundary', () => {
     const recordedChat = openClawFixture.frames.find((frame) => frame.sequence === 20)?.payload as any;
     await expect(adapter.prompt('agent:main:main', {
       text: recordedChat.params.message,
+      thinkingLevel: recordedChat.params.thinking,
       idempotencyKey: recordedChat.params.idempotencyKey,
     })).resolves.toEqual({ runId: 'compat-run-1' });
     expect(fake.requests.at(-1)).toEqual({
@@ -409,6 +511,12 @@ describe('OpenClawAdapter recorded v1 boundary', () => {
       sessionKey: 'agent:main:main',
       text: 'recorded delta',
     });
+    fake.emit('chatCommentary', {
+      runId: 'compat-run-1',
+      sessionKey: 'agent:main:main',
+      itemId: 'msg_1',
+      text: 'Checking the folder.',
+    });
     fake.emit('chatFinal', {
       runId: 'compat-run-1',
       sessionKey: 'agent:main:main',
@@ -416,6 +524,7 @@ describe('OpenClawAdapter recorded v1 boundary', () => {
     });
     expect(updates).toEqual([
       expect.objectContaining({ type: 'agent_message_chunk', text: 'recorded delta' }),
+      { type: 'agent_commentary_chunk', runId: 'compat-run-1', sessionKey: 'agent:main:main', itemId: 'msg_1', text: 'Checking the folder.' },
       expect.objectContaining({ type: 'run_finished', stopReason: 'end_turn' }),
     ]);
   });
@@ -479,6 +588,28 @@ describe('OpenClawAdapter recorded v1 boundary', () => {
       bridgeVersion: '3.0.0',
       bridgeCapabilities: [OPENCLAW_BRIDGE_CAPABILITY],
     });
+  });
+
+  it('offers phone-started Bridge update only from the Relay Bridge handshake', async () => {
+    const status = { id: '5b0c7a0e-3c1f-4e8e-9b2a-6f1d2c3b4a59', state: 'checking', startedAt: 1 };
+    const fake = new RecordedGateway() as RecordedGateway & { requestBridgeUpdate: jest.Mock; requestBridgeUpdateStatus: jest.Mock };
+    fake.requestBridgeUpdate = jest.fn(async () => ({ accepted: true, status }));
+    fake.requestBridgeUpdateStatus = jest.fn(async () => ({ status }));
+    fake.connectResponseCapabilities = [OPENCLAW_BRIDGE_CAPABILITY, 'bridge.remote-update.v1'];
+    fake.onConnect = () => fake.emit('connection', { state: 'ready' });
+    const adapter = new OpenClawAdapter(connection('openclaw', 'remote-update'), { gateway: gateway(fake) });
+    expect(adapter.bridgeUpdate).toBeUndefined();
+    await adapter.connect();
+    expect(adapter.capabilities.bridgeRemoteUpdate).toBe(true);
+    await expect(adapter.bridgeUpdate!.start()).resolves.toEqual({ accepted: true, status });
+    await expect(adapter.bridgeUpdate!.status()).resolves.toEqual(status);
+    expect(fake.requestBridgeUpdate).toHaveBeenCalledWith();
+    expect(fake.requests).toEqual([]);
+    fake.connectResponseCapabilities = [OPENCLAW_BRIDGE_CAPABILITY];
+    fake.emit('connection', { state: 'reconnecting' });
+    fake.emit('connection', { state: 'ready' });
+    expect(adapter.capabilities.bridgeRemoteUpdate).toBe(false);
+    expect(adapter.bridgeUpdate).toBeUndefined();
   });
 
   it('never aliases an OpenClaw Gateway version to a missing Bridge version', () => {
@@ -625,6 +756,23 @@ describe('HermesAdapter recorded M3 boundary', () => {
       runId: 'recorded-run-id',
       stopReason: 'cancelled',
     });
+  });
+
+  it('negotiates phone-started Bridge update from the Hermes health capabilities', async () => {
+    const status = { id: '5b0c7a0e-3c1f-4e8e-9b2a-6f1d2c3b4a59', state: 'checking', startedAt: 1 };
+    const fake = new RecordedGateway();
+    fake.onConnect = () => fake.emit('connection', { state: 'ready' });
+    fake.requestHandler = method => method === 'bridge.update.start' ? { accepted: true, status } : { ok: true };
+    const adapter = new HermesAdapter(connection('hermes', 'remote-update'), { gateway: gateway(fake) });
+    const connecting = adapter.connect();
+    fake.emit('health', { status: 'ok', hermesApiReachable: true, capabilities: ['bridge.capabilities.v2', 'hermes.multi-session.v2', 'bridge.remote-update.v1'] });
+    await connecting;
+    expect(adapter.capabilities.bridgeRemoteUpdate).toBe(true);
+    await expect(adapter.bridgeUpdate!.start()).resolves.toEqual({ accepted: true, status });
+    expect(fake.requests).toEqual([{ method: 'bridge.update.start', params: {} }]);
+    fake.emit('health', { status: 'ok', hermesApiReachable: true, capabilities: ['bridge.capabilities.v2', 'hermes.multi-session.v2'] });
+    expect(adapter.capabilities.bridgeRemoteUpdate).toBe(false);
+    expect(adapter.bridgeUpdate).toBeUndefined();
   });
 
   it('downgrades an old Bridge to one read-only main session', async () => {

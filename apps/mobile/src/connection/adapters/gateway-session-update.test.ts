@@ -22,6 +22,17 @@ describe('mapGatewayAdapterEvent', () => {
     }]);
 
     expect(mapGatewayAdapterEvent({
+      type: 'chatCommentary',
+      payload: { runId: 'run-1', sessionKey: 'agent:main:main', itemId: 'msg_1', text: 'Checking the folder.' },
+    }, 'fallback')).toEqual([{
+      type: 'agent_commentary_chunk',
+      runId: 'run-1',
+      sessionKey: 'agent:main:main',
+      itemId: 'msg_1',
+      text: 'Checking the folder.',
+    }]);
+
+    expect(mapGatewayAdapterEvent({
       type: 'chatFinal',
       payload: {
         runId: 'run-1',
@@ -170,7 +181,7 @@ describe('mapGatewayErrorCode', () => {
     ['rate_limited', 'rate_limited'],
     ['4008 Policy violation', 'rate_limited'],
     ['auth_failed', 'unauthorized'],
-    ['challenge_timeout', 'bridge_offline'],
+    ['challenge_timeout', 'timeout'],
     ['request_timeout', 'timeout'],
     ['BRIDGE_UNAVAILABLE', 'bridge_offline'],
     ['ws_error', 'network'],

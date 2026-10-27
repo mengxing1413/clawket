@@ -48,10 +48,19 @@ import {
   type GatewayAdapterEvent,
 } from './gateway-session-update';
 import type { ConnectionAdapterRuntimeMetadata } from '../runtime-details';
+import { BRIDGE_REMOTE_UPDATE_CAPABILITY, type BridgeUpdateOperations } from '@clawket/agent-protocol';
+import { bridgeUpdateOperations } from './bridge-update';
 
 export const HERMES_MULTI_SESSION_CAPABILITY = 'hermes.multi-session.v2';
 
 export class HermesAdapter extends GatewayAdapterBase {
+  private readonly artifactOperations: import('@clawket/agent-protocol').ArtifactOperations = {
+    open: (sessionKey, artifactId) => this.invoke(() => this.gateway.request('clawket.artifacts.open', { sessionKey, artifactId })),
+    read: (sessionKey, id, offset) => this.invoke(() => this.gateway.request('clawket.artifacts.read', { sessionKey, id, offset })),
+  };
+  public get artifacts(): import('@clawket/agent-protocol').ArtifactOperations | undefined {
+    return this.state === 'ready' && this.bridgeCapabilities.includes('bridge.artifacts.v1') ? this.artifactOperations : undefined;
+  }
   public get sessionFiles(): SessionFilesOperations | undefined {
     if (!this.capabilities.sessionFiles) return undefined;
     return {
@@ -62,6 +71,7 @@ export class HermesAdapter extends GatewayAdapterBase {
   public readonly management: ManagementOperations;
 
   private healthObserved = false;
+  private healthRevision = 0;
   private bridgeName: string | undefined;
   private bridgeVersion: string | undefined;
   private bridgeCapabilities: ReadonlyArray<string> = Object.freeze([]);
@@ -76,7 +86,7 @@ export class HermesAdapter extends GatewayAdapterBase {
       fallbackSessionKey: 'main',
       options,
     });
-    this.currentCapabilities = resolveCapabilities('hermes', { sessionFiles: false, steer: false, execApproval: false, documentAttachments: false, modelHealth: false, cronModel: false });
+    this.currentCapabilities = resolveCapabilities('hermes', { sessionFiles: false, steer: false, execApproval: false, documentAttachments: false, modelHealth: false, cronModel: false, bridgeRemoteUpdate: false });
     this.management = this.createManagementOperations();
   }
 
@@ -87,12 +97,13 @@ export class HermesAdapter extends GatewayAdapterBase {
   }
 
   public override disconnect(): void {
+    this.healthRevision += 1;
     this.healthObserved = false;
     this.bridgeVersion = undefined;
     this.bridgeCapabilities = Object.freeze([]);
     this.commandRuns.clear();
     super.disconnect();
-    this.currentCapabilities = resolveCapabilities('hermes', { sessionFiles: false, steer: false, execApproval: false, documentAttachments: false, modelHealth: false, cronModel: false });
+    this.currentCapabilities = resolveCapabilities('hermes', { sessionFiles: false, steer: false, execApproval: false, documentAttachments: false, modelHealth: false, cronModel: false, bridgeRemoteUpdate: false });
   }
 
   public override getConnectionRuntimeMetadata(): ConnectionAdapterRuntimeMetadata {
@@ -107,7 +118,9 @@ export class HermesAdapter extends GatewayAdapterBase {
   }
 
   public override async probe(timeoutMs?: number): Promise<boolean> {
+    const revision = this.healthRevision;
     const healthy = await super.probe(timeoutMs);
+    if (!healthy && this.healthRevision === revision) this.healthObserved = false;
     if (healthy && this.healthObserved) this.confirmHealthReady();
     return healthy && this.healthObserved;
   }
@@ -196,11 +209,17 @@ export class HermesAdapter extends GatewayAdapterBase {
     void this.refreshSessionsAfterMutation();
   }
 
+  private readonly remoteUpdateOperations = bridgeUpdateOperations(method => this.invoke(() => this.gateway.request(method, {})));
+  public get bridgeUpdate(): BridgeUpdateOperations | undefined {
+    return this.state === 'ready' && this.capabilities.bridgeRemoteUpdate ? this.remoteUpdateOperations : undefined;
+  }
+
   protected override requiresHealthEvidence(): boolean {
     return true;
   }
 
   protected override handleGatewayHealth(payload: GatewayEvents['health']): void {
+    this.healthRevision += 1;
     this.bridgeVersion = readString(payload.bridgeVersion);
     const capabilities = Array.isArray(payload.capabilities)
       ? payload.capabilities.filter((value): value is string => typeof value === 'string')
@@ -214,6 +233,7 @@ export class HermesAdapter extends GatewayAdapterBase {
       execApproval: capabilities.includes('hermes.run-approval.v1'),
       modelHealth: capabilities.includes('hermes.model-health.v1'),
       cronModel: capabilities.includes('hermes.cron-model.v1'),
+      bridgeRemoteUpdate: capabilities.includes(BRIDGE_REMOTE_UPDATE_CAPABILITY),
       ...(!supportsMultiSession ? {
           sessions: false,
           sessionCreate: false,
@@ -241,6 +261,7 @@ export class HermesAdapter extends GatewayAdapterBase {
 
   protected override handleGatewayConnectionTransition(state: LegacyConnectionState): void {
     if (state === 'connecting' || state === 'reconnecting' || state === 'closed') {
+      this.healthRevision += 1;
       this.healthObserved = false;
       this.bridgeVersion = undefined;
       this.bridgeCapabilities = Object.freeze([]);

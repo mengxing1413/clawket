@@ -8,7 +8,7 @@ import { loadBridgeCliEnv } from "../../apps/bridge-cli/scripts/load-env.mjs";
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(scriptDir, "..", "..");
 const bridgePkgPath = path.join(rootDir, "apps", "bridge-cli", "package.json");
-const REQUIRED_CLI_VERSION = "3.1.2";
+const REQUIRED_CLI_VERSION = "3.1.17";
 
 function runOrThrow(command, args, cwd = rootDir, spawn = spawnSync) {
   const result = spawn(command, args, {
@@ -51,7 +51,6 @@ export async function preparePublish({
   runCompatibilityGate({ spawn, cwd });
 
   const registryUrl = readRequiredEnv("CLAWKET_PACKAGE_DEFAULT_REGISTRY_URL", env);
-  const fallbackUrl = readRequiredEnv("CLAWKET_PACKAGE_DEFAULT_REGISTRY_FALLBACK_URL", env);
   const originalText = await readText(packagePath, "utf8");
   const pkg = JSON.parse(originalText);
   if (pkg.version !== REQUIRED_CLI_VERSION) {
@@ -62,7 +61,6 @@ export async function preparePublish({
 
   stdout.write(`\nPublishing @p697/clawket version: ${pkg.version}\n`);
   stdout.write(`Publishing default registry: ${registryUrl}\n`);
-  stdout.write(`Publishing fallback registry: ${fallbackUrl}\n`);
   stdout.write("Running publish safety checks (build + verify + dry-run)...\n\n");
 
   runOrThrow(

@@ -17,6 +17,8 @@ export const FontSize = {
   body: 17,
   secondary: 15,
   caption: 13,
+  /** Clock and delivery glyphs inside a chat bubble: one step under the caption so they recede. */
+  meta: 12,
 } as const;
 
 export const LineHeight = {
@@ -28,6 +30,7 @@ export const LineHeight = {
   body: 24,
   secondary: 20,
   caption: 18,
+  meta: 16,
 } as const;
 
 export const FontWeight = {
@@ -37,7 +40,11 @@ export const FontWeight = {
 
 // ─── Border Radius ───
 export const Radius = {
-  bubble: 20,
+  bubble: 18,
+  /** The corner where two bubbles from one speaker meet (Telegram-style grouping). */
+  bubbleJoined: 6,
+  /** The corner a bubble tail grows from: the tail continues that edge. */
+  bubbleTail: 0,
   card: 16,
   settingsGroup: 14,
   avatarRoster: 18,
@@ -120,6 +127,17 @@ export const Shadow = {
     shadowOpacity: 0.04,
     shadowRadius: 5,
     elevation: 2,
+  },
+  /**
+   * `floating` drawn outside the view only (a box shadow; both platforms clip it
+   * to the outside). Android draws `elevation` beneath the whole outline, so a
+   * see-through surface shows it through. Sized after Android's elevation-2
+   * shadow as measured on device (owner report 2026-10-01).
+   */
+  floatingOutside: {
+    boxShadow: '0px 2px 8px 0px rgba(17, 17, 19, 0.16), 0px 0px 2px 0px rgba(17, 17, 19, 0.06)',
+    elevation: 0,
+    shadowOpacity: 0,
   },
   xs: {
     shadowColor: '#071218',
@@ -243,7 +261,7 @@ export const Motion = {
   companionGaze: 1_200,
   companionBlinkPause: 3_200,
   companionCuriosity: 9_600,
-  /** LoadingState stays invisible this long, so waits that end quickly never flash the Companion. */
+  /** LoadingState and a background SheetHeaderSpinner stay invisible this long, so quick waits never flash. */
   loadingGrace: 400,
   /** A wait longer than this explains itself and offers the connection page. */
   loadingSlowHint: 6_000,
@@ -254,4 +272,26 @@ export const Motion = {
   avatarDoneFade: 3_000,
   /** Dictation waveform: one soft listening pulse leaves the centre per period while the room is quiet. */
   voiceRipple: 2_600,
+  /**
+   * Conversation motion (A+ chat design, owner-approved prototype 2026-09-30).
+   * `send`: the user's bubble flies from the composer along an arc, its X and
+   * Y on separate curves (Telegram's send transition), growing from
+   * `startScale` and `startOpacity`. `morph`: send / stop / mic replace one
+   * another in the composer slot. `step`: a live pill's new step slides in.
+   * `status`: the header's status sentence fades in and rises `statusRise`.
+   * `wallpaper`: the built-in wallpaper's gradient drifts one step per send.
+   */
+  send: {
+    duration: 300,
+    offsetX: 118,
+    offsetY: 148,
+    startScale: 0.94,
+    startOpacity: 0.35,
+    curveX: [0.23, 1, 0.32, 1],
+    curveY: [0.199, 0.011, 0.279, 0.91],
+  },
+  morph: { duration: 150, startScale: 0.6 },
+  step: { duration: 160, rise: 6 },
+  status: { duration: 200, rise: 4 },
+  wallpaper: { duration: 600, curve: [0.2, 0.01, 0.28, 0.91] },
 } as const;

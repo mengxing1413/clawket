@@ -1,4 +1,6 @@
+import { validTurnIdentity } from '../chat/turnIdentity';
 import { normalizeMessageAttribution } from '../chat/messageAttribution';
+import { isTranscriptBoundaryNotice } from '../chat/agentSystemNotice';
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { UiMessage } from "../types/chat";
 import { sanitizeSilentPreviewText, shouldHideMessage } from "../utils/chat-message";
@@ -11,6 +13,7 @@ import { sanitizeSilentPreviewText, shouldHideMessage } from "../utils/chat-mess
 export type CachedMessage = {
   id: string;
   historyMessageId?: string;
+  turnId?: string;
   role: "user" | "assistant" | "system" | "tool";
   text: string;
   attribution?: UiMessage["attribution"];
@@ -20,6 +23,7 @@ export type CachedMessage = {
   timestampMs?: number;
   imageUris?: string[];
   imageMetas?: UiMessage["imageMetas"];
+  artifactAttachments?: UiMessage["artifactAttachments"];
   fileAttachments?: UiMessage["fileAttachments"];
   modelLabel?: string;
   usage?: UiMessage["usage"];
@@ -110,12 +114,15 @@ function makeStorageKey(
 }
 
 function isCacheableMessage(
-  message: Pick<UiMessage, "role"> | Pick<CachedMessage, "role">,
+  message: Pick<UiMessage, "role" | "text"> | Pick<CachedMessage, "role" | "text">,
 ): boolean {
   return (
     message.role === "user" ||
     message.role === "assistant" ||
-    message.role === "tool"
+    message.role === "tool" ||
+    // A transcript boundary paints with the messages on entry instead of
+    // arriving with network history and pushing the rows below it.
+    isTranscriptBoundaryNotice(message)
   );
 }
 
@@ -133,7 +140,7 @@ function sanitizeCachedMessages(messages: unknown[]): CachedMessage[] {
   return messages
     .filter(isStoredCachedMessage)
     .filter(isCacheableMessage)
-    .map(message => ({ ...message, attribution: normalizeMessageAttribution(message.attribution), sentLocally: message.sentLocally === true ? true as const : undefined }))
+    .map(message => ({ ...message, turnId: validTurnIdentity(message.turnId), attribution: normalizeMessageAttribution(message.attribution), sentLocally: message.sentLocally === true ? true as const : undefined }))
     .filter((message) => !shouldHideMessage(message));
 }
 
@@ -146,11 +153,13 @@ function toSlim(msg: UiMessage): CachedMessage {
   if (msg.attribution) slim.attribution = normalizeMessageAttribution(msg.attribution);
   if (msg.sentLocally) slim.sentLocally = true;
   if (msg.sendUncertain) slim.sendUncertain = true;
+  if (validTurnIdentity(msg.turnId)) slim.turnId = msg.turnId;
   if (msg.historyMessageId) slim.historyMessageId = msg.historyMessageId;
   if (msg.idempotencyKey) slim.idempotencyKey = msg.idempotencyKey;
   if (msg.timestampMs) slim.timestampMs = msg.timestampMs;
   if (msg.imageUris?.length) slim.imageUris = msg.imageUris;
   if (msg.imageMetas?.length) slim.imageMetas = msg.imageMetas;
+  if (msg.artifactAttachments?.length) slim.artifactAttachments = msg.artifactAttachments.map(({ type, mimeType, name, artifactId }) => ({ type, mimeType, name, artifactId }));
   if (msg.fileAttachments?.length) slim.fileAttachments = msg.fileAttachments;
   if (msg.modelLabel) slim.modelLabel = msg.modelLabel;
   if (msg.usage) slim.usage = msg.usage;
@@ -183,14 +192,16 @@ function buildMetaFromMessages(
   const timestamps = messages
     .map((message) => message.timestampMs)
     .filter((value): value is number => typeof value === "number" && value > 0);
+  // A boundary notice is not what the session last said.
+  const lastMessage = messages.findLast((message) => message.role !== "system");
 
   return {
     ...meta,
     messageCount: messages.length,
     firstMessageMs: timestamps.length > 0 ? Math.min(...timestamps) : undefined,
     lastMessageMs: timestamps.length > 0 ? Math.max(...timestamps) : undefined,
-    lastMessagePreview: buildPreview(messages[messages.length - 1]),
-    lastModelLabel: messages[messages.length - 1]?.modelLabel,
+    lastMessagePreview: buildPreview(lastMessage),
+    lastModelLabel: lastMessage?.modelLabel,
   };
 }
 
@@ -599,10 +610,10 @@ export const ChatCacheService = {
           params.sessionKey,
           stableSessionId,
         );
-        // Only cache user + assistant + tool messages (skip system noise)
+        // Cache user, assistant and tool messages and transcript boundaries; skip other system noise.
         const cacheable = messages
           .filter(isCacheableMessage)
-          .map(message => ({ ...message, attribution: normalizeMessageAttribution(message.attribution), sentLocally: message.sentLocally === true ? true as const : undefined }))
+          .map(message => ({ ...message, turnId: validTurnIdentity(message.turnId), attribution: normalizeMessageAttribution(message.attribution), sentLocally: message.sentLocally === true ? true as const : undefined }))
           .filter((message) => !shouldHideMessage(message))
           .map(toSlim);
 
@@ -903,11 +914,13 @@ export const ChatCacheService = {
 
       for (const meta of filtered) {
         const messages = messagesByKey.get(meta.storageKey) ?? [];
+        // Boundary notices are cached for display, not as searchable messages.
         const matches = messages.filter(
           (m) =>
-            m.text.toLowerCase().includes(lowerQuery) ||
-            (m.toolName && m.toolName.toLowerCase().includes(lowerQuery)) ||
-            (m.toolSummary && m.toolSummary.toLowerCase().includes(lowerQuery)),
+            m.role !== "system" && (
+              m.text.toLowerCase().includes(lowerQuery) ||
+              (m.toolName && m.toolName.toLowerCase().includes(lowerQuery)) ||
+              (m.toolSummary && m.toolSummary.toLowerCase().includes(lowerQuery))),
         );
         if (matches.length > 0) {
           results.push({ meta, matches });

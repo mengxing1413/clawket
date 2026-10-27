@@ -136,6 +136,21 @@ it('preserves native model priority for catalog, selection and settings replies'
   }
 });
 
+it('waits for a cold native model read beyond 20 seconds, with a bounded 60-second deadline', async () => {
+  const connected = adapter.connect(); sockets[0].open(); sockets[0].reply(); await connected;
+  let settled = false;
+  const read = adapter.management.models!.getSelection!('cold').then(value => { settled = true; return value; });
+  const request = JSON.parse(sockets[0].sent.at(-1)!);
+  await jest.advanceTimersByTimeAsync(30_001);
+  expect(settled).toBe(false);
+  sockets[0].onmessage?.({ data: JSON.stringify({ type: 'res', id: request.id, ok: true, payload: { currentModel: 'haiku', models: [] } }) });
+  expect((await read).currentModel).toBe('haiku');
+  sockets[0].onmessage?.({ data: JSON.stringify({ type: 'tick', ts: Date.now(), ack: 'relay.client-pong.v1' }) });
+  const stalled = adapter.management.models!.getSelection!('cold').catch(error => error);
+  await jest.advanceTimersByTimeAsync(60_000);
+  expect((await stalled).code).toBe('timeout');
+});
+
 it('does not advertise unsupported steer, thinking controls, or skill management', () => {
   expect(adapter.capabilities).toMatchObject({ steer: false, thinkingLevels: false, skills: false, sessionBranch: true });
   expect(adapter.management.models?.setThinkingLevel).toBeUndefined();
@@ -149,4 +164,23 @@ it('restores pending native approvals with the session envelope required by the 
   sockets[0].onmessage?.({ data: JSON.stringify({ type: 'res', id: request.id, ok: true, payload: [approval] }) });
   expect(request.params.sessionKey).toBe('restored-session');
   expect(await result).toEqual([{ sessionKey: 'restored-session', approval }]);
+});
+
+it('uses the latest local connection name even when an Agent reply was already in flight', async () => {
+  const connected = adapter.connect(); sockets[0].open(); sockets[0].reply(); await connected;
+  const pending = adapter.listAgents();
+  adapter.connection.label = 'Work laptop';
+  const request = JSON.parse(sockets[0].sent.at(-1)!);
+  sockets[0].onmessage?.({ data: JSON.stringify({ type: 'res', id: request.id, ok: true,
+    payload: [{ agentId: 'main', name: 'Fixed backend name', isMain: true, mainSessionKey: '' }] }) });
+  expect(await pending).toEqual([expect.objectContaining({ connectionId: record.id, name: 'Work laptop' })]);
+  expect(adapter.state).toBe('ready');
+});
+
+it('reports authenticated Bridge-version evidence and replaces it after reconnecting', async () => {
+  const first = adapter.connect(); sockets[0].open();
+  const reply = (socket: Socket, bridgeVersion?: string) => { const request = JSON.parse(socket.sent.at(-1)!); socket.onmessage?.({ data: JSON.stringify({ type: 'res', id: request.id, ok: true, payload: { backend: 'claude-code', model: 'test', vision: false, bridgeVersion } }) }); };
+  reply(sockets[0], '3.1.10'); await first; expect(adapter.getConnectionRuntimeMetadata().bridgeVersion).toBe('3.1.10');
+  adapter.disconnect(); const next = adapter.connect(); sockets.at(-1)!.open(); expect(adapter.getConnectionRuntimeMetadata().bridgeVersion).toBeUndefined();
+  reply(sockets.at(-1)!, '3.1.11'); await next; expect(adapter.getConnectionRuntimeMetadata().bridgeVersion).toBe('3.1.11');
 });

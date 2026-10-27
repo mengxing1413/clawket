@@ -1,4 +1,5 @@
 export * from './adapter';
+export * from './bridge-update';
 export * from './capabilities';
 export * from './descriptors';
 export * from './errors';
@@ -6,3 +7,5 @@ export * from './legacy-gateway';
 export * from './management';
 export * from './mock';
 export * from './session-files';
+export * from './session-catalog';
+export * from './profile';

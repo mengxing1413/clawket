@@ -1,4 +1,5 @@
 import React from 'react';
+import { View } from 'react-native';
 import { act, fireEvent, render } from '@testing-library/react-native';
 import type {
   AgentDescriptor,
@@ -17,8 +18,11 @@ import {
   Space,
 } from '../../theme/tokens';
 import { PRO_ENTRY_HEIGHT } from '../../components/ui/ProEntryButton';
+import { WorkspaceContext } from '../../navigation/workspace-context';
 import {
   RosterScreen,
+  RosterController,
+  RosterView,
   type RosterScreenProps,
 } from './RosterScreen';
 
@@ -60,6 +64,9 @@ const darkColors = {
   bad: '#E06060',
   badSoft: '#3B2224',
 };
+
+let mockDeferSheetClose = false;
+const mockPendingSheetCloses: Array<() => void> = [];
 
 let mockTheme = { scheme: 'light' as 'light' | 'dark', colors: lightColors };
 let mockConnections: ConnectionRuntimeSnapshot;
@@ -119,6 +126,7 @@ jest.mock('react-native', () => {
     );
   };
   return {
+    ActivityIndicator: host('ActivityIndicator'),
     FlatList,
     ScrollView: host('ScrollView'),
     Image: host('Image'),
@@ -187,8 +195,9 @@ jest.mock('lucide-react-native', () => {
   return new Proxy({}, { get: () => icon });
 });
 
+let mockRightInset = 0;
 jest.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 24, bottom: 16, left: 0, right: 0 }),
+  useSafeAreaInsets: () => ({ top: 24, bottom: 16, left: 0, right: mockRightInset }),
 }));
 
 jest.mock('react-i18next', () => ({
@@ -220,7 +229,10 @@ jest.mock('../../components/ui/Sheet', () => {
     Sheet: ({ visible, children, testID, onAfterClose }: Record<string, unknown>) => {
       const wasVisible = ReactRuntime.useRef(false);
       ReactRuntime.useEffect(() => {
-        if (!visible && wasVisible.current) (onAfterClose as (() => void) | undefined)?.();
+        if (!visible && wasVisible.current && onAfterClose) {
+          if (mockDeferSheetClose) mockPendingSheetCloses.push(onAfterClose as () => void);
+          else (onAfterClose as () => void)();
+        }
         wasVisible.current = visible;
       }, [visible, onAfterClose]);
       return visible ? ReactRuntime.createElement('View', { testID }, children) : null;
@@ -410,6 +422,9 @@ describe('RosterScreen', () => {
   });
 
   beforeEach(() => {
+    mockRightInset = 0;
+    mockDeferSheetClose = false;
+    mockPendingSheetCloses.length = 0;
     mockTheme = { scheme: 'light', colors: lightColors };
     mockCommonTranslations = {};
     mockRoster = [group('live', 'live', [agent('live', 'main'), agent('live', 'builder')])];
@@ -628,42 +643,6 @@ describe('RosterScreen', () => {
     view.rerender(<RosterScreen {...props()} />);
     expect(node('cc:main', 'face')).toBeTruthy();
     expect(view.getByTestId('roster-row-agent:cc:main').props.accessibilityLabel).not.toContain('Claude Code, Claude Code');
-  });
-
-  it('renders the registry-provided semantic subtitle instead of the latest session preview', () => {
-    const source = group('sprite');
-    mockRoster = [{
-      ...source,
-      connection: {
-        ...source.connection,
-        backendKind: 'youmind',
-        transportKind: 'https',
-      },
-      agents: source.agents.map((summary, index) => index === 0
-        ? {
-            ...summary,
-            agent: {
-              ...summary.agent,
-              emoji: undefined,
-              avatarUrl: 'https://cdn.example.invalid/sprite.png',
-            },
-            subtitle: { kind: 'backend' as const, label: 'YouMind' },
-          }
-        : summary),
-    }];
-    mockConnections = snapshot({
-      connections: [mockRoster[0].connection],
-      activeConnectionId: 'sprite',
-      roster: mockRoster,
-    });
-
-    const view = render(<RosterScreen {...props()} />);
-
-    expect(view.getByText('YouMind')).toBeTruthy();
-    expect(view.getByTestId('roster-row-agent:sprite:main-avatar-image').props.source).toEqual({
-      uri: 'https://cdn.example.invalid/sprite.png',
-    });
-    expect(view.queryByText('Needs approval')).toBeNull();
   });
 
   it('keeps cached activity time visible and localizes sync metadata for accessibility', () => {
@@ -885,6 +864,112 @@ describe('RosterScreen', () => {
     );
   });
 
+  it('preserves the rename editor and pending save while roster view hosts change', async () => {
+    const onReviewInteraction = jest.fn();
+    const onReviewBusyChange = jest.fn();
+    let rejectSave!: (reason: Error) => void;
+    const onRenameSession = jest.fn(() => new Promise<void>((_resolve, reject) => { rejectSave = reject; }));
+    const screenProps = props({
+      pinnedSessionKeys: { 'live:main': ['agent:main:main:channel:ops'] },
+      canRenamePinnedSession: true,
+      onRenameSession,
+      onReviewInteraction,
+      onReviewBusyChange,
+    });
+    const tree = (host: 'page' | 'sidebar' | 'drawer' | 'hidden') => (
+      <RosterController {...screenProps} presentation="sidebar">
+        {(viewProps) => host === 'hidden' ? null : (
+          <View key={host}><RosterView {...viewProps} /></View>
+        )}
+      </RosterController>
+    );
+    const view = render(tree('page'));
+    expect(onReviewBusyChange).toHaveBeenLastCalledWith(false);
+    fireEvent(view.getByTestId('roster-screen'), 'touchStart');
+    expect(onReviewInteraction).toHaveBeenCalledTimes(1);
+    fireEvent(view.getByTestId('roster-row-session:live:agent:main:main:channel:ops'), 'longPress');
+    view.rerender(tree('sidebar'));
+    fireEvent.press(view.getByTestId('roster-action-rename_session'));
+    const input = view.getByTestId('roster-rename-input');
+    fireEvent.changeText(input, '折叠前的草稿');
+    for (const host of ['drawer', 'hidden', 'page'] as const) {
+      view.rerender(tree(host));
+      expect(view.getByTestId('roster-rename-input')).toBe(input);
+      expect(input.props.value).toBe('折叠前的草稿');
+      expect(onRenameSession).not.toHaveBeenCalled();
+      expect(onReviewBusyChange).toHaveBeenLastCalledWith(true);
+      if (host !== 'hidden') {
+        onReviewInteraction.mockClear();
+        fireEvent(view.getByTestId('roster-screen'), 'touchStart');
+        expect(onReviewInteraction).toHaveBeenCalledTimes(1);
+      }
+    }
+    fireEvent.press(view.getByTestId('roster-rename-save'));
+    for (const host of ['sidebar', 'drawer', 'hidden', 'page'] as const) {
+      view.rerender(tree(host));
+      expect(input.props.editable).toBe(false);
+      fireEvent.press(view.getByTestId('roster-rename-save'));
+    }
+    expect(onRenameSession).toHaveBeenCalledTimes(1);
+    expect(onRenameSession).toHaveBeenCalledWith(
+      expect.objectContaining({ connectionId: 'live', sessionKey: 'agent:main:main:channel:ops' }),
+      '折叠前的草稿',
+    );
+    await act(async () => { rejectSave(new Error('temporary failure')); });
+    expect(view.getByTestId('roster-rename-input')).toBe(input);
+    expect(input.props.value).toBe('折叠前的草稿');
+    expect(input.props.editable).toBe(true);
+    onRenameSession.mockResolvedValueOnce(undefined);
+    await act(async () => { fireEvent.press(view.getByTestId('roster-rename-save')); });
+    expect(onRenameSession).toHaveBeenCalledTimes(2);
+    expect(view.queryByTestId('roster-rename-input')).toBeNull();
+    expect(onReviewBusyChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it('runs the chosen Add action once after close despite changing view hosts', () => {
+    mockDeferSheetClose = true;
+    const onAdd = jest.fn();
+    const screenProps = props({ canCreateAgent: true, onCreateAgent: jest.fn(), onAdd });
+    const tree = (host: string) => (
+      <RosterController {...screenProps}>
+        {(viewProps) => <View key={host}><RosterView {...viewProps} /></View>}
+      </RosterController>
+    );
+    const view = render(tree('page'));
+    fireEvent.press(view.getByTestId('roster-add'));
+    fireEvent.press(view.getByTestId('roster-action-add_connection'));
+    view.rerender(tree('sidebar'));
+    view.rerender(tree('drawer'));
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(mockPendingSheetCloses).toHaveLength(1);
+    act(() => { mockPendingSheetCloses[0](); });
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    view.rerender(tree('page'));
+    act(() => { mockPendingSheetCloses[0](); });
+    expect(onAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a removal confirmation bound to its original connection across hosts', () => {
+    mockRoster = [group('live', 'live', [agent('live', 'main')])];
+    mockConnections = snapshot({ roster: mockRoster });
+    const onRemoveConnection = jest.fn();
+    const screenProps = props({ onRemoveConnection });
+    const tree = (host: string) => (
+      <RosterController {...screenProps}>
+        {(viewProps) => <View key={host}><RosterView {...viewProps} /></View>}
+      </RosterController>
+    );
+    const view = render(tree('page'));
+    fireEvent(view.getByTestId('roster-row-agent:live:main'), 'longPress');
+    view.rerender(tree('sidebar'));
+    fireEvent.press(view.getByTestId('roster-action-remove_connection'));
+    view.rerender(tree('drawer'));
+    expect(onRemoveConnection).not.toHaveBeenCalled();
+    fireEvent.press(view.getByTestId('roster-remove-connection-confirm'));
+    expect(onRemoveConnection).toHaveBeenCalledTimes(1);
+    expect(onRemoveConnection).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'live' }));
+  });
+
   it.each([
     { operation: 'remove', connectionId: 'live' },
     { operation: 'roster', connectionId: 'live' },
@@ -910,6 +995,27 @@ describe('RosterScreen', () => {
     mockConnections = snapshot({ recovering: true, activeState: 'reconnecting', roster: [] });
     view.rerender(<RosterScreen {...props()} />);
     expect(view.queryByTestId('roster-connection-unavailable')).toBeNull();
+  });
+
+  it('keeps the unavailable card and the rows under it in place while a pressed retry runs', async () => {
+    mockConnections = snapshot({ activeState: 'offline' });
+    let finish!: () => void;
+    mockReconnectConnection.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const view = render(<RosterScreen {...props()} />);
+    expect(view.getByTestId('roster-connection-unavailable')).toBeTruthy();
+    await act(async () => { fireEvent.press(view.getByTestId('roster-connection-unavailable-retry')); });
+    expect(mockReconnectConnection).toHaveBeenCalledWith('live');
+    // The runtime reports the fresh attempt; nothing reads as unavailable, yet the card holds its place.
+    mockConnections = snapshot({ activeState: 'connecting', switching: true });
+    view.rerender(<RosterScreen {...props()} />);
+    expect(view.getByTestId('roster-connection-unavailable')).toBeTruthy();
+    expect(view.getByTestId('roster-connection-unavailable-retry').props.accessibilityState).toMatchObject({ busy: true });
+    expect(view.getByTestId('roster-row-agent:live:main')).toBeTruthy();
+    mockConnections = snapshot({ activeState: 'ready' });
+    view.rerender(<RosterScreen {...props()} />);
+    await act(async () => { finish(); });
+    expect(view.queryByTestId('roster-connection-unavailable')).toBeNull();
+    expect(view.getByTestId('roster-row-agent:live:main')).toBeTruthy();
   });
 
   it('covers accessible companion loading and empty states', () => {
@@ -1025,6 +1131,21 @@ describe('RosterScreen', () => {
     expect(mockReconnectConnection).toHaveBeenCalledWith(mockConnections.activeConnectionId);
   });
 
+  it('retries a failed roster without replacing the ready connection or opening pull refresh', async () => {
+    mockConnections = snapshot({
+      activeState: 'ready', error: { operation: 'roster', connectionId: 'live', message: 'catalog failed' },
+    });
+    const view = render(<RosterScreen {...props()} />);
+    expect(view.getByTestId('roster-error-banner-label').props.children).toBe('Retry list');
+    expect(view.getByTestId('roster-error-banner-action').props.accessibilityLabel).toBe('Retry list');
+    await act(async () => { fireEvent.press(view.getByTestId('roster-error-banner-action')); });
+    expect(mockRefreshRoster).toHaveBeenCalledTimes(1);
+    expect(mockReconnectConnection).not.toHaveBeenCalled();
+    expect(mockProbeActive).not.toHaveBeenCalled();
+    expect(view.getByTestId('roster-refresh-control').props.refreshing).toBe(false);
+    expect(view.getByTestId('roster-row-agent:live:main')).toBeTruthy();
+  });
+
   it('keeps manual reconnect out of native pull refresh and coalesces repeated presses', async () => {
     let finish!: () => void;
     mockReconnectConnection.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
@@ -1042,6 +1163,15 @@ describe('RosterScreen', () => {
     await act(async () => { finish(); });
     await act(async () => { fireEvent.press(view.getByTestId('roster-offline-banner-action')); });
     expect(mockReconnectConnection).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not apply the workspace horizontal inset twice to Add while preserving bottom and standalone spacing', () => {
+    mockRightInset = 64;
+    const screenProps = props();
+    const view = render(<WorkspaceContext.Provider value={{ paneWidth: 656, constrainContent: true }}><RosterScreen {...screenProps} /></WorkspaceContext.Provider>);
+    expect(flattenStyle(view.getByTestId('roster-add').props.style)).toMatchObject({ end: Space.xl, right: undefined, bottom: 16 + Space.xl });
+    view.rerender(<WorkspaceContext.Provider value={{ constrainContent: false }}><RosterScreen {...screenProps} /></WorkspaceContext.Provider>);
+    expect(flattenStyle(view.getByTestId('roster-add').props.style)).toMatchObject({ end: undefined, right: 64 + Space.xl, bottom: 16 + Space.xl });
   });
 
   it('renders grace actions and preserves the canonical visual budget in light and dark themes', () => {

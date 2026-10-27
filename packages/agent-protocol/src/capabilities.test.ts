@@ -18,11 +18,13 @@ function enabled(backend: keyof typeof CAPABILITY_MATRIX): Capability[] {
 
 describe('canonical capability contract', () => {
   it('publishes the frozen product matrix without conflating Hermes with legacy UI flags', () => {
-    expect(enabled('openclaw')).toEqual(CAPABILITY_KEYS.filter((key) => key !== 'projects' && key !== 'agentQuestions' && key !== 'sessionBranch' && key !== 'steer' && key !== 'documentAttachments' && key !== 'modelHealth'));
+    expect(enabled('openclaw')).toEqual(CAPABILITY_KEYS.filter((key) => !['profileManagement', 'projects', 'agentQuestions', 'sessionBranch', 'steer', 'documentAttachments', 'modelHealth', 'fastMode', 'sessionPermissions', 'sessionArchive', 'promptStatus'].includes(key)));
     expect(resolveCapabilities('codex')).toMatchObject({ projects: true, agentQuestions: true, sessionBranch: true, modelPerSession: true, channels: false });
     expect(resolveCapabilities('openclaw', { projects: true }).projects).toBeFalsy();
+    expect(resolveCapabilities('codex', { profileManagement: false }).profileManagement).toBe(false);
+    expect(resolveCapabilities('hermes', { profileManagement: true }).profileManagement).toBeFalsy();
     expect(resolveCapabilities('pi')).toMatchObject({ chat: true, agentQuestions: true, sessionBranch: true, modelPerSession: true, execApproval: false, channels: false, cron: false });
-    expect(enabled('local-model')).toEqual(['chat', 'abort', 'history', 'attachments', 'models']);
+    expect(enabled('local-model')).toEqual(['chat', 'abort', 'history', 'attachments', 'models', 'bridgeRemoteUpdate']);
     expect(enabled('hermes')).toEqual([
       'chat',
       'abort',
@@ -51,8 +53,8 @@ describe('canonical capability contract', () => {
       'usage',
       'cost',
       'execApproval',
+      'bridgeRemoteUpdate',
     ]);
-    expect(enabled('youmind')).toEqual(['chat', 'abort', 'history']);
   });
 
   it('advertises only implemented Claude operations', () => {
@@ -61,13 +63,20 @@ describe('canonical capability contract', () => {
     expect(resolveCapabilities('claude-code', { skills: true, thinkingLevels: true }).thinkingLevels).toBe(false);
   });
 
+  it('lets every Bridge backend negotiate phone-started updates but never assumes them', () => {
+    for (const backend of ['openclaw', 'hermes', 'codex', 'claude-code', 'pi', 'local-model'] as const) {
+      expect(resolveCapabilities(backend).bridgeRemoteUpdate).toBe(true);
+      expect(resolveCapabilities(backend, { bridgeRemoteUpdate: false }).bridgeRemoteUpdate).toBe(false);
+    }
+  });
+
   it('allows runtime evidence to downgrade, never upgrade, backend capability policy', () => {
     expect(resolveCapabilities('openclaw').chat).toBe(true);
     expect(resolveCapabilities('openclaw', { chat: false, logs: false })).toMatchObject({
       chat: false,
       logs: false,
     });
-    expect(resolveCapabilities('youmind', { chat: true, files: true })).toMatchObject({
+    expect(resolveCapabilities('local-model', { chat: true, files: true })).toMatchObject({
       chat: true,
       files: false,
     });
@@ -87,7 +96,7 @@ describe('canonical capability contract', () => {
     expect(resolveCapabilities('openclaw').channelManage).toBe(true);
     expect(resolveCapabilities('openclaw', { channelManage: false }).channelManage).toBe(false);
     expect(resolveCapabilities('hermes', { channelManage: true }).channelManage).toBe(false);
-    expect(resolveCapabilities('youmind', { channelManage: true }).channelManage).toBe(false);
+    expect(resolveCapabilities('local-model', { channelManage: true }).channelManage).toBe(false);
   });
 
   it('permits negotiated Hermes documents while rejecting arbitrary files', () => {
@@ -106,7 +115,7 @@ describe('canonical capability contract', () => {
     expect(supportsFileAttachments(undefined)).toBe(false);
     expect(supportsAttachmentMimeType(CAPABILITY_MATRIX.openclaw, 'application/pdf')).toBe(true);
     expect(supportsFileAttachments(CAPABILITY_MATRIX.openclaw)).toBe(true);
-    expect(supportsAttachmentMimeType(CAPABILITY_MATRIX.youmind, 'image/png')).toBe(false);
+    expect(supportsAttachmentMimeType(resolveCapabilities('local-model', { attachments: false }), 'image/png')).toBe(false);
     expect(supportsPromptAttachment(CAPABILITY_MATRIX.hermes, {
       type: 'image',
       mimeType: ' Image/PNG ',
@@ -129,5 +138,7 @@ describe('canonical capability contract', () => {
       code: 'bridge_offline',
       message: 'Bridge unavailable',
     });
+    expect(error.recoveryAction).toBeUndefined();
+    expect(new AdapterError('server', 'Explicit permission rejection', 'confirm_permissions').recoveryAction).toBe('confirm_permissions');
   });
 });

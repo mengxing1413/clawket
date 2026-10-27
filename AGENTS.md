@@ -2,6 +2,14 @@
 
 This repository is the Clawket monorepo.
 
+## Native Client Program
+
+Owner decision 2026-10-16: React Native remains the default supported client on iOS and Android; native iOS is a parallel product/design experiment. Preserve `apps/mobile`, its default commands, Expo/EAS configuration, store identity and existing capabilities. Native work must not require React Native users to migrate or weaken their connection stability, shared protocol compatibility or release path. Passing native parity, tests or agent review does not switch the default: replacement, React Native removal and same-bundle delivery each require an explicit later owner decision. The current native UI is not owner-accepted. Android native remains deferred.
+
+Read `docs/native-ios/PLAN.md`, `RESEARCH.md` and `PARITY.md` for the experiment. The owner delegates architecture, product and interaction decisions within that boundary to the implementation agent. The 2026-10-15 native authorization supersedes the old 3.0 shared-UI, custom-navigation, no-SF-Symbols/no-Liquid-Glass and no-simulator-screenshots choices only for the native iOS app; existing privacy, compatibility, release, worktree and resource rules remain binding. Preserve all six currently implemented backends and current user capabilities, not just the original 3.0 scope. Continue recording milestones in `docs/3.0/PROGRESS.md`.
+
+Native iOS source belongs in `apps/ios`; Apple domain, protocol and persistence packages belong in `packages/apple`. Do not place maintained native source inside Expo-generated `apps/mobile/ios`. Development installs use a distinct bundle ID and never replace the store app. Identify an authorized physical device by its USB hardware identifier before any automation; wireless availability or a device name is insufficient. Use WebDriverAgent for the owner's requested phone research and automation.
+
 ## Clawket 3.0 Program Rule
 
 1. `docs/3.0/` is the single implementation source for the 3.0 rebuild. Read `docs/3.0/README.md` first, then `docs/3.0/00-decisions.md` (product decisions; implementation may deviate only under the README deviation rules) and `docs/3.0/08-milestones.md` (execution order).
@@ -22,10 +30,21 @@ This repository is the Clawket monorepo.
 
 1. A request to investigate or fix a problem authorizes code/configuration edits and appropriate verification within the requested scope. It does not by itself authorize a release workflow, even when the problem affects production. Passing tests, available credentials, release runbooks, milestone instructions, and urgency are not release authorization.
 2. Require explicit owner authorization before preparing distribution packages (signed AAB/IPA, Archive, EAS release builds), uploading builds, submitting for review, publishing OTA updates or packages, deploying production services, or changing live production configuration (including DNS, routing, WAF and EAS Production variables). Ordinary local checks and development builds remain allowed within the requested scope. Preview deployments and their necessary isolated resources/configuration do not require separate owner approval when they serve the requested development or testing work; proceed with Preview deployment and verification while preserving Production isolation. Authorization for one action does not imply authorization for later release stages or other services/environments; honor existing explicit authorization for the same scope without asking again.
-3. Keep the owner's selected version and testing path. Do not invent a hotfix version, bump a version, or create a separate release branch/worktree as a consequence of a bug fix unless the owner requests that release work. Code-review worktrees remain allowed when needed for the authorized task.
-4. When the owner says they will test first, deliver the code and verification results and wait for their feedback. Do not replace their test with a self-selected packaging or publishing workflow. If a release decision or permission is pending, silence and elapsed time never authorize dependent actions.
+3. Keep the owner's selected version and testing path. Do not invent a hotfix version, bump a version, or create a separate release branch as a consequence of a bug fix unless the owner requests that release work. Task and code-review worktrees follow the Branch and Worktree Rule.
+4. When the owner says they will test first, deliver the code as a draft PR with the verification results and wait for their feedback. Do not replace their test with a self-selected packaging or publishing workflow. If a release decision or permission is pending, silence and elapsed time never authorize dependent actions.
 5. On a stop or no-release instruction, stop agent-started build/deploy/upload processes and verify their state before reporting that work has stopped. Report any external changes already completed; do not silently roll them back or start a substitute workflow.
-6. Report code edits, local verification, built artifacts, uploads, review submissions and public releases accurately as distinct states. If a new app version is needed for installed clients to receive a fix, explain that requirement without initiating release work.
+6. Report code edits, merges to `main`, local verification, built artifacts, uploads, review submissions and public releases accurately as distinct states. If a new app version is needed for installed clients to receive a fix, explain that requirement without initiating release work.
+
+## Branch and Worktree Rule
+
+Owner decision 2026-09-30. Every agent completes this loop itself and stops only for owner-only steps: a review the owner asked to see first, an undecided design, or release authorization. Commands, tool hooks and device details live in `docs/worktree-workflow.md`.
+
+1. The primary checkout (the directory holding the repository's `.git` directory) stays on `main`, clean and fast-forwarded to `origin/main`. Agents never edit, commit, stash or run tests there; its only writes are `node scripts/worktree.mjs sync-main` and owner-requested acceptance builds of `main` under the device lease. The owner's Bridge service runs its `apps/bridge-cli/dist`.
+2. Every change, code or documentation, is one task: one branch named `<agent>/<topic>` from fresh `origin/main`, in one worktree made by `node scripts/worktree.mjs create <agent>/<topic>` and used by one agent. Worktrees live under the machine's `clawket.worktreeRoot` (Lucy-SSD on the owner's Mac), never in temporary or session scratch directories. Each installs its own dependencies: never link another checkout's `node_modules`, because workspace packages resolve through relative links. Read-only investigation needs no worktree. Changes found in the primary checkout move out with `worktree.mjs adopt` once their owner agrees or has ended.
+3. Verify with the narrowest checks, push, and open a PR to `main`; CI runs the full gate. When the required checks pass on a branch that is current with `main`, the agent squash-merges its own PR (standing owner authorization for task changes), then runs `worktree.mjs finish` to fast-forward the primary checkout and remove the worktree and branch. Resolve conflicts by rebasing in the task worktree; never bypass branch protection or force-push `main`.
+4. An opened PR is not a finished task. After every push, the agent waits in the same turn with `gh pr checks <number> --watch` and rebases again whenever `main` moves, until it merges. Nothing else wakes it: CI notifications never report success and there is no auto-merge. This repository rule overrides tool defaults that discourage polling CI. End a turn with an open PR only when it is blocked on an owner-only step, and say plainly that it is not merged.
+5. Merge first, accept later: the owner accepts decided work on builds of `main`, and any fix becomes a new task. Open a draft PR and wait only when the owner asked to review first or the design is undecided. Merging is not a release; the Release Authorization Rule still governs packaging, deployment and publication.
+6. Phones, simulators, native builds, typechecks and test runs broader than one file are exclusive: hold the matching `worktree.mjs lease` (`android`, `ios`, `simulator`, `heavy`) and release it when done. Phone installs never uninstall or replace the store app.
 
 ## AGENTS / CLAUDE Source Rule
 
@@ -35,7 +54,9 @@ This repository is the Clawket monorepo.
 
 | Path | Role |
 |------|------|
-| `apps/mobile` | React Native mobile app |
+| `apps/mobile` | Default React Native iOS and Android app |
+| `apps/ios` | Independent experimental native iOS app |
+| `packages/apple` | Swift modules for the native iOS experiment |
 | `apps/speech-worker` | Independent Alibaba Cloud transcription proxy; server-only secrets and bounded admission |
 | `apps/relay-registry` | Cloudflare registry worker |
 | `apps/relay-worker` | Cloudflare relay worker |
@@ -81,8 +102,12 @@ During the OpenClaw + Hermes coexistence period, treat backend identity and tran
 
 1. Client liveness must be capability-negotiated. Only clients advertising `relay.client-pong.v1` may be expired for missing Relay pong acknowledgements.
 2. Client pong expiry must allow at least three configured heartbeat intervals, including before the first tick; shorter overrides must be clamped to that floor. Legacy clients must not be disconnected solely because they have not sent application traffic; socket failure and handshake-specific timeouts remain valid cleanup signals.
-3. A Bridge or local Gateway reconnect must force any stale client transport to reconnect when its existing backend session can no longer be resumed safely.
+3. A Bridge or local Gateway reconnect must force any stale client transport to reconnect when its existing backend session can no longer be resumed safely. Owner replacement retires the captured full-client generation synchronously before accepting or advertising the replacement: persist a payload-free attachment tombstone, clear bounded response origins, then close with `4011`. Failed retirement blocks replacement; hibernation cannot revive retired routes, and late old-owner cleanup cannot touch newly accepted clients.
 4. Successful health evidence must reset reconnect backoff. A raw WebSocket `open` event is not sufficient proof of a completed backend handshake.
+5. `client_count`, `client_connected`, `client_disconnected` and `client.sockets` are Relay-authored presence controls. Reject peer-supplied versions after existing admission and before every generic or secondary-channel route; pairing peers cannot forge full-client presence. Keep ordinary client control commands and Relay-generated legacy presence frames unchanged.
+5. Negotiated owner/channel and full-client nonce echoes allow a four-frame arrival burst with one echo per second sustained refill. Persist consumed integer credits in the current socket attachment before replying, preserve conservative legacy timestamp migration and clock-rollback bounds, and never replenish on hibernation. This tolerates delivery jitter without changing authentication, routing or legacy pong expiry.
+5. Negotiated `relay.client-ping.v1` lets a current authenticated full client prove same-socket Relay reachability with a bounded nonce echo; it is not backend health. Keep it separate from legacy `client_pong` acknowledgements and their three-interval expiry floor. Persist only the echo rate budget through hibernation, preserve routing markers, and never answer or forward these controls from owners, channels, restricted pairing or retired clients.
+5. `relay.owner-pong.v1` is an opt-in same-socket Bridge roundtrip fallback after a missing WebSocket pong. Advertise it only in authenticated `relay.ready` for owners/channels that requested it; preserve legacy ready frames and owner leases. Reserve `relay.ready` / `relay.owner-ping` / `relay.owner-pong` before forwarding, after client admission. Echo only valid 32-lowercase-hex nonces from the current authenticated owner/channel, with a hibernation-safe per-socket rate limit; never relay these controls to another peer or log/persist nonces.
 
 ## Relay Hibernation Rule
 
@@ -90,11 +115,16 @@ Active client routing must survive Durable Object hibernation through WebSocket 
 
 ## Relay Resource Safety Rule
 
+Hermes legacy `bridge-status` authenticates the owner before resolving a room and remains read-only inside it. Registry fallback must verify `ok: true` and the requested legacy wire role (`gateway` or `client`) in at most 1 KiB of JSON, within ten seconds including body reads; cancel/release bodies on every outcome. HTTP 200 alone never grants another role. Repeated capability-free, same-instance owner replacement within 60 seconds must probe the current owner with the existing `gateway_ping`, preserve one absolute 12-second deadline in its attachment, and return 409 while responsive. Preserve immediate ordinary/disconnected replacement and modern owner/transfer liveness. See `docs/3.1/hermes-connection-safety-2026-10-07.md`.
+
+Authenticated room admission applies to every backend: at most 128 full-client sockets, 16 restricted pairing sockets, and eight sockets per authenticated token fingerprint. Replacing a current client ID remains possible at capacity only with its matching fingerprint; another valid room credential cannot replace a bound socket. Keep the private fingerprint only in socket attachments; never log it or reuse it as a diagnostic ID. Legacy attachments without fingerprints retain existing replacement semantics until their first reconnect and the room-wide limit; hibernation must preserve new per-device accounting and binding.
+
 1. Relay `/ws` requests must prove the backend-specific pairing record exists before resolving a room Durable Object. Keep the bounded 60-second existence cache free of credentials and request-scoped state.
 2. Relay, Bridge, and App use the same 8 MiB application-frame limit. Relay closes strictly larger frames with `1009` / `frame_too_large`; Bridge normalizes the `ws` hard-limit error to the same stable code, and App rejects it before send. The nominal 5 MiB image flow must remain below the wire limit.
 3. Registry registration is limited to 10 attempts per hashed source IP per fixed hour using a strongly consistent counter. Never store or log the raw source IP for this limit.
 4. Unclaimed registration records expire after 24 hours; successful claim restores the existing 365-day lifetime.
 5. Relay health and the post-authentication `relay.ready` control frame advertise `relay.frame-limit.v2`; older peers must remain able to ignore the additive control frame.
+6. Independently negotiated `relay.transfer-hint.v1` protects actual 128 KiB–8 MiB UTF-8 frames from short liveness deadlines. Relay alone emits a size-only hint immediately before the same unchanged frame on a current full-client or authenticated owner/channel socket; peer hints cannot be forwarded. Keep receiver transfer budgets absolute and non-renewable (90 seconds), clear only with a round trip initiated after the latest transfer generation, and preserve legacy traffic and the 8 MiB limit. Complete inbound-frame delivery ends only that direction's head-of-line allowance, never the budget lock, health state or concurrent outbound protection.
 
 ## Preview Service Environment Rule
 
@@ -132,14 +162,17 @@ When implementation, architecture, or release behavior changes, update the close
 
 ## Quality Gate Rule
 
-1. `npm run check:required` is the repository-wide, CI-safe required gate for typechecks, self-contained tests, mobile design-system checks, and documentation checks.
+1. `npm run check:required` is the repository-wide, CI-safe required gate for typechecks, self-contained tests, mobile design-system checks, and documentation checks. CI runs its parts (`typecheck`, `test:required:mobile` as three in-band shards, `test:required:rest`, `check:static`) and the v1 replay as parallel jobs behind the `Typecheck, tests, design system, and docs` gate job; keep that job list and the `check:required` composition in sync. The Windows and macOS Bridge jobs run for desktop-affecting pull requests (`scripts/ci/desktop-changes.mjs`) and on every push to `main`. Desktop jobs share one OS matrix while preserving both required check names. A no-desktop decision skips suite steps on lightweight runners, not the matrix job; failed selectors still run both desktop suites. Build/typecheck wrappers delegate to the CLI's dependency builds once; CI replay and runtime-source tests prebuild only Bridge Core. See `docs/ci.md` for CI scope and failure evidence.
 2. Check scripts must fail with a non-zero exit code when their inputs are missing, malformed, or empty; they must not silently skip verification.
 3. Checks must print the number or scope of verified items so an accidental coverage reduction is visible.
 4. New check logic should expose testable validation functions and include a corrupted-input regression test.
 5. `test:release:compat` is the explicit release integration matrix: read-only production Worker exports are supplied through `CLAWKET_RELEASE_SNAPSHOTS`, exercised locally with historical and candidate Bridges. Missing snapshots must fail. Local code rollback is not proof of Cloudflare migration rollback.
 6. Tests that require an external checkout or live service must have an explicit integration command and must not make the CI-safe gate depend on a developer's home directory. Keep the ordinary `npm test` command as the broader local suite.
+7. Owner decision 2026-10-07: dependency advisories do not block PR merges. `npm run security:audit` checks both lockfiles in the independent weekly/manual `Dependency security review` workflow, outside the required gate; findings and malformed reports still fail that review. Before an authorized release, assess a fresh report against the actual shipped dependencies and record fixes or owner-accepted risks (see `docs/ci.md`). Suppressing a finding in the report needs owner approval, naming one advisory in one package with a reason and expiry; expired or unused exceptions fail the review. Current: GHSA-86w9-cpqp-85rv (node-forge via Expo CLI code signing, no patched release), GHSA-vfj7-8cjw-p6xm (braces via micromatch in the Expo/Metro bundler and Jest, no patched release), and GHSA-wq5f-xc86-pv6w (Miniflare's exact sharp 0.35.4 dependency; adopt the upstream fix without a native override, owner-approved 2026-10-07), all until 2026-11-01. Mobile's direct sharp build-tool dependency must use patched 0.35.5 or later.
 
 `relay:test:integration` runs self-contained local Relay/model servers and recorded mobile adapters. Real local-model inference uses `test:local-model:recovery` (`CLAWKET_RECOVERY_CONFIG`) or `test:local-model:preview` (`CLAWKET_LOCAL_MODEL_PREVIEW_SMOKE=1`, optional model endpoint configuration); these commands fail when prerequisites are absent, never silently skip.
+
+Local-model supervisor start retries a rejected control response only after a proven credential-generation change, within its existing 15-second budget and without launching another owner for that retry. Publish control credentials atomically; unchanged invalid responses still fail. Keep process-test socket paths within the macOS Unix socket limit.
 
 Windows ACL assertions must fail on command/module errors or missing paths. When invoking Windows PowerShell from PowerShell 7, resolve its security module from the invoked shell's `$PSHOME`; inherited module paths must not produce a false zero-access result.
 
@@ -149,7 +182,7 @@ Owner rules (2026-09-26, after the development Mac froze three times): never run
 
 1. Verify with the narrowest affected test files, one at a time: `npx jest <file> --runInBand` in `apps/mobile`, or Vitest with `--maxWorkers=2` unless its config already limits workers or file parallelism. Report which files were verified.
 2. `npm test`, `npm run mobile:test`, `npm run check:required` and directory-wide runs are owner-requested only, and then run in-band (`npm run mobile:test -- --runInBand`, as `test:required` does). CI is unaffected. Mobile Jest also defaults to two workers (`apps/mobile/jest.config.cjs`); never raise that cap.
-3. Run one test process at a time. Check `memory_pressure` and `ps` for another session's run first; never run tests beside `tsc`, builds, headless browsers or simulators, and never start other heavy work while a run is in the background.
+3. Run one test process at a time, holding the `heavy` lease for anything broader than one file (Branch and Worktree Rule). Check `memory_pressure` and `ps` for another session's run first; never run tests beside `tsc`, builds, headless browsers or simulators, and never start other heavy work while a run is in the background.
 
 ## Hermes Implementation Boundaries
 
@@ -181,22 +214,35 @@ Owner rules (2026-09-26, after the development Mac froze three times): never run
 2. Hermes support in those commands must be additive and limited to Clawket-managed Hermes bridge and relay runtimes.
 3. `stop` and `uninstall` should stop Hermes runtimes without deleting Hermes config; `reset` remains the command that clears local Hermes state.
 4. Hermes-only users must be able to use lifecycle commands without requiring an OpenClaw pairing config.
+5. Unified updates may refresh an existing stopped OpenClaw service registration, but must not install missing autostart or start a stopped runtime. Preserve the original launch registration for rollback; details are in `docs/bridge-updates.md`.
 
 ## Connection Diagnostics Rule
 
 Relay socket diagnostics use a server-generated per-socket UUID persisted in WebSocket attachments; never derive it from credentials or user/device identity. Preserve it across attachment updates and hibernation. Keep raw IDs and secrets redacted. Pairing/connection triage follows `docs/3.0/20-connection-diagnostics.md`; distinguish local logs, cloud logs and measured end-to-end evidence.
 
+The standalone `scripts/diagnostics/codex-roster.mjs` checks an existing authenticated loopback Codex Bridge without starting or stopping native/Relay processes. Keep its read-method allowlist, 20-second RPC / 90-second total budgets and Mobile catalog validation bounds. Output only fixed categories, counts, durations and invalid field names; never output payloads or credentials. A local pass is not proof of the phone/Relay path or inference. Its corrupted-input/socket tests belong in the CI-safe gate.
+
 Production observability records sanitized application logs only: keep invocation logs and traces disabled and query-string redaction enabled. Mirror approved cloud settings in the ignored deployment configs; each Registry service binding must target its own backend/environment Relay. Configuration-only version changes still require refreshing the recorded production deployment anchors and verifying source hashes.
+
+Observe Relay cold initialization only when its serial authenticated rehydration fails or exceeds one second. Record fixed stage categories and bounded I/O wall durations; preserve the constructor input gate and awaited heartbeat setup. Workers clocks exclude pre-constructor wakeup/queue time and do not measure synchronous CPU time.
+
+Connection observability is metadata-only and fail-closed: allowlist fields and string categories; never record messages, prompts, tool output, request/response bodies, native stderr/errors, credentials, raw URLs/paths, IP/SSID or device labels. Keep only existing server-generated per-socket diagnostic UUIDs, never add stable identities for triage. Unknown failures and timeouts do not prove phone network failure. Registry unknown routes use a fixed placeholder; transport exceptions use fixed reasons. See the evidence rules in `docs/3.0/20-connection-diagnostics.md`.
+
+Owner-heartbeat fallback diagnostics describe only the current authenticated socket's bounded local Relay action. A successful send is not peer receipt or backend health; keep nonce/payload and exception text out of logs, and preserve diagnostic throttling through hibernation.
 
 ## Independent OpenClaw Client Channels
 
 Negotiated `bridge.client-sockets.v1` uses authenticated owner secondary sockets bound to server-generated full-client socket diagnostic IDs. Keep each local Gateway handshake isolated, preserve raw 8 MiB frames, and reconstruct routes from attachments after hibernation. Restricted pairing sockets cannot become channel targets. Hermes and legacy owners retain their existing policies.
 
-Before handling any frame, verify that its WebSocket is still the current owner, client, pairing client or secondary channel. Buffered frames and late close/error events from replaced sockets must not alter the replacement's routing, rate limits or heartbeat watchdog. Replacement logs link only validated server-generated diagnostic UUIDs; distinguish owner/channel/client sockets and include close codes without logging peer-supplied close text.
+Before handling any frame, verify that its WebSocket is still the current owner, client, pairing client or secondary channel. Recheck the captured owner socket after awaited lease persistence before routing; do not rely on instance IDs or storage input gates as the only generation fence. Buffered frames and late close/error events from replaced sockets must not alter the replacement's routing, rate limits or heartbeat watchdog. Replacement logs link only validated server-generated diagnostic UUIDs; distinguish owner/channel/client sockets and include close codes without logging peer-supplied close text.
 
 ## Worker Toolchain Audit
 
-Keep Wrangler on a security-patched v4 release (current minimum 4.131.0) with its matching Miniflare/workerd dependencies. Do not force a transitive native override to hide an audit finding; validate the resolved lockfile with both dependency audits and v1 replay after toolchain changes.
+Keep the root Vitest worker pool pinned to patched `tinypool` 2.1.2, compatible with the repository’s Node 22 baseline, and root/standalone Mobile source maps pinned to `source-map-js` 1.2.2. Audit both lockfiles; preserve existing approved exceptions without broad suppression.
+
+Keep shell-quote pinned to patched 1.11.0 in both install entry points and the Claude Agent SDK's MCP SDK peer pinned to patched 1.31.0 in the root overrides.
+
+Keep Wrangler on a security-patched v4 release (current minimum 4.144.0) with its matching Miniflare/workerd dependencies. Do not force a transitive native override to hide an audit finding; validate the resolved lockfile with both dependency audits and v1 replay after toolchain changes.
 
 ## First Registry migration recovery
 
@@ -212,8 +258,12 @@ Owner-authorized Pi implementation is specified in `docs/3.1/pi.md`. Pi is an in
 
 ## Codex 3.1 extension
 
-Owner-authorized Codex work is specified in `docs/3.1/codex.md`. New device pairing discovers saved projects and native thread directories; existing explicit project pairings remain scoped. Use Clawket-owned App Server processes and opaque native thread mappings. Preserve OpenClaw, Hermes and Pi. Native continuation routes through the desktop owner; only an explicit no-owner response with no active native turn permits local resume. Unknown dispatch must never create a second writer. Codex Preview uses isolated resources and may be deployed for this authorized testing; production and publication still require authorization.
+Owner-authorized Codex work is specified in `docs/3.1/codex.md`. New device pairing discovers saved projects and native thread directories; existing explicit project pairings remain scoped. Use Clawket-owned App Server processes and opaque native thread mappings. Preserve OpenClaw, Hermes and Pi. Native continuation routes through the desktop owner; imported threads require an explicit no-owner response with no active native turn before local resume. Bridge-created threads may recover without a Desktop broker only on explicitly verified native versions with atomic exclusive writer locks, matching idle history and a proven pre-dispatch broker failure. Unknown dispatch must never create a second writer. Codex Preview uses isolated resources and may be deployed for this authorized testing; production and publication still require authorization.
 
 ## Claude Code 3.1 extension
 
 Owner-authorized Claude Code work is specified in `docs/3.1/claude-code.md`. Use the official Agent SDK and the installed unmodified CLI; authentication stays in Claude's native flow. Discover Desktop/CLI projects and histories read-only. An idle owner is still an owner; discovery and resume do not constitute live attach. Never take over an unknown or active owner, harvest Desktop credentials, or advertise unverified native control. Preserve existing backends and isolate any Claude Preview resources.
+
+## Official Connection Domain Rule
+
+Official Registry/Relay URLs and saved-alias normalization use the pure `packages/bridge-core/src/official-relay.ts` map. New traffic uses `clawket.ai`; custom/self-hosted URLs remain supported. Keep old Workers routes during the compatibility stage and preserve backend/environment resource isolation. Domain retirement and distribution remain separate owner-authorized operations; see `docs/3.1/connection-domains.md`.

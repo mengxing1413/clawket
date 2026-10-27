@@ -1,5 +1,4 @@
 import {
-  getGatewayBackendDescriptor,
   HUMAN_SESSION_KINDS,
   sessionActivityAt,
   type AgentDescriptor,
@@ -15,11 +14,6 @@ import {
   summarizeSessionSignals,
   type SessionWatermarks,
 } from './unread-watermarks';
-
-export type RosterAgentSubtitle = Readonly<{
-  kind: 'backend';
-  label: string;
-}>;
 
 const ROSTER_CACHE_VERSION = 1;
 const ROSTER_SCOPE_PREFIX = 'connection-registry:roster-cache:v1:';
@@ -67,7 +61,6 @@ export type RosterSnapshotInput = Readonly<{
 export type RosterAgentSummary = Readonly<{
   agent: AgentDescriptor;
   sessions: ReadonlyArray<SessionDescriptor>;
-  subtitle?: RosterAgentSubtitle;
   preview?: string;
   /** Latest activity a person took part in across this Agent's human sessions; orders the roster. */
   lastActivityAt: number | null;
@@ -181,6 +174,7 @@ function normalizeSession(value: unknown, connectionId: string): SessionDescript
   const channel = readString(record.channel);
   const preview = readString(record.preview);
   const model = readString(record.model);
+  const sessionId = readString(record.sessionId);
   const parentSessionKey = readString(record.parentSessionKey);
   const candidateProject = record.project as Record<string, unknown> | undefined;
   const project = candidateProject && typeof candidateProject === 'object' && !Array.isArray(candidateProject)
@@ -204,6 +198,8 @@ function normalizeSession(value: unknown, connectionId: string): SessionDescript
     ...(lastActivityAt !== undefined ? { lastActivityAt: lastActivityAt as number | null } : {}),
     ...(preview ? { preview } : {}),
     ...(model ? { model } : {}),
+    ...(sessionId ? { sessionId } : {}),
+    ...(typeof record.archived === 'boolean' ? { archived: record.archived } : {}),
     hasActiveRun: record.hasActiveRun,
     attention,
     ...(parentSessionKey ? { parentSessionKey } : {}),
@@ -217,6 +213,7 @@ function normalizeSession(value: unknown, connectionId: string): SessionDescript
       reset: allowedActions.reset,
       delete: allowedActions.delete,
       pin: allowedActions.pin,
+      ...(typeof allowedActions.archive === 'boolean' ? { archive: allowedActions.archive } : {}),
     },
   };
 }
@@ -270,22 +267,11 @@ function compareConnectionGroups(a: RosterConnectionGroup, b: RosterConnectionGr
     || a.connection.id.localeCompare(b.connection.id);
 }
 
-function resolveRosterAgentSubtitle(
-  connection: ConnectionDescriptor,
-): RosterAgentSubtitle | undefined {
-  if (connection.backendKind !== 'youmind') return undefined;
-  return Object.freeze({
-    kind: 'backend',
-    label: getGatewayBackendDescriptor(connection.backendKind).label,
-  });
-}
-
 function buildAgentSummary(
   agent: AgentDescriptor,
   sessions: ReadonlyArray<SessionDescriptor>,
   watermarks: SessionWatermarks,
   liveSignalsEnabled: boolean,
-  subtitle: RosterAgentSubtitle | undefined,
 ): RosterAgentSummary {
   const agentSessions = sessions.filter((session) => (
     session.connectionId === agent.connectionId && session.agentId === agent.agentId
@@ -313,7 +299,6 @@ function buildAgentSummary(
   return Object.freeze({
     agent,
     sessions: Object.freeze(agentSessions),
-    ...(subtitle ? { subtitle } : {}),
     ...(preview ? { preview } : {}),
     lastActivityAt: signals.lastActivityAt,
     unreadCount: mainUnreadCount,
@@ -331,7 +316,6 @@ export function aggregateRoster(
   const groups = inputs.map((input): RosterConnectionGroup => {
     const liveSignalsEnabled = input.source === 'live'
       && input.connection.id === activeConnectionId;
-    const subtitle = resolveRosterAgentSubtitle(input.connection);
     const watermarks = input.watermarks ?? {};
     const agents = input.agents
       .filter((agent) => agent.connectionId === input.connection.id)
@@ -340,7 +324,6 @@ export function aggregateRoster(
         input.sessions,
         watermarks,
         liveSignalsEnabled,
-        subtitle,
       ))
       .sort(compareAgentSummaries);
     const unreadCount = agents.reduce((total, agent) => total + agent.unreadCount, 0);

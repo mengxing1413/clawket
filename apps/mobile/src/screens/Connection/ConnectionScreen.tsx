@@ -96,12 +96,13 @@ export function ConnectionScreen({
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
   const inFlight = useRef(false);
+  // A failure notice stays in place while the next attempt runs and changes only with its outcome:
+  // clearing it first pulled Reconnect up under the finger and back down (owner rule 2026-09-29).
   const run = async (action: () => Promise<unknown>) => {
     if (inFlight.current) return;
     inFlight.current = true;
     setBusy(true);
-    setFailed(false);
-    try { await action(); } catch { setFailed(true); }
+    try { await action(); setFailed(false); } catch { setFailed(true); }
     finally { inFlight.current = false; setBusy(false); }
   };
   const presence = resolveConnectionPresence({ active, paused, state });
@@ -114,7 +115,7 @@ export function ConnectionScreen({
     ? { label: t('Resume connection'), icon: Play, variant: 'primary' as const }
     : presence === 'not_connected'
       ? { label: t('Connect'), icon: RotateCw, variant: 'primary' as const }
-      : { label: t('Reconnect', { ns: 'common' }), icon: RotateCw, variant: presence === 'offline' ? 'primary' as const : 'outline' as const };
+      : { label: t('Reconnect', { ns: 'common' }), icon: RotateCw, variant: presence === 'offline' ? 'primary' as const : 'card' as const };
   const locale = i18n?.resolvedLanguage;
   const detailRows = useMemo(() => buildConnectionDetailRows({
     connection,
@@ -126,7 +127,7 @@ export function ConnectionScreen({
     <View testID="connection-screen" style={[styles.screen, { backgroundColor: colors.canvasGrouped }]}>
       <AccountSettingsPageHeader testID="connection" title={t('Connection', { ns: 'common' })} onBack={onBack} />
       <ScrollView contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + Space.xl }]}>
-        {onUpgradeBridge ? <Banner testID="connection-bridge-upgrade" message={t('Your older Bridge can keep working. Update it for the new features.', { ns: 'chat' })} actionLabel={t('Update your Bridge', { ns: 'chat' })} onAction={onUpgradeBridge} /> : null}
+        {onUpgradeBridge ? <Banner testID="connection-bridge-upgrade" message={t('New Bridge version', { ns: 'chat' })} actionLabel={t('Update', { ns: 'common' })} onAction={onUpgradeBridge} /> : null}
         <View style={styles.hero}>
           <View style={[styles.symbol, { backgroundColor: colors.surfaceFloating }]}><PlatformMark platform={connection.backendKind} /></View>
           <Text testID="connection-label" style={[styles.name, { color: colors.ink }]}>{connection.label}</Text>
@@ -134,11 +135,15 @@ export function ConnectionScreen({
           {agentSummary ? <Text style={[styles.detail, { color: colors.inkSecondary }]}>{agentSummary}</Text> : null}
         </View>
         {failed ? <Banner tone="bad" message={t('Please try again later.', { ns: 'common' })} /> : null}
+        {/* One row of equal capsules (owner decision 2026-09-30: a full-width bordered button above a
+            text link read as a form); Pause keeps its full name for screen readers, and a paused
+            connection offers Resume alone across the row. Long labels wrap instead of truncating. */}
         <View style={styles.actions}>
           <Button testID="connection-reconnect" label={lifecycleAction.label} icon={lifecycleAction.icon}
-            variant={lifecycleAction.variant} loading={busy} disabled={busy}
+            variant={lifecycleAction.variant} multiline loading={busy} disabled={busy} style={styles.action}
             onPress={() => { void run(paused ? onResume : onReconnect); }} />
-          {!paused ? <Button testID="connection-pause" label={t('Pause connection')} icon={Pause} variant="ghost" disabled={busy}
+          {!paused ? <Button testID="connection-pause" label={t('Pause', { ns: 'common' })} accessibilityLabel={t('Pause connection')}
+            icon={Pause} variant="card" multiline disabled={busy} style={styles.action}
             onPress={() => setConfirmation('pause')} /> : null}
         </View>
         <SettingsGroup density="comfortable">
@@ -192,5 +197,6 @@ const styles = StyleSheet.create({
   symbol: { padding: Space.lg, borderRadius: Radius.xl },
   name: { fontSize: FontSize.title, lineHeight: LineHeight.title, fontWeight: FontWeight.semibold, textAlign: 'center' },
   detail: { fontSize: FontSize.secondary, lineHeight: LineHeight.secondary, fontWeight: FontWeight.regular, textAlign: 'center' },
-  actions: { gap: Space.sm },
+  actions: { flexDirection: 'row', gap: Space.md },
+  action: { flex: 1 },
 });

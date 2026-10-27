@@ -44,11 +44,9 @@ class MemorySecureStorage implements SecureConnectionStorage {
 
 function legacyStorage(state: GatewayConfigsState = { activeId: null, configs: [] }): LegacyConnectionStorage & {
   readLegacyGatewayConfigsState: jest.Mock<Promise<GatewayConfigsState>, []>;
-  migrateLegacyYouMindState: jest.Mock<Promise<void>, [string, string]>;
 } {
   return {
     readLegacyGatewayConfigsState: jest.fn(async () => state),
-    migrateLegacyYouMindState: jest.fn(async (_url: string, _scopeKey: string) => undefined),
   };
 }
 
@@ -69,155 +67,30 @@ function openClawInput(label: string, token = `${label}-token`) {
   };
 }
 
-function youMindRecord(id: string, label: string): ConnectionRecord {
-  return {
-    id,
-    backendKind: 'youmind',
-    transportKind: 'https',
-    label,
-    createdAt: 1,
-    url: 'https://youmind.com',
-    youmind: { authScopeKey: id },
-  };
-}
-
-function persistedRegistry(
-  records: ReadonlyArray<ConnectionRecord>,
-  revision = 1,
-): string {
-  const activeConnectionId = records[0]?.id ?? null;
-  return JSON.stringify({
-    version: 1,
-    revision,
-    state: {
-      activeConnectionId,
-      freeConnectionId: activeConnectionId,
-      records,
-    },
-  });
-}
-
 describe('ConnectionStore', () => {
-  it('sanitizes only the exact legacy YouMind email label in current records and re-pairs', async () => {
+  it('persists official address migration once, retaining identity, credentials and rollback', async () => {
     const secureStorage = new MemorySecureStorage();
-    const records: ConnectionRecord[] = [
-      youMindRecord('auto-email', 'YouMind (owner+one@example.com)'),
-      youMindRecord('custom-name', 'YouMind (Studio)'),
-      youMindRecord('custom-local-address', 'YouMind (owner@local)'),
-      youMindRecord('custom-suffix', 'YouMind (owner@example.com) personal'),
-      {
-        id: 'other-backend',
-        backendKind: 'openclaw',
-        transportKind: 'local',
-        label: 'YouMind (owner@example.com)',
-        createdAt: 1,
-        url: 'ws://127.0.0.1:18789',
-      },
-    ];
-    secureStorage.values.set(CURRENT_KEY, persistedRegistry(records, 7));
-    const store = new ConnectionStore({
-      secureStorage,
-      legacyStorage: legacyStorage(),
-    });
-
-    await expect(store.load()).resolves.toMatchObject({
-      revision: 7,
-      connections: [
-        expect.objectContaining({ id: 'auto-email', label: 'YouMind' }),
-        expect.objectContaining({ id: 'custom-name', label: 'YouMind (Studio)' }),
-        expect.objectContaining({ id: 'custom-local-address', label: 'YouMind (owner@local)' }),
-        expect.objectContaining({ id: 'custom-suffix', label: 'YouMind (owner@example.com) personal' }),
-        expect.objectContaining({ id: 'other-backend', label: 'YouMind (owner@example.com)' }),
-      ],
-    });
-
-    const repaired = await store.upsert({
-      id: 'auto-email',
-      backendKind: 'youmind',
-      transportKind: 'https',
-      label: 'YouMind',
-      url: 'https://youmind.com',
-      youmind: { authScopeKey: 'replacement-scope' },
-    });
-    expect(repaired).toMatchObject({
-      created: false,
-      connection: { id: 'auto-email', label: 'YouMind' },
-    });
-    const persisted = JSON.parse(secureStorage.values.get(CURRENT_KEY) ?? '{}');
-    expect(persisted.state.records[0]).toMatchObject({
-      id: 'auto-email',
-      label: 'YouMind',
-      youmind: { authScopeKey: 'replacement-scope' },
-    });
+    const initial = new ConnectionStore({ secureStorage, legacyStorage: legacyStorage() });
+    await initial.load();
+    const added = await initial.add({ ...openClawInput('Migration'), id: 'preserved-id',
+      url: 'wss://relay-preview.clawket.ai/ws',
+      relay: { serverUrl: 'https://registry-preview.clawket.ai', gatewayId: 'preserved-gw', clientToken: 'preserved-token' } });
+    const old = JSON.parse(secureStorage.values.get(CURRENT_KEY)!);
+    old.state.records[0].url = 'wss://clawket-relay-preview.clawket.workers.dev/ws';
+    old.state.records[0].relay.serverUrl = 'https://clawket-registry-preview.clawket.workers.dev';
+    const oldRaw = JSON.stringify(old);
+    secureStorage.values.set(CURRENT_KEY, oldRaw);
+    const migrated = new ConnectionStore({ secureStorage, legacyStorage: legacyStorage() });
+    await migrated.load();
+    expect(await migrated.getRuntimeRecord(added.id)).toMatchObject({ id: added.id,
+      url: 'wss://relay-preview.clawket.ai/ws', auth: old.state.records[0].auth,
+      relay: { ...old.state.records[0].relay, serverUrl: 'https://registry-preview.clawket.ai' } });
+    expect(migrated.getSnapshot()).toMatchObject({ activeConnectionId: added.id, freeConnectionId: added.id, revision: old.revision + 1 });
+    expect(secureStorage.values.get(ROLLBACK_KEY)).toBe(oldRaw);
+    const writeCount = secureStorage.writes.length;
+    await new ConnectionStore({ secureStorage, legacyStorage: legacyStorage() }).load();
+    expect(secureStorage.writes).toHaveLength(writeCount);
   });
-
-  it('sanitizes an exact legacy YouMind email label restored from rollback', async () => {
-    const secureStorage = new MemorySecureStorage();
-    secureStorage.values.set(
-      CURRENT_KEY,
-      persistedRegistry([youMindRecord('current', 'Current Sprite')], 2),
-    );
-    secureStorage.values.set(
-      ROLLBACK_KEY,
-      persistedRegistry([youMindRecord('previous', 'YouMind (previous@example.com)')]),
-    );
-    const store = new ConnectionStore({
-      secureStorage,
-      legacyStorage: legacyStorage(),
-    });
-    await store.load();
-
-    const rolledBack = await store.rollback();
-
-    expect(rolledBack.connections).toEqual([
-      expect.objectContaining({ id: 'previous', label: 'YouMind' }),
-    ]);
-    const persisted = JSON.parse(secureStorage.values.get(CURRENT_KEY) ?? '{}');
-    expect(persisted.state.records[0]).toMatchObject({ id: 'previous', label: 'YouMind' });
-  });
-
-  it('sanitizes an exact legacy YouMind email label before persisting migration', async () => {
-    const secureStorage = new MemorySecureStorage();
-    const legacy = legacyStorage({
-      activeId: 'legacy-email',
-      configs: [
-        {
-          id: 'legacy-email',
-          name: 'YouMind (legacy@example.com)',
-          backendKind: 'youmind',
-          transportKind: 'custom',
-          mode: 'custom',
-          url: 'https://youmind.com',
-          createdAt: 1,
-          updatedAt: 1,
-        },
-        {
-          id: 'legacy-custom',
-          name: 'My YouMind (legacy@example.com)',
-          backendKind: 'youmind',
-          transportKind: 'custom',
-          mode: 'custom',
-          url: 'https://youmind.com',
-          createdAt: 2,
-          updatedAt: 2,
-        },
-      ],
-    });
-    const store = new ConnectionStore({ secureStorage, legacyStorage: legacy });
-
-    const migrated = await store.load();
-
-    expect(migrated.connections).toEqual([
-      expect.objectContaining({ id: 'legacy-email', label: 'YouMind' }),
-      expect.objectContaining({ id: 'legacy-custom', label: 'My YouMind (legacy@example.com)' }),
-    ]);
-    const persisted = JSON.parse(secureStorage.values.get(CURRENT_KEY) ?? '{}');
-    expect(persisted.state.records.map((record: ConnectionRecord) => record.label)).toEqual([
-      'YouMind',
-      'My YouMind (legacy@example.com)',
-    ]);
-  });
-
   it('migrates the released 2.1 schema fixture once and preserves every credential-bearing field', async () => {
     expect(legacyFixture.provenance).toMatchObject({
       kind: 'schema-reconstruction',
@@ -250,11 +123,6 @@ describe('ConnectionStore', () => {
         environment: 'preview',
         isFreeSlot: true,
       }),
-      expect.objectContaining({
-        id: 'youmind-default',
-        backendKind: 'youmind',
-        transportKind: 'https',
-      }),
     ]);
     expect(JSON.stringify(first)).not.toContain('sanitized-openclaw-token');
     expect(JSON.stringify(first)).not.toContain('gct_sanitized_openclaw');
@@ -272,15 +140,7 @@ describe('ConnectionStore', () => {
       hermes: { bridgeUrl: 'ws://127.0.0.1:8789/v1/hermes/ws' },
       debugMode: true,
     });
-    expect(persisted.state.records[2]).toMatchObject({
-      transportKind: 'https',
-      youmind: { authScopeKey: 'youmind:sanitized@example.invalid' },
-    });
-    expect(legacy.migrateLegacyYouMindState).toHaveBeenCalledTimes(1);
-    expect(legacy.migrateLegacyYouMindState).toHaveBeenCalledWith(
-      'https://youmind.com',
-      'youmind:sanitized@example.invalid',
-    );
+    expect(persisted.state.records).toHaveLength(2);
     expect(secureStorage.values.has(ROLLBACK_KEY)).toBe(true);
     expect(secureStorage.values.get(LEGACY_KEY)).toBe(legacyRaw);
 
@@ -288,53 +148,10 @@ describe('ConnectionStore', () => {
       readLegacyGatewayConfigsState: jest.fn(async () => {
         throw new Error('legacy migration must not repeat');
       }),
-      migrateLegacyYouMindState: jest.fn(async () => {
-        throw new Error('YouMind migration must not repeat');
-      }),
     };
     const restarted = new ConnectionStore({ secureStorage, legacyStorage: forbiddenLegacy });
     await expect(restarted.load()).resolves.toEqual(first);
     expect(forbiddenLegacy.readLegacyGatewayConfigsState).not.toHaveBeenCalled();
-  });
-
-  it('retries the initial registry migration when legacy YouMind auth migration fails', async () => {
-    const secureStorage = new MemorySecureStorage();
-    const legacy = legacyStorage({
-      activeId: 'legacy-sprite',
-      configs: [{
-        id: 'legacy-sprite',
-        name: 'Legacy sprite',
-        backendKind: 'youmind',
-        transportKind: 'custom',
-        mode: 'custom',
-        url: 'https://youmind.example.test',
-        createdAt: 10,
-        updatedAt: 20,
-      }],
-    });
-    legacy.migrateLegacyYouMindState
-      .mockRejectedValueOnce(new Error('legacy auth copy failed'))
-      .mockResolvedValue(undefined);
-    const store = new ConnectionStore({ secureStorage, legacyStorage: legacy });
-
-    await expect(store.load()).rejects.toThrow('legacy auth copy failed');
-    expect(secureStorage.values.has(CURRENT_KEY)).toBe(false);
-    expect(secureStorage.values.has(ROLLBACK_KEY)).toBe(false);
-
-    await expect(store.load()).resolves.toMatchObject({
-      activeConnectionId: 'legacy-sprite',
-      connections: [expect.objectContaining({
-        id: 'legacy-sprite',
-        backendKind: 'youmind',
-      })],
-    });
-    expect(legacy.migrateLegacyYouMindState).toHaveBeenCalledTimes(2);
-    expect(legacy.migrateLegacyYouMindState).toHaveBeenLastCalledWith(
-      'https://youmind.example.test',
-      'cfg:legacy-sprite',
-    );
-    expect(secureStorage.values.has(CURRENT_KEY)).toBe(true);
-    expect(secureStorage.values.has(ROLLBACK_KEY)).toBe(true);
   });
 
   it('keeps exactly one active connection while preserving the independently selected free slot', async () => {
@@ -436,6 +253,37 @@ describe('ConnectionStore', () => {
     const refreshed = await store.upsert({ backendKind: 'pi', transportKind: 'local', label: 'Pi', url: 'ws://127.0.0.1:18001/v1/pi/ws', auth: { token: 'after' } });
     expect(refreshed).toMatchObject({ created: false, connection: { id: 'pi-stable', label: 'My project' } });
     expect(store.getSnapshot().connections).toHaveLength(1);
+  });
+
+  it.each([
+    ['codex', 'Codex'], ['codex', 'Studio laptop'],
+    ['claude-code', 'Claude Code'], ['claude-code', 'Studio laptop'],
+  ] as const)('retains the saved %s label %s when re-pairing with a device default', async (backendKind, label) => {
+    for (const transportKind of ['local', 'relay'] as const) {
+      const store = new ConnectionStore({ secureStorage: new MemorySecureStorage(), legacyStorage: legacyStorage(), now: () => 200, random: () => 0 });
+      const identity = transportKind === 'relay'
+        ? { url: 'wss://relay.example/ws', relay: { serverUrl: 'https://registry.example', gatewayId: 'stable-gateway', clientToken: 'old-token' } }
+        : { url: `ws://192.168.1.2:18001/v1/${backendKind}/ws` };
+      await store.upsert({ id: 'stable-native', backendKind, transportKind, label, ...identity, auth: { token: 'before' } });
+      const refreshed = await store.upsert({ backendKind, transportKind, ...identity,
+        label: `${backendKind === 'codex' ? 'Codex' : 'Claude Code'} · New computer name`, auth: { token: 'after' } });
+      expect(refreshed).toMatchObject({ created: false, connection: { id: 'stable-native', label } });
+      expect(store.getSnapshot().connections).toHaveLength(1);
+      await store.createAdapter('stable-native', (record, descriptor) => {
+        expect(record.auth?.token).toBe('after');
+        return createMockAdapter({ connection: descriptor });
+      });
+    }
+  });
+
+  it.each(['codex', 'claude-code'] as const)('keeps different %s computers separate even with identical device labels', async backendKind => {
+    const store = new ConnectionStore({ secureStorage: new MemorySecureStorage(), legacyStorage: legacyStorage(), now: () => 200, random: () => 0 });
+    const label = `${backendKind === 'codex' ? 'Codex' : 'Claude Code'} · Studio Mac`;
+    for (const gatewayId of ['first', 'second']) {
+      await store.upsert({ id: gatewayId, backendKind, transportKind: 'relay', label, url: 'wss://relay.example/ws',
+        relay: { serverUrl: 'https://registry.example', gatewayId, clientToken: 'token' } });
+    }
+    expect(store.getSnapshot().connections).toHaveLength(2);
   });
 
   it('upserts the same direct Hermes bridge while keeping its stable record identity', async () => {

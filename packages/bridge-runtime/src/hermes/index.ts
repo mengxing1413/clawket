@@ -1,12 +1,15 @@
+import { UpdateAdmission } from '../update-admission.js';
+import { HermesArtifacts } from './artifacts.js';
 import { SessionFileStore } from '../session-files.js';
-import { hermesFileRoots } from './session-files.js';
+import { HermesFileListing, hermesFileRoots } from './session-files.js';
 import { supportsHermesDocuments } from './documents.js';
 import { supportsHermesModelHealth } from './model-health.js';
 import { HermesRunControlMethods, readHermesRunCapabilities } from './run-control.js';
 import { supportsNativeRunContext } from './native-run-context.js';
 import { createServer, type Server as HttpServer } from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import { proveClawketHermesGateway, recordClawketHermesGateway, spawnHermesGateway, type HermesGatewayScope } from './gateway-process.js';
 import { resolveHermesCommand, resolveHermesSourcePath } from './installation.js';
 import { correlateActiveNativeTools, correlateLateNativeTools } from './tool-history.js';
 import WebSocket, { WebSocketServer } from 'ws';
@@ -16,6 +19,7 @@ import { HermesCommandMethods, type HermesModelState } from './commands.js';
 import { HermesCronMethods, supportsHermesCronModels } from './cron.js';
 import { HermesHttpServerMethods, inspectHermesApi, probeHermesApi, type HermesLocalBridgeClient } from './http-server.js';
 import { HermesManagementMethods } from './management.js';
+import { handleRemoteUpdateRequest, isRemoteUpdateMethod, type RemoteUpdateControl } from '../remote-update.js';
 import {
   HermesNativeSessionReader,
   decodeHermesHistoryCursor,
@@ -48,6 +52,7 @@ import {
   DEFAULT_SESSION_ID,
   HEALTH_POLL_INTERVAL_MS,
   HERMES_BOOT_TIMEOUT_MS,
+  HERMES_GATEWAY_OWNER_PATH,
   HERMES_STATE_DB_PATH,
   SESSION_STORE_PATH,
   USAGE_LEDGER_PATH,
@@ -55,8 +60,6 @@ import {
   buildHermesBridgeHttpUrl,
   buildHermesBridgeWsUrl,
   delay,
-  extractHostname,
-  extractPort,
   formatError,
   installHermesMethods,
   isRecord,
@@ -89,8 +92,11 @@ export type HermesLocalBridgeOptions = {
   bridgeToken?: string | null;
   displayName?: string | null;
   bridgeVersion?: string;
+  /** CLI-injected phone-started update control; see `../remote-update.ts`. */
+  remoteUpdate?: RemoteUpdateControl;
   sessionStorePath?: string;
   usageLedgerPath?: string;
+  gatewayOwnerPath?: string;
   hermesStateDbPath?: string;
   startHermesIfNeeded?: boolean;
   hermesCommand?: string;
@@ -110,10 +116,19 @@ export class HermesLocalBridge {
   readonly bridgeToken: string;
   readonly displayName: string;
   readonly bridgeVersion: string | undefined;
+  readonly remoteUpdate: RemoteUpdateControl | undefined;
   readonly hermesSourcePath: string;
   readonly hermesHomePath: string;
   private readonly sessionFiles = new SessionFileStore();
-  private listingFiles = false;
+  private readonly artifacts = new HermesArtifacts(
+    () => hermesFileRoots(this.runHermesPython.bind(this), this.hermesHomePath),
+    () => this.operationGeneration,
+  );
+
+  projectArtifactContent(key: string, content: unknown): unknown { return this.artifacts.content(key, content); }
+  private readonly workspaceFileListing = new HermesFileListing(this.sessionFiles,
+    key => this.getHermesSessionHistory(key, 200),
+    () => hermesFileRoots(this.runHermesPython.bind(this), this.hermesHomePath), () => this.operationGeneration);
   readonly hermesPythonPath: string;
   readonly pythonRunner: HermesPythonRunner;
   readonly nativeSessions: HermesNativeSessionReader;
@@ -148,6 +163,7 @@ export class HermesLocalBridge {
     this.bridgeToken = options.bridgeToken?.trim() || randomUUID();
     this.displayName = options.displayName?.trim() || DEFAULT_AGENT_NAME;
     this.bridgeVersion = normalizeBridgeVersion(options.bridgeVersion);
+    this.remoteUpdate = options.remoteUpdate;
     this.hermesSourcePath = options.hermesSourcePath?.trim() || resolveHermesSourcePath();
     this.hermesHomePath = options.hermesHomePath?.trim() || DEFAULT_HERMES_HOME_PATH;
     // The CLI persists the bridge token. Derive a separate, scope-bound API key
@@ -278,7 +294,7 @@ export class HermesLocalBridge {
   }
 
   async stop(): Promise<void> {
-    this.sessionFiles.clear();
+    this.sessionFiles.clear(); this.artifacts.clear();
     this.operationGeneration += 1;
     this.hermesRunCapabilities = new Set();
     this.runCapabilitiesLoaded = false;
@@ -355,8 +371,22 @@ export class HermesLocalBridge {
     }
 
     if (apiStatus === 'unauthorized') {
-      this.updateSnapshot({ hermesApiReachable: false, lastError: 'The running Hermes API rejected the configured API key. Set CLAWKET_HERMES_API_KEY to its API_SERVER_KEY, or explicitly restart the gateway with clawket hermes run --restart-hermes.' });
-      this.logPerf('hermes_api_probe', { result: 'unauthorized', elapsedMs: Date.now() - startedAt });
+      // Only Clawket's own spawn record may authorize replacing a gateway that
+      // rejects the current key, for example after re-pairing rotated it.
+      const ownership = this.options.startHermesIfNeeded === false
+        ? null
+        : await proveClawketHermesGateway(this.gatewayOwnerScope());
+      if (generation !== this.operationGeneration) return false;
+      this.logPerf('hermes_api_probe', {
+        result: 'unauthorized',
+        owner: ownership === null ? 'autostart_disabled' : ownership.owned ? 'clawket' : ownership.reason,
+        elapsedMs: Date.now() - startedAt,
+      });
+      if (ownership?.owned) {
+        this.log(`replacing Clawket-started Hermes gateway pid=${ownership.pid}; it rejected the current API key`);
+        return this.startHermesGatewayProcess();
+      }
+      this.updateSnapshot({ hermesApiReachable: false, lastError: 'The running Hermes API rejected the configured API key. Clawket replaces only a gateway it can prove it started, so it left this one running. Set CLAWKET_HERMES_API_KEY to its API_SERVER_KEY, or rerun Clawket pairing with --restart-hermes to restart it.' });
       return false;
     }
 
@@ -387,32 +417,15 @@ export class HermesLocalBridge {
       apiBaseUrl: this.apiBaseUrl,
     });
     this.log(`starting hermes gateway via ${command}`);
-    // Hermes gateway stdout/stderr may contain prompts, assistant replies,
-    // tool invocations, and other session data. Clawket must not persist
-    // that content to its log files, so by default we route the child's
-    // stdio to /dev/null via `stdio: 'ignore'`. Diagnostic metadata
-    // (startup, health probe, exit code) is emitted via this class's own
-    // `this.log()` calls and is unaffected. For local debugging, opt in
-    // with `CLAWKET_HERMES_VERBOSE=1`; verbose output may contain
-    // sensitive data and must not be shared.
-    const verboseHermesStdio = process.env.CLAWKET_HERMES_VERBOSE === '1';
     // Current Hermes requires an authenticated API even on loopback. A key for
     // our child is scoped separately from the bridge token and reused by API requests.
     this.apiKey ??= randomUUID();
-    const hermesChildEnv: NodeJS.ProcessEnv = {
-      ...process.env,
-      HERMES_HOME: this.hermesHomePath,
-      API_SERVER_ENABLED: 'true',
-      API_SERVER_KEY: this.apiKey,
-      API_SERVER_HOST: extractHostname(this.apiBaseUrl),
-      API_SERVER_PORT: String(extractPort(this.apiBaseUrl)),
-    };
-    // Strip the bridge token before inheriting env into hermes gateway.
-    // Hermes does not need it, and we keep its blast radius minimal.
-    delete hermesChildEnv.CLAWKET_HERMES_BRIDGE_TOKEN;
-    this.hermesChild = spawn(command, ['gateway', 'run', '--replace'], {
-      env: hermesChildEnv,
-      stdio: verboseHermesStdio ? 'pipe' : 'ignore',
+    this.hermesChild = spawnHermesGateway({
+      command,
+      apiBaseUrl: this.apiBaseUrl,
+      apiKey: this.apiKey,
+      hermesHomePath: this.hermesHomePath,
+      log: (line) => this.log(line),
     });
     this.managedApi = true;
 
@@ -427,21 +440,6 @@ export class HermesLocalBridge {
       if (this.hermesChild === child) this.hermesChild = null;
       this.log(spawnFailure.message);
     });
-
-    if (verboseHermesStdio) {
-      this.log(
-        'CLAWKET_HERMES_VERBOSE=1: forwarding hermes gateway stdio to bridge logs. ' +
-          'Output may contain prompts, responses, and other session data; do not share these logs.',
-      );
-      this.hermesChild.stdout?.on('data', (chunk) => {
-        const text = chunk.toString().trim();
-        if (text) this.log(`[hermes] ${text}`);
-      });
-      this.hermesChild.stderr?.on('data', (chunk) => {
-        const text = chunk.toString().trim();
-        if (text) this.log(`[hermes] ${text}`);
-      });
-    }
     this.hermesChild.once('exit', (code) => {
       this.log(`hermes gateway exited code=${code ?? 'null'}`);
       if (generation !== this.operationGeneration || this.hermesChild !== child) return;
@@ -449,6 +447,10 @@ export class HermesLocalBridge {
       this.apiRecoveryAfterMs = Math.max(this.apiRecoveryAfterMs, Date.now() + 30_000);
       this.updateSnapshot({ hermesApiReachable: false, lastError: 'The managed Hermes API stopped. Clawket will retry starting it automatically.' });
     });
+    // Ownership evidence outlives this Bridge: the gateway keeps running after stop.
+    if (child.pid !== undefined && !await recordClawketHermesGateway(this.gatewayOwnerScope(), child.pid)) {
+      this.log('could not record this Hermes gateway as Clawket-started; a later API key change will need --restart-hermes');
+    }
 
     const startMs = Date.now();
     while (Date.now() - startMs < HERMES_BOOT_TIMEOUT_MS) {
@@ -473,6 +475,14 @@ export class HermesLocalBridge {
     });
     this.log(error);
     return false;
+  }
+
+  private gatewayOwnerScope(): HermesGatewayScope {
+    return {
+      ownerPath: this.options.gatewayOwnerPath?.trim() || HERMES_GATEWAY_OWNER_PATH,
+      apiBaseUrl: this.apiBaseUrl,
+      hermesHomePath: this.hermesHomePath,
+    };
   }
 
   async refreshHermesHealth(): Promise<void> {
@@ -728,7 +738,7 @@ export class HermesLocalBridge {
   resetHermesSession(key: string): { ok: true; key: string; sessionId: string } {
     if (!this.sessionStore.owns(key)) throw new Error(`Hermes native session is read-only: ${key}`);
     this.cancelActiveRunsForSession(key);
-    this.sessionFiles.forget(key);
+    this.sessionFiles.forget(key); this.artifacts.forget(key);
     const session = this.sessionStore.resetSession(key);
     return { ok: true, key, sessionId: session.sessionId };
   }
@@ -736,10 +746,15 @@ export class HermesLocalBridge {
   deleteHermesSession(key: string): { ok: true; key: string } {
     if (!this.sessionStore.owns(key)) throw new Error(`Hermes native session is read-only: ${key}`);
     this.cancelActiveRunsForSession(key);
-    this.sessionFiles.forget(key);
+    this.sessionFiles.forget(key); this.artifacts.forget(key);
     this.sessionStore.deleteSession(key);
     this.updateSnapshot({ sessionCount: this.sessionStore.count() });
     return { ok: true, key };
+  }
+
+  private readonly updateAdmission = new UpdateAdmission();
+  prepareForUpdate(): boolean {
+    return this.updateAdmission.prepare(() => this.activeRuns.size > 0 || this.pendingRunStarts.size > 0 || this.queuedMutations > 0);
   }
 
   private operationGeneration = 0;
@@ -747,6 +762,12 @@ export class HermesLocalBridge {
   private queuedMutations = 0;
 
   async dispatchRequest(method: string, params: unknown): Promise<unknown> {
+    return this.updateAdmission.request(() => this.dispatchAdmittedRequest(method, params));
+  }
+
+  private async dispatchAdmittedRequest(method: string, params: unknown): Promise<unknown> {
+    // The updater runs out of process and waits for idle work, so starting it never queues behind mutations.
+    if (isRemoteUpdateMethod(method)) return handleRemoteUpdateRequest(this.remoteUpdate, method);
     // Keep whole config/session mutations serialized after making Python nonblocking.
     // Read-only requests and health must never wait behind these operations.
     if (/^(model\.set|skills\.(install|update|delete|content\.update)|hermes\.(reasoning|fast)\.set|hermes\.cron\.jobs\.(create|update|pause|resume|run|remove)|chat\.send)$/.test(method)) {
@@ -806,28 +827,20 @@ export class HermesLocalBridge {
       }
       case 'sessions.create':
         return { session: this.createHermesSession(payload) };
-      case 'clawket.files.list': {
-        const key = readString(payload.sessionKey);
-        if (!key || key.length > 1024 || this.listingFiles) throw new Error('Session files unavailable.');
-        this.listingFiles = true;
-        const generation = this.operationGeneration;
-        try {
-          const history = await this.getHermesSessionHistory(key, 200);
-          const roots = await hermesFileRoots(this.runHermesPython.bind(this), this.hermesHomePath);
-          if (generation !== this.operationGeneration) throw new Error('Connection changed.');
-          return { files: this.sessionFiles.list(key, history.messages, roots) };
-        } finally { this.listingFiles = false; }
-      }
+      case 'clawket.artifacts.open': return this.artifacts.resolve(payload.sessionKey, payload.artifactId, cursor =>
+        this.artifacts.history(String(payload.sessionKey), () => this.getHermesSessionHistory(String(payload.sessionKey), 200, cursor), cursor));
+      case 'clawket.artifacts.read': return this.artifacts.read(payload.sessionKey, payload.id, payload.offset);
+      case 'clawket.files.list': return this.workspaceFileListing.list(readString(payload.sessionKey));
       case 'clawket.files.read':
         return this.sessionFiles.read(readString(payload.sessionKey), readString(payload.id), payload.offset as number);
       case 'chat.history': {
         const sessionKey = readString(payload.sessionKey);
         if (!sessionKey) throw new Error('chat.history requires sessionKey.');
-        return this.traceBridgeRequest(method, requestStartedAt, requestSeq, (await this.getHermesSessionHistory(
+        return this.traceBridgeRequest(method, requestStartedAt, requestSeq, (await this.artifacts.history(sessionKey, () => this.getHermesSessionHistory(
           sessionKey,
           readPositiveInt(payload.limit, 50),
           payload.cursor,
-        )));
+        ), payload.cursor)));
       }
       case 'exec.approval.list':
         return this.listRunApprovals(readString(payload.sessionKey));

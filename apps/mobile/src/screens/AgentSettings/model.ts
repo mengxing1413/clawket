@@ -71,8 +71,6 @@ export type AgentSettingsGroupDescriptor = Readonly<{
 export type AgentSettingsModel = Readonly<{
   identity: Readonly<{
     name: string;
-    /** Account line supplied by the backend (the YouMind email); the hero shows no line otherwise. */
-    detail?: string;
     /** Product the Agent lives on; rendered as the avatar's corner mark, never as a text line. */
     backend: ConnectionDescriptor['backendKind'];
     backendLabel: string;
@@ -92,7 +90,6 @@ export type BuildAgentSettingsModelInput = Readonly<{
   connectionState: ConnectionState;
   isPro: boolean;
   permissionDenied?: boolean;
-  identityDetail?: string;
   summary?: AgentSettingsSummary;
   /** Agents on this connection; the Gateway heartbeat is global, so it only describes a lone Agent. */
   agentCount?: number;
@@ -131,7 +128,6 @@ type StatDefinition = Gate & Readonly<{
 const BACKEND_LABELS: Readonly<Record<ConnectionDescriptor['backendKind'], string>> = {
   openclaw: 'OpenClaw',
   hermes: 'Hermes',
-  youmind: 'YouMind',
   'local-model': 'Local model',
   pi: 'Pi',
   codex: 'Codex',
@@ -199,13 +195,15 @@ const STATS: ReadonlyArray<StatDefinition> = [
   {
     id: 'files',
     placement: 'tile',
-    capabilities: ['files'],
+    capabilities: ['files', 'profileManagement'],
+    capabilityMode: 'any',
     title: () => 'Memory',
     value: (summary) => formatCount(summary.fileCount),
   },
 ];
 
 const CONNECTION_ROWS: ReadonlyArray<RowDefinition> = [
+  { id: 'plugins', placement: 'advanced', title: 'Plugins', capabilities: ['profileManagement'], value: () => undefined },
   {
     id: 'openclaw',
     placement: 'advanced',
@@ -217,7 +215,8 @@ const CONNECTION_ROWS: ReadonlyArray<RowDefinition> = [
     id: 'tools',
     placement: 'advanced',
     title: 'Tools',
-    capabilities: ['tools'],
+    capabilities: ['tools', 'profileManagement'],
+    capabilityMode: 'any',
     value: (summary) => formatCount(summary.toolCount),
   },
   {
@@ -244,7 +243,7 @@ const CONNECTION_ROWS: ReadonlyArray<RowDefinition> = [
     // management rows rather than leading them.
     id: 'connection',
     placement: 'primary',
-    title: 'Connection',
+    title: 'Connection settings',
     value: (_summary, connectionState) => CONNECTION_STATE_LABELS[connectionState],
     attention: (_summary, connectionState) => connectionState !== 'ready',
   },
@@ -275,7 +274,6 @@ export function buildAgentSettingsModel(
   return {
     identity: {
       name: input.agent.name,
-      detail: cleanValue(input.identityDetail),
       backend: input.connection.backendKind,
       backendLabel,
       activeMinutesAgo: input.capabilities.heartbeat && (input.agentCount ?? 1) <= 1
@@ -326,7 +324,7 @@ function buildRows(
       id: definition.id,
       section: definition.id,
       placement: definition.placement,
-      title: definition.title,
+      title: capabilities.profileManagement && definition.id === 'tools' ? 'MCP' : definition.title,
       value: definition.value(summary, connectionState),
       attention: definition.attention?.(summary, connectionState) ?? false,
       locked: permissionDenied || (definition.requiresPro === true && !isPro),

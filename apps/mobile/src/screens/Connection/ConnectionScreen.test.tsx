@@ -74,15 +74,20 @@ jest.mock('../../components/ui/Button', () => {
   const ReactRuntime = require('react');
   const { Pressable, Text } = require('react-native');
   return {
-    Button: ({ testID, label, onPress, disabled, variant }: { testID?: string; label: string; onPress: () => void; disabled?: boolean; variant?: string }) => (
-      ReactRuntime.createElement(Pressable, { testID, onPress, disabled, variant }, ReactRuntime.createElement(Text, null, label))
+    Button: ({ testID, label, onPress, disabled, variant, accessibilityLabel, multiline }: { testID?: string; label: string; onPress: () => void; disabled?: boolean; variant?: string; accessibilityLabel?: string; multiline?: boolean }) => (
+      ReactRuntime.createElement(Pressable, { testID, onPress, disabled, variant, accessibilityLabel, multiline }, ReactRuntime.createElement(Text, null, label))
     ),
   };
 });
 jest.mock('../../components/ui/Banner', () => {
   const ReactRuntime = require('react');
-  const { Text } = require('react-native');
-  return { Banner: ({ message }: { message: string }) => ReactRuntime.createElement(Text, null, message) };
+  const { Text, Pressable } = require('react-native');
+  return { Banner: ({ message, actionLabel, onAction }: { message: string; actionLabel?: string; onAction?: () => void }) => ReactRuntime.createElement(
+    ReactRuntime.Fragment,
+    null,
+    ReactRuntime.createElement(Text, null, message),
+    actionLabel ? ReactRuntime.createElement(Pressable, { testID: 'banner-action', onPress: onAction }, ReactRuntime.createElement(Text, null, actionLabel)) : null,
+  ) };
 });
 jest.mock('../../components/ui/ConfirmationModal', () => {
   const ReactRuntime = require('react');
@@ -238,14 +243,38 @@ describe('ConnectionScreen', () => {
     expect(onResume).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a failure notice in place while the next attempt runs and clears it only on success', async () => {
+    let finish!: () => void;
+    const onReconnect = jest.fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const view = render(<ConnectionScreen {...props({ onReconnect })} />);
+    await flush();
+    await act(async () => { fireEvent.press(view.getByTestId('connection-reconnect')); });
+    expect(view.getByText('Please try again later.')).toBeTruthy();
+    await act(async () => { fireEvent.press(view.getByTestId('connection-reconnect')); });
+    expect(onReconnect).toHaveBeenCalledTimes(2);
+    expect(view.getByText('Please try again later.')).toBeTruthy();
+    await act(async () => { finish(); });
+    expect(view.queryByText('Please try again later.')).toBeNull();
+  });
+
   it('keeps Reconnect quiet while online and makes the needed action the ink one', async () => {
     const view = render(<ConnectionScreen {...props({ active: true, state: 'ready' })} />);
     await flush();
-    expect(view.getByTestId('connection-reconnect').props.variant).toBe('outline');
+    // Reconnect and Pause share one row of borderless card capsules on the grouped canvas.
+    expect(view.getByTestId('connection-reconnect').props).toMatchObject({ variant: 'card', multiline: true });
     expect(view.getByText('Reconnect')).toBeTruthy();
+    expect(view.getByTestId('connection-pause').props).toMatchObject({
+      variant: 'card',
+      multiline: true,
+      accessibilityLabel: 'Pause connection',
+    });
+    expect(view.getByText('Pause')).toBeTruthy();
 
     view.rerender(<ConnectionScreen {...props({ active: true, state: 'offline' })} />);
     expect(view.getByTestId('connection-reconnect').props.variant).toBe('primary');
+    expect(view.getByTestId('connection-pause').props.variant).toBe('card');
 
     view.rerender(<ConnectionScreen {...props({ active: false, state: 'idle' })} />);
     expect(view.getByTestId('connection-reconnect').props.variant).toBe('primary');
@@ -277,5 +306,18 @@ describe('ConnectionScreen', () => {
     view.rerender(<ConnectionScreen {...props({ freeSlot: { current: true, switchAvailable: true, switching: false } })} />);
     expect(view.getByTestId('connection-free-current')).toBeTruthy();
     expect(view.getByText('Current')).toBeTruthy();
+  });
+
+  it('links an outdated Bridge to the shared guide with one short banner', async () => {
+    const onUpgradeBridge = jest.fn();
+    const view = render(<ConnectionScreen {...props()} />);
+    await flush();
+    expect(view.queryByText('New Bridge version')).toBeNull();
+
+    view.rerender(<ConnectionScreen {...props({ onUpgradeBridge })} />);
+    expect(view.getByText('New Bridge version')).toBeTruthy();
+    expect(view.getByText('Update')).toBeTruthy();
+    fireEvent.press(view.getByTestId('banner-action'));
+    expect(onUpgradeBridge).toHaveBeenCalledTimes(1);
   });
 });

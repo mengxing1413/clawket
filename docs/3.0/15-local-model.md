@@ -1,7 +1,7 @@
 # Local model connections
 
-The owner authorized this additive backend on 2026-09-11. Existing OpenClaw,
-Hermes and YouMind contracts stay compatible. Implementation is on
+The owner authorized this additive backend on 2026-09-11. Existing OpenClaw
+and Hermes contracts stay compatible. Implementation is on
 `feat/local-model-bridge`; it is not an npm or app-store release.
 
 ## Architecture
@@ -115,6 +115,13 @@ then run `npm run --workspace clawket build:android:preview`. This creates only
 a debug APK. After installing it on a device, `npm run mobile:dev:android`
 configures adb reverse and starts Metro; use `ANDROID_SERIAL` when multiple
 devices are connected. iOS native builds still require macOS/Xcode.
+
+The managed supervisor publishes its control credential atomically after acquiring
+the exclusive pipe/socket. Concurrent start during owner replacement may read
+the previous credential before connecting to the new owner. A rejected response
+is retried only when the saved credential demonstrably changed, within the existing
+15-second start budget; that retry does not spawn another owner. Unchanged invalid
+responses still fail. Status and stop do not silently retry across generations.
 
 ## Windows acceptance evidence (2026-09-11)
 

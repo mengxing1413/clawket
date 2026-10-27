@@ -1,8 +1,10 @@
+import { extractHistoryAttachments } from './gateway-attachments';
 import type { AdapterErrorCode, SessionUpdate, Usage } from '@clawket/agent-protocol';
 
 export type GatewayAdapterEvent =
   | { type: 'chatRunStart'; payload: { runId: string; sessionKey?: string } }
   | { type: 'chatDelta'; payload: { runId: string; sessionKey?: string; text: string } }
+  | { type: 'chatCommentary'; payload: { runId: string; sessionKey?: string; itemId: string; text: string } }
   | {
       type: 'chatTool';
       payload: {
@@ -24,7 +26,7 @@ export type GatewayAdapterEvent =
         sessionKey?: string;
         message?: {
           role?: string;
-          content?: string | Array<{ type: string; text?: string }>;
+          content?: string | Array<{ type: string; text?: string; artifactDisplayText?: string }>;
           provider?: string;
           model?: string;
         };
@@ -88,6 +90,14 @@ export function mapGatewayAdapterEvent(
         runId: event.payload.runId,
         text: event.payload.text,
       }];
+    case 'chatCommentary':
+      return [{
+        type: 'agent_commentary_chunk',
+        sessionKey,
+        runId: event.payload.runId,
+        itemId: event.payload.itemId,
+        text: event.payload.text,
+      }];
     case 'chatTool':
       if (event.payload.phase === 'start') {
         return [{
@@ -110,6 +120,7 @@ export function mapGatewayAdapterEvent(
       }];
     case 'chatFinal': {
       const text = extractGatewayMessageText(event.payload.message?.content);
+      const attachments = extractHistoryAttachments(event.payload.message?.content);
       return [{
         type: 'run_finished',
         sessionKey,
@@ -120,6 +131,7 @@ export function mapGatewayAdapterEvent(
           ? {
               role: 'assistant',
               content: text,
+              ...(attachments.length ? { attachments } : {}),
               provider: event.payload.message.provider,
               model: event.payload.message.model,
             }
@@ -219,14 +231,15 @@ export function mapGatewayErrorCode(code: string): AdapterErrorCode {
   if (normalized.includes('pairing_expired') || normalized.includes('claim_expired')) return 'pairing_expired';
   if (normalized.includes('pairing')) return 'pairing_required';
   if (normalized.includes('auth') || normalized.includes('unauthorized')) return 'unauthorized';
+  if (normalized.includes('timeout')) return 'timeout';
   if (
     normalized.startsWith('network')
     || normalized.startsWith('ws_')
     || normalized.includes('socket')
     || normalized.includes('dns')
   ) return 'network';
-  if (normalized.includes('challenge') || normalized.includes('bridge')) return 'bridge_offline';
-  if (normalized.includes('timeout')) return 'timeout';
+  if (normalized.includes('bridge')) return 'bridge_offline';
+  if (normalized.includes('challenge')) return 'server';
   if (normalized.includes('gateway') || normalized.includes('unavailable')) return 'gateway_offline';
   if (normalized.includes('network')) return 'network';
   if (normalized.includes('unsupported')) return 'unsupported';
@@ -234,12 +247,12 @@ export function mapGatewayErrorCode(code: string): AdapterErrorCode {
 }
 
 export function extractGatewayMessageText(
-  content?: string | Array<{ type: string; text?: string }>,
+  content?: string | Array<{ type: string; text?: string; artifactDisplayText?: string }>,
 ): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
   return content
     .filter((block) => block.type === 'text')
-    .map((block) => block.text ?? '')
+    .map((block) => block.artifactDisplayText ?? block.text ?? '')
     .join('');
 }

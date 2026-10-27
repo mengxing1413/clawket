@@ -4,7 +4,7 @@
 
 服务端 → Bridge npm → App 的顺序成立，但服务端部署后仍需支持未升级的 App 和 Bridge；发布新版 npm 不会自动升级用户电脑。兼容矩阵见 [2026-09-14 发布兼容性报告](release-compatibility-2026-09-14.md)，最新证据与未关闭风险见 [2026-09-16 最终检查](final-release-review-2026-09-16.md)。
 
-1. 固定候选提交和发布包，跑 `check:required`、`test:compat`、`relay:test:integration`、`bridge:cli:verify-package`。导出当时 Production 四个 Worker 的只读代码快照，用 `CLAWKET_RELEASE_SNAPSHOTS=<directory> npm run test:release:compat` 验证混合服务版本、旧/新 Bridge 与存量配对。快照缺失必须失败。
+1. 固定候选提交和发布包，跑 `check:required`、`test:compat`、`relay:test:integration`、`bridge:cli:verify-package`。另跑 `security:audit` 留存最新报告，按实际交付依赖评估并记录修复或负责人接受的风险；依赖公告不阻挡普通 PR，审计退出码不代替发布判断（2026-10-07 负责人决定，详见 [CI 安全复核](../ci.md#independent-dependency-security-review)）。导出当时 Production 四个 Worker 的只读代码快照，用 `CLAWKET_RELEASE_SNAPSHOTS=<directory> npm run test:release:compat` 验证混合服务版本、旧/新 Bridge 与存量配对。快照缺失必须失败。
 2. Preview 部署 Registry → Relay，逐后端验证；OpenClaw 与 Hermes 的资源、凭据独立。完成旧 App 协议回放、新版 App 连接旧 Bridge 的测试，并在隔离候选服务上用实际已发布 2.x App 抽验。保存 Production 版本与恢复产物。
 3. **首次 Registry 迁移前准备恢复方案。** 新增 `PairRegisterRateLimiter` Durable Object 后，不能直接回滚到不导出该类的旧版本。先准备并验证保留新 DO 类、绑定、迁移及注册限速保护的恢复产物，或先建立支持迁移的兼容基线；故障时前向部署恢复产物。不得临时删除 DO 或限速来回退。
 4. 核对每个环境/后端的绑定与密钥。OpenClaw 六位码必须在对应 Registry/Relay 配置匹配且至少 32 字符的 `PAIRING_TICKET_SECRET`；只核对名称不会证明值相同，需实际配对验证。旧 QR / 12 位加密邀请兼容流程仍须保留。
@@ -33,7 +33,6 @@
 - [x] **AUTO 完成；HUMAN 待人：真机相机与相册。** 二维码扫描（折叠入口）→ 配对成功
 - [x] **AUTO 完成；HUMAN 待人：真实 LAN / Tailscale。** 直连 / Tailscale URL 配对 → 成功
 - [x] **AUTO 完成；HUMAN 待人：真实双 transport 与旧 Bridge。** Hermes 配对（Relay 与本地各一次）→ 成功；老 Bridge 时显示升级提示
-- [x] **AUTO 完成；HUMAN 待人：真实既有账户。** YouMind 新建入口按 09-14 决策隐藏；既有连接仍可恢复并聊天。标志重新开启时再验收邮箱验证码与新建流程。
 - [x] **AUTO 完成；HUMAN 待人：真实故障复现。** 配对码过期 / Bridge 未运行 / 无网络三种失败分别显示对应文案与动作
 - [x] **AUTO 完成；HUMAN 待人：真机打开链接。** 「还没有 Agent」链接只指向官方文档
 
@@ -49,12 +48,11 @@
 ### 3.3 线程
 
 - [x] **AUTO 完成；HUMAN 待人：长名称与实时布局。** 头部胶囊：名字、模型、上下文剩余；运行中变「正在用 …」；离线变灰
-- [x] **AUTO 完成；HUMAN 待人：三后端真机响应。** 发送、流式、停止键中止（三种后端各一次）
-- [x] **AUTO 完成；HUMAN 待人：照片选择/相机与真实交付。** 附件：OpenClaw 与 Hermes 发图成功；YouMind 无附件入口
+- [x] **AUTO 完成；HUMAN 待人：双后端真机响应。** 发送、流式、停止键中止（两种后端各一次）
+- [x] **AUTO 完成；HUMAN 待人：照片选择/相机与真实交付。** 附件：OpenClaw 与 Hermes 发图成功
 - [x] **AUTO 完成；HUMAN 待人：真实任务与日志。** 子 Agent 运行卡出现并可打开；Cron 结果卡出现；失败带查看日志（Pro）
 - [x] **AUTO 完成；HUMAN 待人：真实审批生命周期。** exec 审批卡：允许 / 拒绝 / 长按总是允许；配对请求卡
 - [x] **AUTO 完成；HUMAN 待人：长实时历史。** 上拉加载更早历史；压缩系统事件行
-- [x] **AUTO 完成；HUMAN 待人：真实 Sprite 账户与网络。** YouMind：首次进入自动开场（不显示 WakeUp）；中止；断网后恢复对账
 - [x] **AUTO 完成；HUMAN 待人：真实命令。** Hermes：斜杠命令回执为系统事件行
 - [x] **AUTO 完成；HUMAN 待人：OS 辅助功能视觉检查。** 减动效开启时无位移动画，且跳过会话交叉淡入
 
@@ -67,7 +65,7 @@
 
 ### 3.5 设置
 
-- [x] **AUTO 完成；HUMAN 待人：真实值与视觉。** Agent 设置：Agent 组 5 行、连接组 5 行按能力显隐；Hermes 7 行；YouMind 只读身份 + 连接状态，邮箱只在私有 route-scoped Agent Settings 显示
+- [x] **AUTO 完成；HUMAN 待人：真实值与视觉。** Agent 设置：Agent 组 5 行、连接组 5 行按能力显隐；Hermes 7 行
 - [x] **AUTO 完成；HUMAN 待人：真实 OpenClaw/Hermes 各保存一次。** 每个二级页可打开并保存一次：模型、技能（已安装 / 发现 / 安装）、定时（含心跳、创建、运行）、文件（编辑保存 Pro）、用量、OpenClaw 管理四分段（Pro）、工具、渠道与设备（配对请求）、日志（Pro）
 - [x] **AUTO 完成；HUMAN 待人：OS 图标/语音/通知。** 账户设置：Pro 状态、连接增删、主题 / 强调色 / 聊天外观 / 图标（Pro）、语音、通知、帮助链接、社区、关于、开发者（Debug、Preview、设计系统、重置）
 

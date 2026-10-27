@@ -10,6 +10,7 @@ import { routeGatewayEvent } from '../connection/protocol/events';
 import { mapGatewayAdapterEvent, type GatewayAdapterEvent } from '../connection/adapters/gateway-session-update';
 import { buildChildSessionActivityCards } from './childSessionActivity';
 import { useChildRunRecords } from './useChildRunRecords';
+import { buildThreadTimelineItems } from '../screens/Thread/model';
 
 const historyMock = {
   sessionKey: 'agent:main:main' as string | null,
@@ -19,6 +20,7 @@ const historyMock = {
   hasMoreHistory: false,
   loadingMoreHistory: false,
   historyLoaded: true,
+  activitySnapshot: null as (import('@clawket/agent-protocol').SessionHistory & { requestedAtMs: number }) | null,
   messages: [] as any[],
   thinkingLevel: null as string | null,
   historyLimitRef: { current: 50 },
@@ -43,6 +45,7 @@ const historyMock = {
   restoreCachedMessages: jest.fn().mockResolvedValue(undefined),
   loadSessionsAndHistory: jest.fn().mockResolvedValue(undefined),
   reconcileLatestAssistantFromHistory: jest.fn().mockResolvedValue(undefined),
+  captureSessionScope: jest.fn(() => () => true),
   refreshCurrentSessionHistory: jest.fn().mockResolvedValue(undefined),
 };
 
@@ -89,7 +92,7 @@ jest.mock('expo-document-picker', () => ({
 
 
 jest.mock('../services/auto-app-review', () => ({
-  recordSuccessfulSendForAutomaticReview: jest.fn().mockResolvedValue(undefined),
+  recordCompletedTurnForAutomaticReview: jest.fn().mockResolvedValue(undefined),
 }));
 
 jest.mock('../services/storage', () => ({
@@ -159,6 +162,9 @@ jest.mock('./useChatVoiceInput', () => ({
 
 jest.mock('./useChatModelPicker', () => ({
   useChatModelPicker: jest.fn(() => ({
+    runtimeSettingsBusy: false,
+    runtimeSettingsPendingRef: { current: false },
+    runtimeSettingsUnconfirmedRef: { current: false },
     availableModels: [],
     modelPickerError: null,
     modelPickerLoading: false,
@@ -193,7 +199,7 @@ jest.mock('../services/analytics/events', () => ({
 }));
 
 function createAdapter(backendKind: BackendKind = 'openclaw') {
-  const transportKinds = { openclaw: 'relay', hermes: 'relay', 'local-model': 'relay', pi: 'relay', codex: 'relay', 'claude-code': 'relay', youmind: 'https' } as const;
+  const transportKinds = { openclaw: 'relay', hermes: 'relay', 'local-model': 'relay', pi: 'relay', codex: 'relay', 'claude-code': 'relay' } as const;
   return {
     state: 'connecting',
     capabilities: resolveCapabilities(backendKind),
@@ -250,6 +256,7 @@ describe('useChatController adapter event migration', () => {
     historyMock.sessions = [{ key: 'agent:main:main', kind: 'direct' as const }];
     historyMock.messages = [];
     historyMock.historyLoaded = true;
+    historyMock.activitySnapshot = null;
     historyMock.hasMoreHistory = false;
     historyMock.loadSessionsAndHistory.mockResolvedValue(undefined);
     mockAppContext.currentAgentId = 'main';
@@ -264,6 +271,300 @@ describe('useChatController adapter event migration', () => {
     });
     jest.useRealTimers();
     consoleErrorSpy.mockRestore();
+  });
+
+  it('dates each Codex commentary segment independently across two tool boundaries', () => {
+    const runAt = Date.UTC(2026, 9, 3, 20, 13, 35);
+    jest.setSystemTime(runAt);
+    const { result, handlers } = renderController('codex');
+    const receive = (update: any, receivedAt: number) => {
+      jest.setSystemTime(receivedAt);
+      act(() => handlers.onUpdate?.(mapAdapterSessionUpdate(update, { now: () => receivedAt })));
+    };
+    act(() => handlers.onState?.('ready'));
+    receive({ type: 'run_started', sessionKey: 'agent:main:main', runId: 'clock-run' }, runAt);
+    const firstAt = runAt + 4_000, secondAt = runAt + 94_000, thirdAt = runAt + 162_000;
+    const texts = ['I will run the first command.', 'The first command is still running.', 'The second command is now running.'];
+    for (const [index, at] of [firstAt, secondAt, thirdAt].entries()) {
+      receive({ type: 'agent_message_chunk', sessionKey: 'agent:main:main', runId: 'clock-run',
+        textMode: 'snapshot', text: texts.slice(0, index + 1).join('\n\n'), timestampMs: at }, at + 2_000);
+      const tail = result.current.listData.find(message => message.id === 'streaming');
+      expect(tail).toMatchObject({ text: texts[index], timestampMs: at });
+      const renderKey = tail?.renderKey;
+      // Later tokens cannot advance this paragraph's first observed clock or its identity.
+      receive({ type: 'agent_message_chunk', sessionKey: 'agent:main:main', runId: 'clock-run',
+        textMode: 'snapshot', text: texts.slice(0, index + 1).join('\n\n') + ' More.', timestampMs: at + 1_000 }, at + 3_000);
+      expect(result.current.listData.find(message => message.id === 'streaming')).toMatchObject({ timestampMs: at, renderKey });
+      if (index < 2) receive({ type: 'tool_call', sessionKey: 'agent:main:main', runId: 'clock-run',
+        toolCallId: `tool-${index}`, title: 'exec' }, at + 10_000);
+      // The Native cumulative stream includes the committed paragraph's last tokens.
+      texts[index] += ' More.';
+    }
+    expect(result.current.listData.filter(message => message.role === 'assistant').reverse()
+      .map(message => message.timestampMs)).toEqual([firstAt, secondAt, thirdAt]);
+  });
+
+  describe('OpenClaw commentary', () => {
+    const key = 'agent:main:main';
+    const user = { id: 'ask', role: 'user' as const, text: 'Run the commands', timestampMs: 1_000 };
+    const first = 'I will check the date.';
+    const second = 'The system has been running for eight days.';
+    const answer = 'All commands completed.';
+    const commentary = (itemId: string, text: string) => ({ type: 'agent_commentary_chunk', sessionKey: key, runId: 'run', itemId, text });
+    const reply = (text: string) => ({ type: 'agent_message_chunk', sessionKey: key, runId: 'run', text, textMode: 'snapshot' });
+    const tool = (status?: 'success') => status
+      ? { type: 'tool_call_update', sessionKey: key, runId: 'run', toolCallId: 'date', status }
+      : { type: 'tool_call', sessionKey: key, runId: 'run', toolCallId: 'date', title: 'exec' };
+    const transcript = (hasActiveRun: boolean, ...messages: any[]) => ({ type: 'history_reconciled', sessionKey: key,
+      history: { key, hasActiveRun, messages: [user, ...messages] } });
+    const nativeFirst = { id: 'native-c1', role: 'assistant', text: first, timestampMs: 2_000 };
+    const nativeTool = { id: 'toolcall_date', role: 'tool', text: '', timestampMs: 3_000, tool: { name: 'exec', callId: 'date', status: 'success' } };
+    // The Thread's empty reply placeholder is not a paragraph.
+    const texts = (rows: any[]) => rows.filter(row => row.role === 'assistant' && row.text).map(row => row.text);
+    const shown = (rows: any[]) => texts([...rows].reverse());
+    const start = () => {
+      jest.setSystemTime(1_000);
+      historyMock.messages = [user];
+      const rendered = renderController('openclaw');
+      const receive = (update: any) => act(() => rendered.handlers.onUpdate?.(mapAdapterSessionUpdate(update)));
+      act(() => rendered.handlers.onState?.('ready'));
+      receive({ type: 'run_started', sessionKey: key, runId: 'run' });
+      return { ...rendered, receive };
+    };
+
+    it('streams each commentary item as its own paragraph and keeps it through the run end', () => {
+      const { result, receive } = start();
+      receive(commentary('c1', 'I will check'));
+      receive(commentary('c1', first));
+      expect(result.current.listData.find(row => row.id === 'streaming')?.text).toBe(first);
+      receive(tool());
+      receive(tool('success'));
+      // Late updates for a settled item neither shorten it nor open a second row.
+      receive(commentary('c1', 'I will check'));
+      receive(commentary('c1', first));
+      expect(shown(result.current.listData)).toEqual([first]);
+      receive(commentary('c2', second));
+      receive(reply(answer));
+      expect(shown(result.current.listData)).toEqual([first, second, answer]);
+      expect(result.current.listData.find(row => row.id === 'streaming')?.text).toBe(answer);
+      receive({ type: 'run_finished', sessionKey: key, runId: 'run', stopReason: 'end_turn', message: { role: 'assistant', content: answer } });
+      expect(texts(historyMock.messages)).toEqual([first, second, answer]);
+      // The transcript brings the same paragraphs back: nothing is added or doubled.
+      receive(transcript(false, nativeFirst, nativeTool,
+        { id: 'native-c2', role: 'assistant', text: second, timestampMs: 4_000 },
+        { id: 'native-final', role: 'assistant', text: answer, timestampMs: 5_000 }));
+      expect(texts(historyMock.messages)).toEqual([first, second, answer]);
+    });
+
+    it('matches commentary the transcript already holds while the run continues', () => {
+      const { result, receive } = start();
+      receive(commentary('c1', first));
+      receive(tool());
+      receive(transcript(true, nativeFirst, nativeTool));
+      expect(shown(result.current.listData)).toEqual([first]);
+      receive(commentary('c2', second));
+      expect(shown(result.current.listData)).toEqual([first, second]);
+    });
+
+    it('keeps live commentary when a recovery read has no reply text yet', () => {
+      const { result, receive, rerender } = start();
+      receive(commentary('c1', first));
+      jest.setSystemTime(5_000);
+      historyMock.activitySnapshot = { key, messages: [user], hasActiveRun: true, requestedAtMs: 5_000,
+        activeRun: { runId: 'run', text: '', startedAtMs: 1_000 } } as any;
+      rerender({});
+      expect(result.current.listData.find(row => row.id === 'streaming')?.text).toBe(first);
+      receive(reply(answer));
+      expect(shown(result.current.listData)).toEqual([first, answer]);
+    });
+
+    it('continues a reply paragraph in place when it turns out to be commentary', () => {
+      const { result, receive } = start();
+      receive(reply('I will check'));
+      receive(commentary('c1', first));
+      expect(shown(result.current.listData)).toEqual([first]);
+      receive(tool());
+      receive(reply(answer));
+      expect(shown(result.current.listData)).toEqual([first, answer]);
+    });
+
+    it('keeps commentary still live at the run end as its own row', () => {
+      const { receive } = start();
+      receive(commentary('c1', first));
+      receive({ type: 'run_finished', sessionKey: key, runId: 'run', stopReason: 'end_turn', message: { role: 'assistant', content: answer } });
+      expect(texts(historyMock.messages)).toEqual([first, answer]);
+    });
+  });
+
+  it.each([undefined, null, 0, -1, NaN, Infinity, 1e20, '123'])('keeps a fixed first-receipt Codex paragraph clock when Native omits or corrupts it: %j', timestampMs => {
+    jest.setSystemTime(1_000);
+    const { result, handlers } = renderController('codex');
+    act(() => {
+      handlers.onState?.('ready');
+      handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'run_started', sessionKey: 'agent:main:main', runId: 'clock-run' }));
+    });
+    jest.setSystemTime(20_000);
+    act(() => handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'agent_message_chunk', sessionKey: 'agent:main:main', runId: 'clock-run', text: 'A new paragraph is arriving.', timestampMs } as any)));
+    expect(result.current.listData.find(message => message.id === 'streaming')?.timestampMs).toBe(20_000);
+    jest.setSystemTime(30_000);
+    act(() => handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'agent_message_chunk', sessionKey: 'agent:main:main', runId: 'clock-run', text: ' More.', timestampMs } as any)));
+    expect(result.current.listData.find(message => message.id === 'streaming')?.timestampMs).toBe(20_000);
+  });
+
+  it.each(['openclaw', 'hermes', 'pi'] as const)('retains the existing %s live clock when its stream has no stage metadata', backend => {
+    jest.setSystemTime(1_000);
+    const { result, handlers } = renderController(backend);
+    act(() => {
+      handlers.onState?.('ready');
+      handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'run_started', sessionKey: 'agent:main:main', runId: 'clock-run' }));
+    });
+    jest.setSystemTime(20_000);
+    act(() => handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'agent_message_chunk', sessionKey: 'agent:main:main', runId: 'clock-run', text: 'A paragraph is arriving.' })));
+    expect(result.current.listData.find(message => message.id === 'streaming')?.timestampMs).toBe(1_000);
+  });
+
+  it('restores the same Codex paragraph clock after transport disconnect without advancing it on later tokens', () => {
+    jest.setSystemTime(1_000);
+    const { result, handlers } = renderController('codex');
+    act(() => handlers.onState?.('ready'));
+    jest.setSystemTime(20_000);
+    act(() => handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'agent_message_chunk', sessionKey: 'agent:main:main',
+      runId: 'clock-run', text: 'A paragraph in progress.', timestampMs: 19_000 })));
+    act(() => handlers.onState?.('offline'));
+    jest.setSystemTime(30_000);
+    act(() => handlers.onState?.('ready'));
+    act(() => handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'agent_message_chunk', sessionKey: 'agent:main:main',
+      runId: 'clock-run', text: ' More.', timestampMs: 29_000 })));
+    expect(result.current.listData.find(message => message.id === 'streaming')?.timestampMs).toBe(19_000);
+  });
+
+  it('keeps a noncurrent Codex paragraph first clock and isolates it from the previous selected conversation', () => {
+    jest.setSystemTime(10_000);
+    const { result, rerender, handlers } = renderController('codex');
+    act(() => handlers.onState?.('ready'));
+    const receive = (sessionKey: string, text: string, timestampMs: number) => act(() => handlers.onUpdate?.(mapAdapterSessionUpdate({
+      type: 'agent_message_chunk', sessionKey, runId: sessionKey, text, timestampMs,
+    })));
+    receive('agent:main:main', 'The selected conversation paragraph.', 9_000);
+    receive('agent:main:other', 'Another conversation paragraph.', 11_000);
+    receive('agent:main:other', ' More.', 12_000);
+    historyMock.sessionKey = 'agent:main:other';
+    rerender({});
+    expect(result.current.listData.find(message => message.id === 'streaming')).toMatchObject({
+      text: 'Another conversation paragraph. More.', timestampMs: 11_000,
+    });
+    receive('agent:main:main', ' Later.', 15_000);
+    expect(result.current.listData.find(message => message.id === 'streaming')?.timestampMs).toBe(11_000);
+  });
+
+  it.each([true, false])('recovers a later Codex paragraph from active history (explicit tail clock: %s)', reported => {
+    jest.setSystemTime(30_000);
+    const { result, rerender } = renderController('codex');
+    historyMock.messages = [
+      { id: 'user', role: 'user', text: 'Request', timestampMs: 1_000 },
+      { id: 'first', role: 'assistant', text: 'Earlier paragraph.', timestampMs: 5_000 },
+      { id: 'toolcall_exec', role: 'tool', text: '', toolName: 'exec', toolCallId: 'exec', toolStatus: 'running', timestampMs: 7_000 },
+      { id: 'second', role: 'assistant', text: 'A later paragraph.', timestampMs: 19_000 },
+    ];
+    historyMock.activitySnapshot = { key: 'agent:main:main', messages: [], hasActiveRun: true, requestedAtMs: 30_000,
+      activeRun: { runId: 'clock-run', text: 'Earlier paragraph.\n\nA later paragraph.', startedAtMs: 1_000,
+        ...(reported ? { messageTimestampMs: 19_000 } : {}) } };
+    rerender({});
+    expect(result.current.listData.find(message => message.id === 'streaming')).toMatchObject({ text: 'A later paragraph.', timestampMs: 19_000 });
+    expect(result.current.listData.find(message => message.text === 'Earlier paragraph.')).toMatchObject({ timestampMs: 5_000 });
+  });
+
+  it('recovers the first clock of consecutive Codex assistant items merged into one tail without a tool', () => {
+    jest.setSystemTime(30_000);
+    const { result, rerender } = renderController('codex');
+    historyMock.messages = [
+      { id: 'user', role: 'user', text: 'Request', timestampMs: 1_000 },
+      { id: 'first', role: 'assistant', text: 'First paragraph.', timestampMs: 13_000 },
+      { id: 'second', role: 'assistant', text: 'Second paragraph.', timestampMs: 15_000 },
+    ];
+    historyMock.activitySnapshot = { key: 'agent:main:main', messages: [], hasActiveRun: true, requestedAtMs: 30_000,
+      activeRun: { runId: 'clock-run', text: 'First paragraph.\n\nSecond paragraph.', startedAtMs: 1_000, messageTimestampMs: 15_000 } };
+    rerender({});
+    expect(result.current.listData.find(message => message.id === 'streaming')).toMatchObject({
+      text: 'First paragraph.\n\nSecond paragraph.', timestampMs: 13_000,
+    });
+  });
+
+  it.each([false, true])('does not borrow an empty recovered Codex tail clock (previous tool: %s)', previousTool => {
+    jest.setSystemTime(10_000);
+    const { result, rerender, handlers } = renderController('codex');
+    act(() => handlers.onState?.('ready'));
+    historyMock.messages = previousTool ? [
+      { id: 'user', role: 'user', text: 'Request', timestampMs: 1_000 },
+      { id: 'first', role: 'assistant', text: 'Earlier paragraph.', timestampMs: 5_000 },
+      { id: 'toolcall_exec', role: 'tool', text: '', toolName: 'exec', toolCallId: 'exec', toolStatus: 'running', timestampMs: 7_000 },
+    ] : [];
+    historyMock.activitySnapshot = { key: 'agent:main:main', messages: [], hasActiveRun: true, requestedAtMs: 10_000,
+      activeRun: { runId: 'clock-run', text: previousTool ? 'Earlier paragraph.' : '', startedAtMs: 1_000,
+        ...(previousTool ? { messageTimestampMs: 5_000 } : {}) } };
+    rerender({});
+    jest.setSystemTime(20_000);
+    act(() => handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'agent_message_chunk', sessionKey: 'agent:main:main',
+      runId: 'clock-run', textMode: 'snapshot', text: `${previousTool ? 'Earlier paragraph.\n\n' : ''}A later paragraph.`, timestampMs: 19_000 })));
+    expect(result.current.listData.find(message => message.id === 'streaming')).toMatchObject({ text: 'A later paragraph.', timestampMs: 19_000 });
+  });
+
+  it.each([true, false])('restores a noncurrent Codex run as tool-bounded paragraphs with their own clocks (reported clocks: %s)', reported => {
+    const runAt = Date.UTC(2026, 9, 6, 2, 16, 54);
+    jest.setSystemTime(runAt);
+    const { result, rerender, handlers } = renderController('codex');
+    act(() => handlers.onState?.('ready'));
+    const other = 'agent:main:other';
+    const receive = (update: any, at: number) => {
+      jest.setSystemTime(at);
+      act(() => handlers.onUpdate?.(mapAdapterSessionUpdate(update, { now: () => at })));
+    };
+    const texts = ['First commentary.', 'Second commentary.', 'Third commentary.'];
+    const nativeAt = [runAt + 4_000, runAt + 95_000, runAt + 580_000];
+    receive({ type: 'run_started', sessionKey: other, runId: 'desktop:turn' }, runAt + 500);
+    texts.forEach((_, index) => {
+      receive({ type: 'agent_message_chunk', sessionKey: other, runId: 'desktop:turn', textMode: 'snapshot', text: texts.slice(0, index + 1).join('\n\n'),
+        ...(reported ? { timestampMs: nativeAt[index] } : {}) }, nativeAt[index]! + 1_000);
+      receive({ type: 'tool_call', sessionKey: other, runId: 'desktop:turn', toolCallId: `tool-${index}`, title: 'exec', status: 'running',
+        ...(reported ? { startedAtMs: nativeAt[index]! + 2_000 } : {}) }, nativeAt[index]! + 3_000);
+    });
+    receive({ type: 'tool_call_update', sessionKey: other, runId: 'desktop:turn', toolCallId: 'tool-0', status: 'success',
+      ...(reported ? { finishedAtMs: runAt + 40_000, durationMs: 33_000 } : {}) }, runAt + 41_000);
+    jest.setSystemTime(runAt + 600_000);
+    historyMock.sessionKey = other;
+    rerender({});
+    const rows = result.current.listData.slice().reverse();
+    expect(rows.filter(row => row.role === 'assistant' && row.text.trim()).map(row => [row.text, row.timestampMs])).toEqual(
+      texts.map((text, index) => [text, reported ? nativeAt[index] : nativeAt[index]! + 1_000]));
+    expect(rows.filter(row => row.role === 'tool').map(row => [row.id, row.toolStatus, row.toolStartedAt])).toEqual(
+      texts.map((_, index) => [`toolcall_tool-${index}`, index === 0 ? 'success' : 'running', nativeAt[index]! + (reported ? 2_000 : 3_000)]));
+    expect(rows.find(row => row.id === 'toolcall_tool-0')).toMatchObject(reported
+      ? { toolFinishedAt: runAt + 40_000, toolDurationMs: 33_000 } : { toolFinishedAt: runAt + 41_000, toolDurationMs: 34_000 });
+    // No earlier paragraph is repeated inside a tail dated by the run start.
+    expect(rows.some(row => row.role === 'assistant' && row.text.includes(texts[0]!) && row.text.includes(texts[2]!))).toBe(false);
+    expect(rows.filter(row => row.role === 'assistant' && row.text.trim() && row.timestampMs === runAt + 500)).toEqual([]);
+  });
+
+  it('keeps the native run time of a Codex step over the phone receipt span', () => {
+    jest.setSystemTime(1_000);
+    const { result, handlers } = renderController('codex');
+    const receive = (update: any, at: number) => {
+      jest.setSystemTime(at);
+      act(() => handlers.onUpdate?.(mapAdapterSessionUpdate(update, { now: () => at })));
+    };
+    act(() => handlers.onState?.('ready'));
+    receive({ type: 'run_started', sessionKey: 'agent:main:main', runId: 'run' }, 1_000);
+    receive({ type: 'tool_call', sessionKey: 'agent:main:main', runId: 'run', toolCallId: 'exec', title: 'exec', status: 'running', startedAtMs: 2_000 }, 9_000);
+    receive({ type: 'tool_call_update', sessionKey: 'agent:main:main', runId: 'run', toolCallId: 'exec', status: 'success',
+      startedAtMs: 2_000, finishedAtMs: 8_500, durationMs: 6_400 }, 10_000);
+    expect(result.current.listData.find(row => row.id === 'toolcall_exec')).toMatchObject({
+      toolStatus: 'success', toolStartedAt: 2_000, toolFinishedAt: 8_500, toolDurationMs: 6_400,
+    });
+    receive({ type: 'tool_call', sessionKey: 'agent:main:main', runId: 'run', toolCallId: 'legacy', title: 'exec' }, 11_000);
+    receive({ type: 'tool_call_update', sessionKey: 'agent:main:main', runId: 'run', toolCallId: 'legacy', status: 'success' }, 14_000);
+    expect(result.current.listData.find(row => row.id === 'toolcall_legacy')).toMatchObject({
+      toolStartedAt: 11_000, toolFinishedAt: 14_000, toolDurationMs: 3_000,
+    });
   });
 
   it.each(['NO', 'NO_'])('does not adopt silent reply prefix %s as the active visible run', (text) => {
@@ -306,6 +607,124 @@ describe('useChatController adapter event migration', () => {
 
     expect(result.current.isSending).toBe(false);
     expect(historyMock.messages).toEqual([]);
+  });
+
+  it.each(['missing', 'recent'])('keeps the latest reply after its user when an earlier matching reply has a %s timestamp', (timestampKind) => {
+    const previousMessages = [
+      { id: 'old-user', role: 'user', text: 'First question' },
+      { id: 'native-old-reply', role: 'assistant', text: 'OK', timestampMs: timestampKind === 'recent' ? Date.now() : undefined },
+      { id: 'current-user', role: 'user', text: 'Next question' },
+    ];
+    historyMock.messages = previousMessages;
+    const { result, handlers } = renderController('codex');
+
+    act(() => {
+      handlers.onState?.('ready');
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'run_started', sessionKey: 'agent:main:main', runId: 'current-run',
+      }));
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'run_finished', sessionKey: 'agent:main:main', runId: 'current-run',
+        stopReason: 'end_turn', message: { role: 'assistant', content: 'OK' },
+      }));
+    });
+
+    expect(result.current.isSending).toBe(false);
+    expect(historyMock.messages).toEqual([
+      ...previousMessages,
+      expect.objectContaining({ role: 'assistant', text: 'OK' }),
+    ]);
+  });
+
+  it('still merges a matching recovered reply after the latest user', () => {
+    historyMock.messages = [
+      { id: 'current-user', role: 'user', text: 'Question' },
+      { id: 'native-current-reply', role: 'assistant', text: 'OK' },
+    ];
+    const { handlers } = renderController('codex');
+    act(() => {
+      handlers.onState?.('ready');
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'run_started', sessionKey: 'agent:main:main', runId: 'current-run',
+      }));
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'run_finished', sessionKey: 'agent:main:main', runId: 'current-run',
+        stopReason: 'end_turn', message: { role: 'assistant', content: 'OK' },
+      }));
+    });
+    expect(historyMock.messages).toHaveLength(2);
+    expect(historyMock.messages[1]).toEqual(expect.objectContaining({ role: 'assistant', text: 'OK' }));
+    });
+
+  it.each([false, true])('retains the final reply completion clock and separator through repeated canonical reloads (tool: %s)', withTool => {
+    const { result, adapter, handlers } = renderController('codex');
+    const startedAt = 1727996280000, completedAt = startedAt + 31 * 60_000;
+    const user = { id: 'native-user', role: 'user' as const, text: 'Wait for my answer', timestampMs: startedAt };
+    historyMock.messages = [user];
+    act(() => {
+      handlers.onState?.('ready');
+      handlers.onUpdate?.(mapAdapterSessionUpdate({ type: 'run_started', sessionKey: 'agent:main:main', runId: 'clock-run' }, { now: () => startedAt }));
+      if (withTool) handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'tool_call', sessionKey: 'agent:main:main', runId: 'clock-run', toolCallId: 'clock-tool', title: 'exec',
+      }, { now: () => startedAt + 1000 }));
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'run_finished', sessionKey: 'agent:main:main', runId: 'clock-run', stopReason: 'end_turn',
+        message: { role: 'assistant', content: 'Done', timestampMs: completedAt },
+      }, { now: () => completedAt + 20_000 }));
+    });
+    const final = historyMock.messages.find(message => message.role === 'assistant');
+    expect(final).toMatchObject({ text: 'Done', timestampMs: completedAt });
+    const dates = () => buildThreadTimelineItems({ messages: [...historyMock.messages].reverse(), runs: [], nowMs: completedAt })
+      .filter(item => item.type === 'date').map(item => item.timestampMs);
+    expect(dates()).toContain(completedAt);
+    for (let count = 0; count < 2; count++) act(() => {
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'history_reconciled', sessionKey: 'agent:main:main', history: {
+          key: 'agent:main:main', hasActiveRun: false, messages: [user,
+            ...(withTool ? [{ id: 'toolcall_clock-tool', role: 'tool' as const, text: '', timestampMs: startedAt,
+              tool: { name: 'exec', callId: 'clock-tool', status: 'success' as const } }] : []),
+            { id: 'native-final', role: 'assistant' as const, text: 'Done', timestampMs: completedAt }],
+        },
+      }));
+    });
+    expect(historyMock.messages.filter(message => message.role === 'assistant')).toEqual([
+      expect.objectContaining({ text: 'Done', timestampMs: completedAt, renderKey: final.renderKey }),
+    ]);
+    expect(dates()).toContain(completedAt);
+    expect(result.current.isSending).toBe(false);
+    expect(adapter.prompt).not.toHaveBeenCalled();
+  });
+
+  it('keeps one failed native-turn notice after live completion and repeated history recovery', () => {
+    const { result, adapter, handlers } = renderController('codex');
+    const terminalMessage = {
+      id: 'codex-turn-error:native-failed-turn', role: 'system' as const,
+      text: 'Model authentication failed. Sign in again on your computer.', timestampMs: 200,
+    };
+    act(() => {
+      handlers.onState?.('ready');
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'run_started', sessionKey: 'agent:main:main', runId: 'bridge-failed-run',
+      }, { now: () => 100 }));
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'run_finished', sessionKey: 'agent:main:main', runId: 'bridge-failed-run',
+        stopReason: 'error', terminalMessage,
+        message: { role: 'assistant', content: terminalMessage.text },
+      }, { now: () => 200 }));
+    });
+    expect(result.current.isSending).toBe(false);
+    expect(historyMock.messages.filter(message => message.role === 'assistant')).toEqual([]);
+    expect(historyMock.messages.filter(message => message.id === terminalMessage.id)).toHaveLength(1);
+    for (let count = 0; count < 2; count++) act(() => {
+      handlers.onUpdate?.(mapAdapterSessionUpdate({
+        type: 'history_reconciled', sessionKey: 'agent:main:main',
+        history: { key: 'agent:main:main', hasActiveRun: false, messages: [terminalMessage] },
+      }));
+    });
+    expect(historyMock.messages.filter(message => message.id === terminalMessage.id)).toEqual([
+      expect.objectContaining(terminalMessage),
+    ]);
+    expect(adapter.prompt).not.toHaveBeenCalled();
   });
 
   it('persists an agent-event-only child through a cold controller mount using the real cache codec', async () => {

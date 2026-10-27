@@ -3,6 +3,8 @@ import type {
   ConnectionDescriptor,
   SessionDescriptor,
 } from '@clawket/agent-protocol';
+import { resolveCapabilities } from '@clawket/agent-protocol';
+import { availableSessionActions, buildSessionPanelRows } from '../../screens/SessionPanel/model';
 
 import type { DashboardCacheEntry } from '../../services/storage';
 import {
@@ -392,23 +394,6 @@ describe('aggregateRoster', () => {
     expect(order('cache')).toEqual(order('live'));
   });
 
-  it('adds backend subtitle metadata at the registry boundary', () => {
-    const youmindConnection: ConnectionDescriptor = {
-      ...connection('sprite', 1),
-      backendKind: 'youmind',
-      transportKind: 'https',
-    };
-    const groups = aggregateRoster([{
-      connection: youmindConnection,
-      source: 'live',
-      syncedAt: 100,
-      agents: [agent('sprite', 'main')],
-      sessions: [session('sprite', 'main', 'main:main', 100)],
-    }], 'sprite');
-
-    expect(groups[0].agents[0].subtitle).toEqual({ kind: 'backend', label: 'YouMind' });
-  });
-
   it('suppresses unread for a cached active connection and ignores cross-connection live rows', () => {
     const groups = aggregateRoster([{
       connection: connection('a', 1),
@@ -428,7 +413,7 @@ describe('aggregateRoster', () => {
   });
 });
 
-it.each(['openclaw', 'hermes', 'youmind'] as const)('counts only canonical main-chat unread for %s', (backendKind) => {
+it.each(['openclaw', 'hermes', 'local-model'] as const)('counts only canonical main-chat unread for %s', (backendKind) => {
   const input = {
     connection: { ...connection('a', 1), backendKind },
     source: 'live' as const,
@@ -454,6 +439,40 @@ it('retains native continuity and project metadata through a cold roster cache r
   await cache.set('c', [agent('c', 'codex')], [session('c', 'codex', 'native:one', 10, { source: 'native', canContinue: true, project })], 'ready');
   const cold = await new RosterCache({ storage }).get('c');
   expect(cold?.sessions[0]).toMatchObject({ source: 'native', canContinue: true, project });
+});
+
+it.each([false, true])('retains the native thread ID and reversible archive action in live and cold menu rows (archived: %s)', async (archived) => {
+  const storage = new MemoryCacheStorage();
+  const cache = new RosterCache({ storage });
+  const saved = await cache.set('c', [agent('c', 'codex')], [session('c', 'codex', 'bridge-session', 10, {
+    sessionId: 'native-thread-id', archived, allowedActions: { ...actions, archive: true },
+  })]);
+  const cold = await new RosterCache({ storage }).get('c');
+  expect(cold).not.toBeNull();
+  for (const snapshot of [saved, cold!]) {
+    const group = aggregateRoster([{
+      connection: { ...connection('c', 1), backendKind: 'codex' },
+      agents: snapshot.agents, sessions: snapshot.sessions, source: 'cache', syncedAt: snapshot.savedAt,
+    }], 'c')[0];
+    const row = buildSessionPanelRows(group)[0];
+    expect(row).toMatchObject({ sessionId: 'native-thread-id', archived, allowedActions: { archive: true } });
+    const menu = availableSessionActions(row, resolveCapabilities('codex'));
+    expect(menu).toEqual(expect.arrayContaining(['copy_id', 'archive']));
+    expect(menu).not.toContain('delete');
+    if (archived) expect(menu).toEqual(['copy_id', 'archive']);
+  }
+});
+
+it('does not infer archive support or native identity from invalid optional cache fields', async () => {
+  const cache = new RosterCache({ storage: new MemoryCacheStorage() });
+  const saved = await cache.set('c', [agent('c', 'codex')], [session('c', 'codex', 'legacy', 10, {
+    sessionId: 123 as unknown as string,
+    archived: 'false' as unknown as boolean,
+    allowedActions: { ...actions, archive: 'true' as unknown as boolean },
+  })]);
+  expect(saved.sessions[0]).not.toHaveProperty('sessionId');
+  expect(saved.sessions[0]).not.toHaveProperty('archived');
+  expect(saved.sessions[0].allowedActions).not.toHaveProperty('archive');
 });
 
 it('persists sessions-first entry without inventing a main chat', async () => {

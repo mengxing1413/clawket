@@ -1,3 +1,7 @@
+// Keep the real confirmation flow; native presentation measurement has its own boundary test.
+jest.mock('../../components/ui/PresentationSafeAreaProvider', () => ({
+  PresentationSafeAreaProvider: ({ children }: React.PropsWithChildren) => children,
+}));
 import React from 'react';
 import { act, fireEvent, render, waitFor } from '@testing-library/react-native';
 import { CAPABILITY_MATRIX, type AgentAdapter, type AgentDescriptor } from '@clawket/agent-protocol';
@@ -10,6 +14,7 @@ jest.mock('react-native', () => {
   const host = (name: string) => ReactRuntime.forwardRef(({ children, style, ...props }: Record<string, unknown>, ref: unknown) =>
     ReactRuntime.createElement(name, { ...props, ref, style: typeof style === 'function' ? style({ pressed: false }) : style }, children));
   return {
+    I18nManager: { isRTL: false },
     Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
     Pressable: host('Pressable'), View: host('View'), Text: host('Text'), TextInput: host('TextInput'), ScrollView: host('ScrollView'), ActivityIndicator: host('ActivityIndicator'),
     Modal: ({ visible, children }: { visible: boolean; children: React.ReactNode }) => visible ? children : null,
@@ -25,10 +30,11 @@ jest.mock('react-i18next', () => ({ useTranslation: () => ({
 }) }));
 jest.mock('react-native-safe-area-context', () => ({ useSafeAreaInsets: () => ({ top: 44, bottom: 34, left: 0, right: 0 }) }));
 jest.mock('../../theme', () => ({ useAppTheme: () => ({ theme: require('../../theme/theme').buildInterfaceTheme('light', 'light', require('../../theme/accents').builtInAccents.iceBlue) }) }));
-jest.mock('../../components/ui/ScreenHeader', () => ({ ScreenHeader: ({ title, onBack, rightContent }: Record<string, unknown>) => {
+jest.mock('../../components/ui/ScreenHeader', () => ({ ScreenHeader: ({ title, status, onBack, rightContent }: Record<string, unknown>) => {
   const R = require('react');
-  return R.createElement('View', null, R.createElement('Text', { testID: 'identity-title' }, title), R.createElement('Pressable', { testID: 'identity-back', onPress: onBack }), rightContent);
+  return R.createElement('View', null, status ?? R.createElement('Text', { testID: 'identity-title' }, title), R.createElement('Pressable', { testID: 'identity-back', onPress: onBack }), rightContent);
 } }));
+jest.mock('../../components/ui/ConnectionStatusPill', () => ({ ConnectionStatusPill: (props: Record<string, unknown>) => require('react').createElement('ConnectionStatusPill', props) }));
 jest.mock('../../components/ui/AgentAvatar', () => ({ AgentAvatar: (props: unknown) => require('react').createElement('Avatar', props) }));
 jest.mock('../../components/ui/FormTextInput', () => ({ FormTextInput: (props: unknown) => require('react').createElement('TextInput', props) }));
 jest.mock('../../components/ui/FloatingButton', () => ({ FloatingButton: (props: unknown) => require('react').createElement('Pressable', props) }));
@@ -203,6 +209,8 @@ describe('IdentityScreen', () => {
     const onRemoved = jest.fn();
     const view = render(<IdentityScreen {...data} agent={writer} online={false} isPro onOpenPaywall={jest.fn()} onRemoved={onRemoved} />);
     await waitFor(() => expect(view.getByTestId('agent-identity-profile-name')).toBeTruthy());
+    expect(view.getByTestId('agent-identity-offline').props.status).toBe('offline');
+    expect(view.queryByText('Offline · reconnecting')).toBeNull();
     expect(view.getByTestId('agent-identity-profile-name').props.editable).toBe(false);
     expect(view.getByTestId('agent-identity-delete').props.disabled).toBe(true);
 

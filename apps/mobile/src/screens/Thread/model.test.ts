@@ -1,12 +1,15 @@
 import { formatThreadTimestamp } from './timestamps';
 import type { AdapterErrorCode, Capabilities, CronJob } from '@clawket/agent-protocol';
 import type { UiMessage } from '../../types/chat';
+import { foldTurnSteps } from '../../components/chat/turn-work';
 import {
   buildCronRunSeeds,
   buildThreadTimelineItems,
   areThreadRunSeedsEqual,
+  copiedSessionTitle,
   deriveThreadContentState,
-  groupThreadTools,
+  fitThreadHeaderName,
+  placeTurnReceipts,
   withThreadRhythm,
   stabilizeThreadRows,
   formatThreadLocalTime,
@@ -15,8 +18,13 @@ import {
   resolveThreadErrorDetail,
   resolveThreadHeaderName,
   resolveThreadHeaderSubtitle,
+  threadHeaderAgentLabel,
   displayProjectPath,
   THREAD_ERROR_COPY,
+  groupThreadRuns,
+  isToolRunningInTurn,
+  resolveThreadWorkingStatus,
+  type ThreadRunCard,
 } from './model';
 
 const CAPABILITIES = {
@@ -155,29 +163,24 @@ describe('Thread model', () => {
     expect(resolveContextRemainingPercent(undefined, 100)).toBeNull();
   });
 
-  it('uses capability metadata to suppress model copy and prioritizes activity states', () => {
+  it('reads Online while idle and prioritizes activity states', () => {
     const base = {
-      capabilities: CAPABILITIES,
       state: { kind: 'ready' } as const,
       isRunning: false,
-      model: 'Sonnet',
-      contextUsed: 46,
-      contextWindow: 100,
       offlineLabel: 'Offline · reconnecting',
       thinkingLabel: 'Thinking…',
-      formatModelContext: (model: string, remaining: number) => `${model} · ${remaining}% left`,
+      onlineLabel: 'Online',
     };
 
-    expect(resolveThreadHeaderSubtitle(base)).toBe('Sonnet · 54% left');
-    expect(resolveThreadHeaderSubtitle({
-      ...base,
-      capabilities: { ...CAPABILITIES, models: false },
-    })).toBe('');
+    expect(resolveThreadHeaderSubtitle(base)).toBe('Online');
+    expect(resolveThreadHeaderSubtitle({ ...base, state: { kind: 'empty' } })).toBe('Online');
+    expect(resolveThreadHeaderSubtitle({ ...base, state: { kind: 'loading' } })).toBe('');
     expect(resolveThreadHeaderSubtitle({
       ...base,
       isRunning: true,
       activityLabel: 'Using exec…',
     })).toBe('Using exec…');
+    expect(resolveThreadHeaderSubtitle({ ...base, isRunning: true })).toBe('Thinking…');
     expect(resolveThreadHeaderSubtitle({
       ...base,
       state: { kind: 'offline' },
@@ -194,10 +197,55 @@ describe('Thread model', () => {
     expect(displayProjectPath('/Users2/lucy/app')).toBe('/Users2/lucy/app');
   });
 
+  it('titles a copied conversation within the Bridge title limit without splitting characters', () => {
+    const format = (title: string) => `${title} (copy)`;
+    expect(copiedSessionTitle('  Fix login  ', format)).toBe('Fix login (copy)');
+    expect(copiedSessionTitle(`${'a'.repeat(195)}😀😀`, format)).toBe(`${'a'.repeat(192)}… (copy)`);
+    expect(copiedSessionTitle(`${'a'.repeat(190)}${'😀'.repeat(5)}`, format)).toBe(`${'a'.repeat(190)}😀… (copy)`);
+    expect(copiedSessionTitle(`${'a'.repeat(193)}`, format)).toBe(`${'a'.repeat(193)} (copy)`);
+    // No usable source title, or a format that cannot fit, keeps the Bridge's own default title.
+    expect(copiedSessionTitle('   ', format)).toBeUndefined();
+    expect(copiedSessionTitle(null, format)).toBeUndefined();
+    expect(copiedSessionTitle('abc', (title) => `${title}${'x'.repeat(300)}`)).toBeUndefined();
+  });
+
   it('adds a session title only for non-main sessions', () => {
-    expect(resolveThreadHeaderName('Atlas', 'Main', true)).toBe('Atlas');
-    expect(resolveThreadHeaderName('Atlas', 'Build release', false)).toBe('Atlas · Build release');
-    expect(resolveThreadHeaderName('Atlas', '  ', false)).toBe('Atlas');
+    expect(resolveThreadHeaderName('Atlas', 'Main', true)).toEqual({ agent: 'Atlas', session: null });
+    expect(resolveThreadHeaderName('Atlas', ' Build release ', false)).toEqual({ agent: 'Atlas', session: 'Build release' });
+    expect(resolveThreadHeaderName('Atlas', '  ', false)).toEqual({ agent: 'Atlas', session: null });
+    expect(resolveThreadHeaderName('Atlas', 'Atlas', false)).toEqual({ agent: 'Atlas', session: null });
+  });
+
+  it('drops only the Bridge-generated brand that the product face already shows', () => {
+    expect(threadHeaderAgentLabel('Codex · Lucy的Mac mini', 'Codex')).toBe('Lucy的Mac mini');
+    expect(threadHeaderAgentLabel('Claude Code · Lucy的MacBook Pro', 'Claude Code')).toBe('Lucy的MacBook Pro');
+    expect(threadHeaderAgentLabel('Pi · clawket', 'Pi')).toBe('clawket');
+    // A renamed connection, a bare brand, another brand or the Agent's own face keep the name.
+    expect(threadHeaderAgentLabel('Studio Codex', 'Codex')).toBe('Studio Codex');
+    expect(threadHeaderAgentLabel('Codex', 'Codex')).toBe('Codex');
+    expect(threadHeaderAgentLabel('Codex · Lucy的Mac mini', 'Claude Code')).toBe('Codex · Lucy的Mac mini');
+    expect(threadHeaderAgentLabel('Codex · Lucy的Mac mini', null)).toBe('Codex · Lucy的Mac mini');
+  });
+
+  it('shortens the Agent before the session title when the header line overflows', () => {
+    // 210 points: the title line of a 402-point iPhone at 15-point text.
+    const fit = (agent: string, session: string | null, width = 210, fontSize = 15) => (
+      fitThreadHeaderName({ agent, session }, width, fontSize)
+    );
+    expect(fit('Lucy的Mac mini', '修复 Claude 当前模型读取')).toBe('Lucy的M… · 修复 Claude 当前模型读取');
+    // A short session title leaves the Agent more than its 40% share.
+    expect(fit('Lucy的Mac mini', 'New session')).toBe('Lucy的Mac… · New session');
+    // Enlarged text keeps the same share of a line that holds fewer characters.
+    expect(fit('Lucy的Mac mini', '修复 Claude 当前模型读取', 210, 18)).toBe('Lucy的… · 修复 Claude 当前模型读取');
+    // A short Agent name, or a line with room for both, is left whole.
+    expect(fit('Molty', '每周例会纪要整理与待办跟进')).toBe('Molty · 每周例会纪要整理与待办跟进');
+    expect(fit('Atlas', 'Build release')).toBe('Atlas · Build release');
+    // The main conversation names only the Agent, and the native ellipsis guards it.
+    expect(fit('Lucy的Mac mini', null, 40)).toBe('Lucy的Mac mini');
+    for (const width of [Number.NaN, 0, -1]) {
+      expect(fit('Lucy的Mac mini', '修复 Claude 当前模型读取', width)).toBe('Lucy的Mac mini · 修复 Claude 当前模型读取');
+    }
+    expect(fit('Lucy的Mac mini', '修复 Claude 当前模型读取', 210, 0)).toBe('Lucy的Mac mini · 修复 Claude 当前模型读取');
   });
 
   it('defines product copy for the complete adapter error-code union', () => {
@@ -374,10 +422,31 @@ describe('Thread model', () => {
     );
   });
 
-  it('spaces rows by voice: stacked within a turn, apart across turns, sectioned by time labels', () => {
+  it('puts the time label of the message a transcript boundary opened above that boundary', () => {
+    const at = (hour: number, minute: number) => new Date(2026, 9, 2, hour, minute).getTime();
+    const messages: UiMessage[] = [
+      { id: 'reply', role: 'assistant', text: 'Light rain.', timestampMs: at(8, 7) },
+      { id: 'question', role: 'user', text: 'Weather?', timestampMs: at(8, 6) },
+      { id: 'system_history_reset', role: 'system', text: 'Session reset', timestampMs: at(8, 6) - 1 },
+      // Other notices stay with the block they report on.
+      { id: 'notice', role: 'system', text: 'The model is rate limited. Try again shortly.', timestampMs: at(4, 55) },
+      { id: 'earlier', role: 'user', text: 'Test', timestampMs: at(4, 54) },
+    ];
+    expect(buildThreadTimelineItems({ messages, runs: [], locale: 'en-US' }).map((item) => item.key)).toEqual([
+      'message:reply',
+      'message:question',
+      'message:system_history_reset',
+      'date:message:question',
+      'message:notice',
+      'message:earlier',
+      'date:message:earlier',
+    ]);
+  });
+
+  it('spaces rows by voice: joined within a speaker group, apart across turns, sectioned by time labels', () => {
     const at = (minute: number) => new Date(2026, 8, 5, 12, minute).getTime();
-    const timeline = groupThreadTools(buildThreadTimelineItems({
-      messages: [
+    const folded = foldTurnSteps([
+        { id: 'follow-up', role: 'assistant', text: 'Anything else?', timestampMs: at(10) },
         { id: 'reply', role: 'assistant', text: 'Done', timestampMs: at(10) },
         { id: 'exec-2', role: 'tool', text: '', toolStatus: 'success', timestampMs: at(10) },
         { id: 'exec-1', role: 'tool', text: '', toolStatus: 'success', timestampMs: at(10) },
@@ -385,25 +454,28 @@ describe('Thread model', () => {
         { id: 'ask', role: 'user', text: 'Check it', timestampMs: at(10) },
         { id: 'again', role: 'user', text: 'Correction', timestampMs: at(0) },
         { id: 'first', role: 'user', text: 'Hello', timestampMs: at(0) },
-        { id: 'notice', role: 'system', text: 'Context compacted', timestampMs: at(0) },
-      ],
-      runs: [],
-      locale: 'en-US',
-    }), new Set());
+      { id: 'notice', role: 'system', text: 'Context compacted', timestampMs: at(0) },
+    ], false);
+    const timeline = placeTurnReceipts(buildThreadTimelineItems({ messages: folded.messages, runs: [], locale: 'en-US' }), folded);
 
-    // Newest first, as the list data is built before it is reversed.
-    expect(withThreadRhythm(timeline).map((row) => [row.key, row.gapAbove])).toEqual([
-      ['message:reply', 'stack'],
-      ['tools:exec-1', 'stack'],
-      ['message:failed', 'turn'],
-      ['message:ask', 'none'],
-      ['date:message:ask', 'section'],
-      ['message:again', 'stack'],
-      ['message:first', 'none'],
-      ['date:message:first', 'section'],
-      // An untimed system notice gets no time label and sits under the list inset.
-      ['message:notice', 'none'],
+    // Newest first, as the list data is built before it is reversed. The
+    // turn's steps left the conversation, so its two replies join; the
+    // receipt rides on the last one.
+    expect(withThreadRhythm(timeline).map((row) => [row.key, row.gapAbove, row.joinsOlder, row.joinsNewer])).toEqual([
+      ['message:follow-up', 'joined', true, false],
+      ['message:reply', 'turn', false, true],
+      ['message:ask', 'none', false, false],
+      ['date:message:ask', 'section', false, false],
+      ['message:again', 'joined', true, false],
+      ['message:first', 'turn', false, true],
+      // A boundary notice opens the rows after it: their time label sits above
+      // it, and the oldest label under the list inset.
+      ['message:notice', 'none', false, false],
+      ['date:message:first', 'none', false, false],
     ]);
+    const receipt = timeline[0]?.type === 'message' ? timeline[0].receipt : undefined;
+    expect(receipt?.steps.map((step) => step.id)).toEqual(['failed', 'exec-1', 'exec-2']);
+    expect(receipt).toEqual({ steps: receipt?.steps });
   });
 
   it('keeps an approval prompt inside the Agent turn regardless of its wire role', () => {
@@ -414,6 +486,27 @@ describe('Thread model', () => {
       { type: 'message', key: 'ask', message: { id: 'ask', role: 'user', text: 'Run it' } },
     ]);
     expect(rows.map((row) => row.gapAbove)).toEqual(['stack', 'turn', 'none']);
+    // An approval card is not a bubble: the reply after it starts a new group.
+    expect(rows.map((row) => row.joinsOlder)).toEqual([false, false, false]);
+  });
+
+  it('joins a reply to its speaker only once it has words', () => {
+    const rows = (text: string) => withThreadRhythm([
+      { type: 'message', key: 'live', message: { id: 'streaming', role: 'assistant', text, streaming: true } },
+      { type: 'message', key: 'earlier', message: { id: 'earlier', role: 'assistant', text: 'Checking.' } },
+    ]).map((row) => [row.gapAbove, row.joinsOlder, row.joinsNewer]);
+    // The live pill is not a bubble: the reply above keeps its tail.
+    expect(rows('')).toEqual([['stack', false, false], ['none', false, false]]);
+    expect(rows('Found it')).toEqual([['joined', true, false], ['none', false, true]]);
+  });
+
+  it('never joins bubbles from different participants', () => {
+    const attribution = (id: string): UiMessage['attribution'] => ({ channel: 'telegram', sender: { id, name: id } });
+    const rows = withThreadRhythm([
+      { type: 'message', key: 'bob', message: { id: 'bob', role: 'user', text: 'Hi', attribution: attribution('bob') } },
+      { type: 'message', key: 'alice', message: { id: 'alice', role: 'user', text: 'Hey', attribution: attribution('alice') } },
+    ]);
+    expect(rows.map((row) => [row.joinsOlder, row.joinsNewer])).toEqual([[false, false], [false, false]]);
   });
 
   it('keeps input order stable when timeline timestamps are equal or absent', () => {
@@ -444,7 +537,10 @@ it('preserves cached content during recovery before surfacing a failure', () => 
 });
 
 describe('stabilizeThreadRows', () => {
-  const rows = (messages: UiMessage[]) => withThreadRhythm(groupThreadTools(buildThreadTimelineItems({ messages, runs: [] }), new Set())).reverse();
+  const rows = (messages: UiMessage[], live = false) => {
+    const folded = foldTurnSteps(messages, live);
+    return withThreadRhythm(placeTurnReceipts(buildThreadTimelineItems({ messages: folded.messages, runs: [] }), folded)).reverse();
+  };
   const tool = (id: string, status: UiMessage['toolStatus'] = 'success'): UiMessage => ({ id, role: 'tool', text: '', toolName: 'bash', toolStatus: status });
 
   it('returns the previous array when every row renders the same', () => {
@@ -456,16 +552,36 @@ describe('stabilizeThreadRows', () => {
 
   it('reuses unchanged rows and replaces only the rows whose content, rhythm or grouping changed', () => {
     const user: UiMessage = { id: 'u', role: 'user', text: 'Run it' };
-    const previous = rows([{ id: 'streaming', renderKey: 'reply:1:0', role: 'assistant', text: 'Wor', streaming: true }, tool('t2', 'running'), tool('t1'), user]);
+    const previous = rows([{ id: 'streaming', renderKey: 'reply:1:0', role: 'assistant', text: 'Wor', streaming: true }, tool('t2', 'running'), tool('t1'), user], true);
     const next = stabilizeThreadRows(previous, rows([
       { id: 'streaming', renderKey: 'reply:1:0', role: 'assistant', text: 'World', streaming: true },
       tool('t2'), tool('t1'), { ...user },
-    ]));
+    ], true));
     expect(next).not.toBe(previous);
     expect(next.map((row) => row.key)).toEqual(previous.map((row) => row.key));
     const changed = next.filter((row, index) => row !== previous[index]).map((row) => row.key);
-    expect(changed).toEqual(['tools:t1', 'message:reply:1:0']);
+    expect(changed).toEqual(['message:reply:1:0']);
     expect(next[0]).toBe(previous[0]);
+  });
+
+  it('replaces a reply row when its receipt changes and keeps it when the receipt renders the same', () => {
+    const user: UiMessage = { id: 'u', role: 'user', text: 'Run it' };
+    const answer: UiMessage = { id: 'a', role: 'assistant', text: 'Done' };
+    const previous = rows([answer, tool('t1'), user]);
+    expect(stabilizeThreadRows(previous, rows([{ ...answer }, tool('t1'), { ...user }]))).toBe(previous);
+    const changed = stabilizeThreadRows(previous, rows([answer, tool('t2'), tool('t1'), user]));
+    expect(changed.find((row) => row.key === 'message:a')).not.toBe(previous.find((row) => row.key === 'message:a'));
+  });
+
+  it('replaces a bubble row whose group changed so its corners and tail follow', () => {
+    const first: UiMessage = { id: 'a', role: 'assistant', text: 'One' };
+    const previous = rows([first]);
+    const next = stabilizeThreadRows(previous, rows([{ id: 'b', role: 'assistant', text: 'Two' }, first]));
+    const before = previous.find((row) => row.key === 'message:a')!;
+    const after = next.find((row) => row.key === 'message:a')!;
+    expect(before.joinsNewer).toBe(false);
+    expect(after.joinsNewer).toBe(true);
+    expect(after).not.toBe(before);
   });
 
   it('never reuses a row across a change of key, type or order', () => {
@@ -479,5 +595,77 @@ describe('stabilizeThreadRows', () => {
     const favorite = stabilizeThreadRows(previous, rows([{ ...second, usage: { totalTokens: 2 } } as UiMessage, first]));
     expect(favorite.find((row) => row.key === 'message:b')).not.toBe(previous.find((row) => row.key === 'message:b'));
     expect(favorite.find((row) => row.key === 'message:a')).toBe(previous.find((row) => row.key === 'message:a'));
+  });
+});
+
+describe('A+ presence and scheduled digests', () => {
+  const t = (key: string) => key;
+  const prompt: UiMessage = { id: 'ask', role: 'user', text: 'Go' };
+  const tool = (id: string, toolName: string, toolStatus: UiMessage['toolStatus']): UiMessage => ({ id, role: 'tool', text: '', toolName, toolStatus });
+
+  it('says what the running step of this turn does, then typing, then the activity or thinking', () => {
+    const status = (messages: UiMessage[], activityLabel?: string) => resolveThreadWorkingStatus({ messages, activityLabel, thinkingLabel: 'Thinking…', t });
+    expect(status([tool('b', 'exec', 'running'), prompt])).toBe('Running a command…');
+    expect(status([tool('b', 'Read', 'running'), prompt])).toBe('Reading files…');
+    expect(status([tool('b', 'apply_patch', 'running'), prompt])).toBe('Editing files…');
+    expect(status([tool('b', 'web_search', 'running'), prompt])).toBe('Searching…');
+    expect(status([tool('b', 'browser', 'running'), prompt])).toBe('Browsing the web…');
+    expect(status([tool('b', 'mcp__linear__save_issue', 'running'), prompt])).toBe('Using tools…');
+    expect(status([{ id: 'r', role: 'assistant', text: 'Hel', streaming: true }, tool('b', 'exec', 'success'), prompt])).toBe('Typing…');
+    expect(status([{ id: 'r', role: 'assistant', text: '', streaming: true }, prompt], 'Using exec…')).toBe('Using exec…');
+    expect(status([prompt])).toBe('Thinking…');
+    // An orphaned call from an earlier turn never speaks for this one.
+    expect(status([prompt, tool('old', 'exec', 'running')])).toBe('Thinking…');
+    expect(isToolRunningInTurn([prompt, tool('old', 'exec', 'running')])).toBe(false);
+    expect(isToolRunningInTurn([tool('now', 'exec', 'running'), prompt])).toBe(true);
+  });
+
+  it('merges adjacent scheduled results of one day into one digest keyed by the oldest', () => {
+    const day = new Date(2026, 8, 5).getTime();
+    const cron = (id: string, hour: number, dayOffset = 0): ThreadRunCard => ({
+      id, kind: 'cron', title: id, status: 'succeeded', statusLabel: 'Succeeded', timeLabel: `${hour}:00`,
+      updatedAt: day + dayOffset * 86_400_000 + hour * 3_600_000,
+    });
+    const subagent: ThreadRunCard = { id: 'worker', kind: 'subagent', title: 'Worker', status: 'completed', statusLabel: 'Done', timeLabel: '9:30', updatedAt: day + 9.5 * 3_600_000 };
+    const timeline = buildThreadTimelineItems({
+      messages: [{ id: 'reply', role: 'assistant', text: 'Hi', timestampMs: day + 12 * 3_600_000 }],
+      runs: [cron('late', 11), cron('b', 8), cron('a', 7), cron('yesterday', 22, -1)],
+      locale: 'en-US',
+    });
+    // Results carry their own times: hours apart on one day, no labels between them.
+    // Newest first: each label follows the row it heads.
+    expect(timeline.map((item) => item.key)).toEqual([
+      'message:reply', 'date:message:reply', 'run:cron:late', 'run:cron:b', 'run:cron:a', 'date:run:cron:a', 'run:cron:yesterday', 'date:run:cron:yesterday',
+    ]);
+    const grouped = groupThreadRuns(timeline);
+    expect(grouped.map((item) => item.key)).toEqual([
+      'message:reply', 'date:message:reply', 'cron:a', 'date:run:cron:a', 'cron:yesterday', 'date:run:cron:yesterday',
+    ]);
+    const digest = grouped.find((item) => item.key === 'cron:a');
+    expect(digest?.type === 'cron' ? digest.runs.map((run) => run.id) : null).toEqual(['late', 'b', 'a']);
+    // Sub-agent runs keep their own cards and break a digest.
+    const mixed = groupThreadRuns([
+      { type: 'run', key: 'run:cron:b', timestampMs: 2, run: cron('b', 8) },
+      { type: 'run', key: 'run:subagent:worker', timestampMs: 1, run: subagent },
+      { type: 'run', key: 'run:cron:a', timestampMs: 0, run: cron('a', 7) },
+    ]);
+    expect(mixed.map((item) => item.key)).toEqual(['cron:b', 'run:subagent:worker', 'cron:a']);
+  });
+
+  it('marks jobs the conversation may run again, as the editor does', () => {
+    const job = (id: string, kind: string) => ({ id, name: id, agentId: 'main', enabled: true, sessionKey: 'agent:main:main',
+      schedule: { kind: 'every', everyMs: 60_000 }, payload: { kind } } as unknown as CronJob);
+    const seeds = buildCronRunSeeds({
+      entries: [
+        { ts: 2, runAtMs: 2, jobId: 'daily', action: 'finished', status: 'error', sessionKey: 'agent:main:main' },
+        { ts: 1, runAtMs: 1, jobId: 'beat', action: 'finished', status: 'ok', sessionKey: 'agent:main:main' },
+      ],
+      jobs: [job('daily', 'agentTurn'), job('beat', 'heartbeat')],
+      currentSessionKey: 'agent:main:main',
+      currentAgentId: 'main',
+      isMainAgent: true,
+      fallbackTitle: 'Task',
+    });
+    expect(seeds.map((seed) => [seed.id.split(':')[0], seed.runnable])).toEqual([['daily', true], ['beat', false]]);
   });
 });

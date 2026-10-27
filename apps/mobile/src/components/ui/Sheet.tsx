@@ -30,11 +30,11 @@ import {
   type ReduceMotion,
   type WithTimingConfig,
 } from 'react-native-reanimated';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSafeAreaInsets, type Metrics } from 'react-native-safe-area-context';
 import { useAppTheme } from '../../theme';
 import { Motion, Radius, Space } from '../../theme/tokens';
-import { getIpadModalSheetMetrics } from '../../utils/ipad-layout';
-import { isIPad } from '../../utils/platform';
+import { getIpadModalSheetMetrics, hasPanelSpace } from '../../utils/ipad-layout';
+import { getRuntimePlatform } from '../../utils/platform';
 import {
   AdaptiveBottomSheetModal,
   type AdaptiveBottomSheetModalRef,
@@ -43,6 +43,7 @@ import { SheetBackdrop } from './SheetBackdrop';
 import {
   SheetDragHandle,
   SheetHeader,
+  type SheetTone,
   useSheetBackgroundStyle,
 } from './SheetHeader';
 import { ThemedFullWindowOverlay } from './ThemedFullWindowOverlay';
@@ -87,7 +88,11 @@ export type SheetProps = {
   closeAccessibilityLabel: string;
   title?: string;
   titleContent?: React.ReactNode;
+  /** Replaces the close button (a sub-page's Back); swipe and the backdrop still close. */
+  headerLeading?: React.ReactNode;
   headerRight?: React.ReactNode;
+  /** `grouped` lays settings cards on the grouped canvas (A+ model sheet, owner-approved 2026-10-01). */
+  tone?: SheetTone;
   children: React.ReactNode;
   /**
    * Pinned to the visible bottom edge at every detent (fixed-snap content is
@@ -149,7 +154,7 @@ export function resolveSheetContentHeightLimit(
   return Math.max(1, boundedSheetHeight - Space.lg);
 }
 
-/** Shared phone bottom sheet and automatically centered iPad panel. */
+/** Shared bottom sheet that centers a panel when the iOS window has room. */
 export function Sheet({
   visible,
   onClose,
@@ -157,7 +162,9 @@ export function Sheet({
   closeAccessibilityLabel,
   title,
   titleContent,
+  headerLeading,
   headerRight,
+  tone = 'canvas',
   children,
   footer,
   maxHeight = '90%',
@@ -177,8 +184,12 @@ export function Sheet({
   testID,
 }: SheetProps): React.JSX.Element {
   const { theme } = useAppTheme();
-  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
-  const insets = useSafeAreaInsets();
+  const window = useWindowDimensions();
+  const inheritedInsets = useSafeAreaInsets();
+  const [presentation, setPresentation] = useState<Metrics | null>(null);
+  const windowWidth = presentation?.frame.width ?? window.width;
+  const windowHeight = presentation?.frame.height ?? window.height;
+  const insets = presentation?.insets ?? inheritedInsets;
   const modalRef = useRef<AdaptiveBottomSheetModalRef>(null);
   const presentedRef = useRef(false);
   const visibleRef = useRef(visible);
@@ -189,7 +200,8 @@ export function Sheet({
   onAfterCloseRef.current = onAfterClose;
 
   const styles = useMemo(() => createStyles(theme.colors), [theme.colors]);
-  const backgroundStyle = useSheetBackgroundStyle();
+  const backgroundStyle = useSheetBackgroundStyle(tone);
+  const toneStyle = tone === 'grouped' ? styles.grouped : null;
   const usesFixedSnapPoints = snapPoints !== undefined;
   const maxDynamicContentSize = useMemo(
     () => resolveSheetMaxHeight(
@@ -198,29 +210,47 @@ export function Sheet({
     ),
     [insets.bottom, insets.top, maxHeight, windowHeight],
   );
-  const fixedIpadSheetHeight = useMemo(
-    () => (isIPad && windowWidth >= 600
+  const adaptive = getRuntimePlatform() === 'ios';
+  const panelMetrics = useMemo(
+    () => (adaptive && hasPanelSpace(windowWidth - insets.left - insets.right)
       ? getIpadModalSheetMetrics({
         windowWidth,
         windowHeight,
         topInset: insets.top,
         bottomInset: insets.bottom,
-      }).height
+        leftInset: insets.left,
+        rightInset: insets.right,
+      })
       : undefined),
-    [insets.bottom, insets.top, windowHeight, windowWidth],
+    [adaptive, insets.bottom, insets.top, insets.left, insets.right, windowHeight, windowWidth],
   );
+  const fixedPanelHeight = panelMetrics?.height;
+  const [contentMeasurement, setContentMeasurement] = useState<{ width: number; height: number } | null>(null);
+  const panelWidthRef = useRef(panelMetrics?.width);
+  panelWidthRef.current = panelMetrics?.width;
+  const handleContentLayout = useCallback((event: LayoutChangeEvent) => {
+    const { width, height } = event.nativeEvent.layout;
+    if (panelWidthRef.current !== undefined && Math.abs(width - panelWidthRef.current) >= 1) return;
+    if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+      setContentMeasurement(current => current?.width === width && current.height === height ? current : { width, height });
+    }
+  }, []);
+  const preferredHeight = !usesFixedSnapPoints && panelMetrics && contentMeasurement
+    && Math.abs(contentMeasurement.width - panelMetrics.width) < 1
+    ? Math.min(contentMeasurement.height + Space.lg, maxDynamicContentSize)
+    : undefined;
   const contentHeightLimit = useMemo(
     () => resolveSheetContentHeightLimit(
       maxDynamicContentSize,
-      fixedIpadSheetHeight,
+      fixedPanelHeight,
     ),
-    [fixedIpadSheetHeight, maxDynamicContentSize],
+    [fixedPanelHeight, maxDynamicContentSize],
   );
   const contentViewportStyle = useMemo<ViewStyle>(
-    () => (fixedIpadSheetHeight === undefined
+    () => (fixedPanelHeight === undefined || !usesFixedSnapPoints
       ? { maxHeight: contentHeightLimit }
       : { height: contentHeightLimit, maxHeight: contentHeightLimit }),
-    [contentHeightLimit, fixedIpadSheetHeight],
+    [contentHeightLimit, fixedPanelHeight, usesFixedSnapPoints],
   );
 
   useEffect(() => {
@@ -283,6 +313,19 @@ export function Sheet({
     () => ({ ...styles.footer, paddingBottom: bottomPadding }),
     [bottomPadding, styles.footer],
   );
+  // Gorhom's BottomSheetView composes only the first two entries of a style
+  // array (`StyleSheet.compose(...style)`), which dropped the bottom padding,
+  // tone and viewport limit behind them, so the measured body gets one style.
+  const dynamicSheetStyle = useMemo(
+    () => (usesFixedSnapPoints ? undefined : StyleSheet.flatten([
+      styles.sheet,
+      toneStyle,
+      { paddingBottom: bottomPadding },
+      style,
+      contentViewportStyle,
+    ])),
+    [bottomPadding, contentViewportStyle, style, styles.sheet, toneStyle, usesFixedSnapPoints],
+  );
   const footerSlot = useMemo<SheetFooterSlot>(
     () => ({
       node: footer,
@@ -308,13 +351,14 @@ export function Sheet({
         titleContent={titleContent}
         onClose={onClose}
         closeAccessibilityLabel={closeAccessibilityLabel}
+        leading={headerLeading}
         right={headerRight}
         testID={testID}
       />
       <View
         testID={testID ? `${testID}-body` : undefined}
         style={[
-          (usesFixedSnapPoints || fixedIpadSheetHeight !== undefined) && styles.fixedBody,
+          usesFixedSnapPoints && styles.fixedBody,
           contentStyle,
           footer ? { paddingBottom: footerHeight + FOOTER_TOP_PADDING } : null,
         ]}
@@ -328,6 +372,8 @@ export function Sheet({
   return (
     <AdaptiveBottomSheetModal
       ref={modalRef}
+      onPresentationMetrics={setPresentation}
+      preferredHeight={preferredHeight}
       accessible={false}
       index={initialIndex}
       stackBehavior={stackBehavior}
@@ -350,7 +396,7 @@ export function Sheet({
       {usesFixedSnapPoints ? (
         <View
           testID={testID}
-          style={[styles.sheet, styles.fixedSheet, { paddingBottom: bottomPadding }, style]}
+          style={[styles.sheet, toneStyle, styles.fixedSheet, { paddingBottom: bottomPadding }, style]}
           accessibilityViewIsModal
         >
           {sheetContent}
@@ -358,7 +404,8 @@ export function Sheet({
       ) : (
         <BottomSheetView
           testID={testID}
-          style={[styles.sheet, { paddingBottom: bottomPadding }, style, contentViewportStyle]}
+          onLayout={handleContentLayout}
+          style={dynamicSheetStyle}
           accessibilityViewIsModal
         >
           {sheetContent}
@@ -377,6 +424,9 @@ function createStyles(
       backgroundColor: colors.canvas,
       borderTopLeftRadius: Radius.bottomSheet,
       borderTopRightRadius: Radius.bottomSheet,
+    },
+    grouped: {
+      backgroundColor: colors.canvasGrouped,
     },
     fixedBody: {
       flex: 1,

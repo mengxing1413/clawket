@@ -7,12 +7,14 @@ jest.mock('./components/SessionFilesSheet', () => ({ SessionFilesSheet: () => nu
 import { createReplyConversation } from '../../services/reply-conversation';
 jest.mock('../../services/reply-conversation', () => ({ createReplyConversation: jest.fn(), replyConversationDraft: (message: any) => message.role === 'assistant' && !message.streaming ? message.text : null }));
 jest.mock('./components/DraftRecoverySheet', () => ({ DraftRecoverySheet: () => null }));
-jest.mock('./components/RunInputSheet', () => ({ RunInputSheet: () => null }));
+let mockRunInputSheetProps: Record<string, any> | null = null;
+jest.mock('./components/RunInputSheet', () => ({ RunInputSheet: (props: any) => { mockRunInputSheetProps = props; return null; } }));
 let mockSkillPickerProps: { sessionKey?: string; onSelect: (skill: any) => void } | null = null;
 jest.mock('./components/SkillPickerSheet', () => ({ SkillPickerSheet: (props: any) => { mockSkillPickerProps = props; return null; } }));
 jest.mock('./components/SelectedSkill', () => ({ SelectedSkill: () => null }));
 jest.mock('../../services/incoming-share', () => ({ IncomingShareStore: { list: jest.fn(async () => []), remove: jest.fn(async () => undefined) } }));
 import React from 'react';
+import { Keyboard } from 'react-native';
 import { act, render, waitFor } from '@testing-library/react-native';
 import { CAPABILITY_MATRIX } from '@clawket/agent-protocol';
 import type { ComposerHandle } from '../../components/ui/Composer';
@@ -306,6 +308,80 @@ function createApp(): Record<string, unknown> {
 }
 
 describe('ThreadScreen connection container', () => {
+  it('keeps the Current/Next chooser while a Current acknowledgement is pending instead of silently queuing Next', () => {
+    mockController.canChooseRunInput = true;
+    mockController.canSteer = false;
+    mockController.steeringPending = true;
+    mockController.activeRunId = 'active';
+    mockController.onSteer = jest.fn();
+    render(<ThreadScreen {...createNavigationProps()} />);
+    act(() => mockThreadViewProps?.onSend?.());
+    expect(mockRunInputSheetProps?.visible).toBe(true);
+    expect(mockRunInputSheetProps?.canSteer).toBe(false);
+    expect(mockRunInputSheetProps?.steeringPending).toBe(true);
+    expect(mockController.onSend).not.toHaveBeenCalled();
+    act(() => mockRunInputSheetProps?.onNext());
+    expect(mockController.onSend).toHaveBeenCalledTimes(1);
+    expect(mockController.onSteer).not.toHaveBeenCalled();
+  });
+
+  it('dismisses the editing keyboard before presenting the current-or-next chooser without sending', () => {
+    const props = createNavigationProps();
+    const blur = jest.fn();
+    mockController.composerRef = { current: { blur, focus: jest.fn(), clear: jest.fn() } };
+    mockController.canChooseRunInput = true;
+    mockController.canSteer = true;
+    mockController.onSteer = jest.fn();
+    mockController.activeRunId = 'current-run';
+    (Keyboard.dismiss as jest.Mock).mockClear();
+    render(<ThreadScreen {...props} />);
+    act(() => mockThreadViewProps?.onSend());
+    expect(blur).toHaveBeenCalledTimes(1);
+    expect(Keyboard.dismiss).toHaveBeenCalledTimes(1);
+    expect(mockRunInputSheetProps?.visible).toBe(true);
+    expect(mockController.onSend).not.toHaveBeenCalled();
+    expect(mockController.onSteer).not.toHaveBeenCalled();
+  });
+
+  it('routes a required native permission confirmation directly to permission selection', () => {
+    const props = createNavigationProps();
+    mockController.runtimeSettingsUnconfirmed = true;
+    mockController.runtimeSettingsBusy = false;
+    mockController.permissions = { mode: 'workspace', available: true, scope: 'session', requiresConfirmation: true };
+    const setPermissionPickerVisible = jest.fn();
+    mockController.setPermissionPickerVisible = setPermissionPickerVisible;
+    render(<ThreadScreen {...props} />);
+    expect(mockThreadViewProps?.permissionsNeedConfirmation).toBe(true);
+    act(() => mockThreadViewProps?.onReviewRuntimeSettings?.());
+    expect(setPermissionPickerVisible).toHaveBeenCalledWith(true);
+    expect(mockController.setModelPickerVisible).toHaveBeenCalledWith(false);
+    expect(mockController.retryModelPickerLoad).toHaveBeenCalledTimes(1);
+    expect(mockController.onSend).not.toHaveBeenCalled();
+  });
+
+  it('keeps an explicit settings recovery action after the sheet closes, including while offline', () => {
+    const props = createNavigationProps();
+    const setPermissionPickerVisible = jest.fn();
+    mockController.runtimeSettingsUnconfirmed = true;
+    mockController.runtimeSettingsBusy = false;
+    mockController.modelPickerVisible = false;
+    mockController.connectionState = 'reconnecting';
+    mockController.setPermissionPickerVisible = setPermissionPickerVisible;
+    const view = render(<ThreadScreen {...props} />);
+    act(() => mockThreadViewProps?.onReviewRuntimeSettings?.());
+    expect(setPermissionPickerVisible).toHaveBeenCalledWith(false);
+    expect(mockController.setModelPickerVisible).toHaveBeenCalledWith(true);
+    expect(mockController.retryModelPickerLoad).toHaveBeenCalledTimes(1);
+    expect(mockController.onSend).not.toHaveBeenCalled();
+    mockController.runtimeSettingsBusy = true;
+    view.rerender(<ThreadScreen {...props} />);
+    expect(mockThreadViewProps?.onReviewRuntimeSettings).toBeUndefined();
+    mockController.runtimeSettingsBusy = false;
+    mockController.runtimeSettingsUnconfirmed = false;
+    view.rerender(<ThreadScreen {...props} />);
+    expect(mockThreadViewProps?.onReviewRuntimeSettings).toBeUndefined();
+  });
+
   it('clears a selected skill with the composer instead of recreating a hidden draft', async () => {
     const props = createNavigationProps();
     const view = render(<ThreadScreen {...props} />);
@@ -318,38 +394,94 @@ describe('ThreadScreen connection container', () => {
     expect(mockController.setInput).toHaveBeenLastCalledWith('');
   });
 
-  it.each(['pi', 'claude-code'] as const)('explains native %s read-only history and explicitly branches with its context', async (backend) => {
+  const readOnlyFooterParts = () => React.Children.toArray((mockThreadViewProps?.readOnlyFooter as React.ReactElement<any>).props.children)
+    .filter((child): child is React.ReactElement<any> => React.isValidElement(child));
+  const readOnlyFooterPart = (testID: string) => readOnlyFooterParts().find(child => child.props.testID === testID);
+  const blockedNativeRoster = (sessionKey: string, blocked: Record<string, unknown>) => [{ connection: { id: 'connection-1' }, agents: [{ agent: { agentId: 'atlas' }, sessions: [{ key: sessionKey, source: 'native', ...blocked }] }] }];
+
+  it.each(['pi', 'claude-code'] as const)('explains native %s read-only history and continues it in a titled copy', async (backend) => {
     const props = createNavigationProps();
     const pi = { ...adapter, connection: { ...adapter.connection, backendKind: backend }, capabilities: CAPABILITY_MATRIX[backend], state: 'ready', createSession: jest.fn() };
-    mockConnections = { ...mockConnections, activeAdapter: pi, roster: [{ connection: { id: 'connection-1' }, agents: [{ agent: { agentId: 'atlas' }, sessions: [{ key: props.route.params.sessionKey, source: 'native', kind: 'direct' }] }] }] };
+    mockConnections = { ...mockConnections, activeAdapter: pi, roster: blockedNativeRoster(props.route.params.sessionKey, { kind: 'direct' }) };
     mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1', activeAdapter: pi } as any);
     const { ManualSessions } = require('../../services/manual-sessions');
     const create = jest.spyOn(ManualSessions, 'create').mockResolvedValue({ key: 'private-branch' });
     try {
       render(<ThreadScreen {...props} />);
       expect(mockThreadViewProps?.capabilities.chat).toBe(false);
-      const footer = mockThreadViewProps?.readOnlyFooter as React.ReactElement<any>;
-      expect(footer.props.children[0].props.children).toBe('Imported conversations are read-only. Continue with their context in a new session; the original stays unchanged.');
-      await act(async () => footer.props.children[1].props.onPress());
-      expect(create).toHaveBeenCalledWith(pi, 'atlas', `native-branch:${props.route.params.sessionKey}`, { fromSession: props.route.params.sessionKey });
+      expect(readOnlyFooterPart('native-session-read-only-hint')?.props.children).toBe('This conversation came from your computer and is view-only here. Continue in a copy; the original stays unchanged.');
+      expect(readOnlyFooterPart('native-session-recheck')).toBeUndefined();
+      const copy = readOnlyFooterPart('native-session-copy');
+      expect(copy?.props).toMatchObject({ label: 'Continue in a copy', variant: 'primary' });
+      await act(async () => copy?.props.onPress());
+      expect(create).toHaveBeenCalledWith(pi, 'atlas', `native-branch:${props.route.params.sessionKey}`, { fromSession: props.route.params.sessionKey, title: 'Main thread (copy)' });
       expect(props.navigation.replace).toHaveBeenCalledWith('Thread', expect.objectContaining({ sessionKey: 'private-branch' }));
-    } finally { create.mockRestore(); }
+    } finally {
+      create.mockRestore();
+      mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1' } as any);
+    }
   });
 
   it.each([
-    ['in_use', 'This conversation is open on your computer. Close that conversation, then check again, or continue in a new session.'],
-    ['ownership_unknown', 'Could not verify whether this conversation is in use. Check again, or continue in a new session.'],
-    ['project_unavailable', 'This conversation’s project folder is unavailable on your computer.'],
-  ])('explains native continuation blocked by %s and refreshes status without sending', async (reason, hint) => {
+    ['in_use', 'This conversation is still open on your computer. Archive or exit it there to keep chatting here.', 'I’ve closed it on my computer'],
+    ['ownership_unknown', 'Could not confirm whether this conversation is still open on your computer.', 'Retry'],
+    ['project_unavailable', 'This conversation’s project folder is unavailable on your computer.', 'Retry'],
+  ])('explains native continuation blocked by %s, leads with the copy and rechecks without sending', async (reason, hint, recheckLabel) => {
     const props = createNavigationProps();
     const native = { ...adapter, capabilities: CAPABILITY_MATRIX['claude-code'], state: 'ready', loadSession: jest.fn().mockResolvedValue({ messages: [] }) };
-    mockConnections = { ...mockConnections, activeAdapter: native, roster: [{ connection: { id: 'connection-1' }, agents: [{ agent: { agentId: 'atlas' }, sessions: [{ key: props.route.params.sessionKey, source: 'native', canContinue: false, continuationBlockedReason: reason }] }] }] };
-    render(<ThreadScreen {...props} />);
-    const footer = mockThreadViewProps?.readOnlyFooter as React.ReactElement<any>;
-    expect(footer.props.children[0].props.children).toBe(hint);
-    expect(footer.props.children[1].props.disabled).toBe(reason === 'project_unavailable');
-    await act(async () => footer.props.children[2].props.onPress());
-    expect(native.loadSession).toHaveBeenCalledWith(props.route.params.sessionKey);
+    const roster = blockedNativeRoster(props.route.params.sessionKey, { canContinue: false, continuationBlockedReason: reason });
+    mockConnections = { ...mockConnections, activeAdapter: native, roster };
+    // The Bridge publishes the same blocked state before answering the recheck.
+    mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1', activeAdapter: native, roster } as any);
+    try {
+      render(<ThreadScreen {...props} />);
+      expect(readOnlyFooterPart('native-session-read-only-hint')?.props.children).toBe(hint);
+      const recheck = readOnlyFooterPart('native-session-recheck');
+      if (reason === 'project_unavailable') {
+        expect(readOnlyFooterPart('native-session-copy')).toBeUndefined();
+        expect(recheck?.props).toMatchObject({ label: recheckLabel, variant: 'primary' });
+      } else {
+        expect(readOnlyFooterPart('native-session-copy')?.props).toMatchObject({ label: 'Continue in a copy', variant: 'primary' });
+        expect(recheck?.props).toMatchObject({ label: recheckLabel, variant: 'secondary' });
+      }
+      await act(async () => recheck?.props.onPress());
+      expect(native.loadSession).toHaveBeenCalledWith(props.route.params.sessionKey);
+      expect(readOnlyFooterPart('native-session-read-only-hint')?.props.children).toBe(reason === 'in_use'
+        ? 'It’s still open on your computer. Archive or exit it there, then try again.'
+        : hint);
+      expect(readOnlyFooterParts().some(child => child.props.tone === 'bad')).toBe(false);
+    } finally {
+      mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1' } as any);
+    }
+  });
+
+  it('reports a native conversation as still open only while the check that found it still applies', async () => {
+    const props = createNavigationProps();
+    const native = { ...adapter, capabilities: CAPABILITY_MATRIX['claude-code'], state: 'ready', loadSession: jest.fn().mockResolvedValue({ messages: [] }) };
+    const inUse = blockedNativeRoster(props.route.params.sessionKey, { canContinue: false, continuationBlockedReason: 'in_use' });
+    const regularHint = 'This conversation is still open on your computer. Archive or exit it there to keep chatting here.';
+    const stillOpenHint = 'It’s still open on your computer. Archive or exit it there, then try again.';
+    mockConnections = { ...mockConnections, activeAdapter: native, roster: inUse };
+    // The computer released it: the screen may still show the old roster for a moment, but must not claim it is open.
+    mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1', activeAdapter: native, roster: blockedNativeRoster(props.route.params.sessionKey, { canContinue: true }) } as any);
+    try {
+      const view = render(<ThreadScreen {...props} />);
+      await act(async () => readOnlyFooterPart('native-session-recheck')?.props.onPress());
+      expect(readOnlyFooterPart('native-session-read-only-hint')?.props.children).toBe(regularHint);
+
+      mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1', activeAdapter: native, roster: inUse } as any);
+      await act(async () => readOnlyFooterPart('native-session-recheck')?.props.onPress());
+      expect(readOnlyFooterPart('native-session-read-only-hint')?.props.children).toBe(stillOpenHint);
+
+      // A later change of state retires the result of the earlier check.
+      mockConnections = { ...mockConnections, roster: blockedNativeRoster(props.route.params.sessionKey, { canContinue: false, continuationBlockedReason: 'ownership_unknown' }) };
+      view.rerender(<ThreadScreen {...props} />);
+      mockConnections = { ...mockConnections, roster: inUse };
+      view.rerender(<ThreadScreen {...props} />);
+      expect(readOnlyFooterPart('native-session-read-only-hint')?.props.children).toBe(regularHint);
+    } finally {
+      mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1' } as any);
+    }
   });
 
   it('discards a session this app just created when the reader leaves it without writing anything', async () => {
@@ -586,6 +718,15 @@ describe('ThreadScreen connection container', () => {
     });
   });
 
+  it('gives history paging the active conversation scope and head-refresh state', () => {
+    const props = createNavigationProps();
+    mockController.refreshing = true;
+    render(<ThreadScreen {...props} />);
+    expect(mockThreadViewProps?.historyPagingBlocked).toBe(true);
+    expect(mockThreadViewProps?.historyScope).toBe('connection-1:atlas:agent:atlas:main');
+    expect(mockThreadViewProps?.onLoadMoreHistory).toBe(mockController.onLoadMoreHistory);
+  });
+
   it('keeps main conversations and the existing grace period complete', () => {
     mockIsPro = false;
     const props = createNavigationProps();
@@ -705,14 +846,15 @@ describe('ThreadScreen connection container', () => {
       agentName: 'Controller Atlas',
       sessionKey: 'agent:atlas:main',
       model: 'Sonnet',
-      contextUsed: 46,
-      contextWindow: 100,
       state: { kind: 'ready' },
       capabilities: adapter.capabilities,
       topInset: 24,
       bottomInset: 16,
       compactionNotice: 'Compacting context...',
     });
+    // Context left moved from the header into the model sheet (A+ composer).
+    expect(mockThreadViewProps).not.toHaveProperty('contextUsed');
+    expect(mockThreadOverlayProps?.modelSheet.contextRemainingPercent).toBe(54);
     expect(mockThreadViewProps?.composerRef).toBe(mockController.composerRef);
     expect(mockThreadViewProps?.onPasteFiles).toBe(mockController.onPasteFiles);
     expect(mockThreadViewProps?.onPasteFailed).toBe(mockController.onPasteFailed);
@@ -1027,6 +1169,7 @@ describe('ThreadScreen connection container', () => {
       status: 'succeeded' as const,
       updatedAt: now - 60_000,
       cronRun: { ts: now - 60_000, jobId: 'nightly', action: 'finished' as const, status: 'ok' as const, sessionKey: cronSessionKey },
+      runnable: true,
     };
     const job = { id: 'nightly', agentId: 'atlas', sessionKey: cronSessionKey, name: 'Nightly report' };
     const page = { total: 1, offset: 0, limit: 100, hasMore: false, nextOffset: null };
@@ -1223,7 +1366,7 @@ describe('ThreadScreen connection container', () => {
     expect(props.navigation.navigate).toHaveBeenCalledWith('AgentSettings', { connectionId: 'connection-1', agentId: 'atlas' });
   });
 
-  it('gates every Add sheet entry by backend capability for OpenClaw, Hermes and YouMind', () => {
+  it('gates every Add sheet entry by backend capability, down to a chat-only backend', () => {
     const props = createNavigationProps();
     adapter.capabilities = { ...CAPABILITY_MATRIX.openclaw };
     const view = render(<ThreadScreen {...props} />);
@@ -1274,7 +1417,7 @@ describe('ThreadScreen connection container', () => {
     expect(mockThreadOverlayProps?.onCreateScheduledTask).toBeDefined();
     expect(mockThreadOverlayProps?.onOpenTools).toBeUndefined();
 
-    adapter.capabilities = { ...CAPABILITY_MATRIX.youmind };
+    adapter.capabilities = { ...CAPABILITY_MATRIX['local-model'], attachments: false, models: false };
     view.rerender(<ThreadScreen {...props} />);
     expect(mockThreadViewProps?.onOpenAddMenu).toBeUndefined();
     expect(mockThreadOverlayProps?.onAttachRecentPhotos).toBeUndefined();
@@ -1443,7 +1586,7 @@ test('voice widget waits for focus, capability, restored draft and the matching 
     mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1', activeAdapter: adapter } as any);
     const view = render(<ThreadScreen {...props} />);
     await act(async () => mockThreadViewProps?.messageActions?.onBranch?.(reply));
-    expect(createReplyConversation).toHaveBeenCalledWith(adapter, 'atlas', 'agent:atlas:main', reply);
+    expect(createReplyConversation).toHaveBeenCalledWith(adapter, 'atlas', 'agent:atlas:main', reply, undefined);
     expect(props.navigation.push).toHaveBeenCalledWith('Thread', expect.objectContaining({ sessionKey: 'new-chat' }));
     jest.mocked(props.navigation.push).mockClear();
     let finish!: (value: any) => void;
@@ -1452,6 +1595,31 @@ test('voice widget waits for focus, capability, restored draft and the matching 
     view.unmount();
     await act(async () => finish({ key: 'late-chat' }));
     expect(props.navigation.push).not.toHaveBeenCalled();
+  });
+
+  test.each(['codex', 'pi', 'claude-code'] as const)('quotes a reply using only the current scoped %s project', async backend => {
+    const props = createNavigationProps();
+    const reply = { id: 'project-reply', role: 'assistant' as const, text: 'Selected project answer' };
+    const currentAdapter = { ...adapter, connection: { ...adapter.connection, backendKind: backend }, capabilities: { ...CAPABILITY_MATRIX[backend] } };
+    mockConnections.activeAdapter = currentAdapter;
+    mockConnections.roster = [
+      { connection: { id: 'other-connection' }, agents: [{ agent: { agentId: 'atlas' }, sessions: [{ key: props.route.params.sessionKey, project: { id: 'foreign-project' } }] }] },
+      { connection: currentAdapter.connection, agents: [
+        { agent: { agentId: 'other-agent' }, sessions: [{ key: props.route.params.sessionKey, project: { id: 'other-agent-project' } }] },
+        { agent: { agentId: 'atlas' }, sessions: [
+          { key: 'other-session', project: { id: 'other-session-project' } },
+          { key: props.route.params.sessionKey, project: { id: 'opaque-selected-project', name: 'QA', path: '/qa/selected' } },
+        ] },
+      ] },
+    ];
+    jest.mocked(createReplyConversation).mockResolvedValueOnce({ key: 'project-quote-chat' } as any);
+    mockRuntime.getSnapshot.mockReturnValue({ activeConnectionId: 'connection-1', activeAdapter: currentAdapter } as any);
+    const view = render(<ThreadScreen {...props} />);
+    await act(async () => mockThreadViewProps?.messageActions?.onBranch?.(reply));
+    expect(createReplyConversation).toHaveBeenLastCalledWith(currentAdapter, 'atlas', props.route.params.sessionKey, reply, 'opaque-selected-project');
+    expect(props.navigation.push).toHaveBeenCalledWith('Thread', expect.objectContaining({ sessionKey: 'project-quote-chat' }));
+    expect(mockController.onSend).not.toHaveBeenCalled();
+    view.unmount();
   });
 
   test.each(['camera', 'photos'] as const)('%s widget waits for a restored draft and opens its native picker once', async (shortcut) => {

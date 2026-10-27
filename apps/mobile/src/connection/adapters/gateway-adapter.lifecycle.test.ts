@@ -41,6 +41,7 @@ class LifecycleGateway {
   private readonly listeners = new Map<string, Set<(payload: any) => void>>();
 
   public configure(_config: GatewayConfig | null): void {}
+  public getTransferGraceMs(): number { return 0; }
 
   public on(event: GatewayEventName, listener: (payload: any) => void): () => void {
     const listeners = this.listeners.get(event) ?? new Set();
@@ -286,7 +287,7 @@ describe('GatewayAdapter lifecycle boundaries', () => {
       connectTimeoutMs: 25,
     });
     const connecting = adapter.connect();
-    const rejection = expect(connecting).rejects.toMatchObject({ code: 'bridge_offline' });
+    const rejection = expect(connecting).rejects.toMatchObject({ code: 'timeout' });
 
     await jest.advanceTimersByTimeAsync(26);
     await rejection;
@@ -294,6 +295,20 @@ describe('GatewayAdapter lifecycle boundaries', () => {
 
     expect(fake.disconnectCalls).toBe(1);
     expect(adapter.state).toBe('offline');
+  });
+
+  it.each([OpenClawAdapter, HermesAdapter])('joins a bounded known-transfer handshake instead of closing its outer connection timer', async Adapter => {
+    jest.useFakeTimers(); const fake = new LifecycleGateway();
+    jest.spyOn(fake, 'getTransferGraceMs').mockReturnValue(60_000);
+    const backend = Adapter === OpenClawAdapter ? 'openclaw' : 'hermes';
+    const adapter = new Adapter(connection(backend), { gateway: gateway(fake), historyCache: null, connectTimeoutMs: 25_000 });
+    const connecting = adapter.connect();
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(fake.disconnectCalls).toBe(0);
+    fake.emit('connection', { state: 'ready' });
+    if (backend === 'hermes') fake.emit('health', { status: 'ok', hermesApiReachable: true });
+    await expect(connecting).resolves.toBeUndefined();
+    expect(adapter.state).toBe('ready'); adapter.disconnect();
   });
 
   it('uses the prompted non-main session for legacy events without a session key', async () => {
@@ -520,6 +535,28 @@ describe('mergeGatewayHistory', () => {
       { ...remote[0], id: 'h_user_local', timestampMs: 10_264 },
       { ...remote[1], id: 'h_assistant_local', timestampMs: 11_340 }, pending,
     ])).toEqual([...remote, pending]);
+  });
+
+  it('keeps a live-only tool step before the reply it preceded when history omits the step', () => {
+    // Observed 2026-10-01: the provider ran `ls` itself, so chat.history held
+    // only the prompt and a reply stamped at response start, before the step.
+    const user = { id: 'server-user', role: 'user' as const, text: 'Count the files', timestampMs: 1790784965713,
+      idempotencyKey: 'send-1' };
+    const reply = { id: 'h_assistant_1790784986809_c6fa3ea7', role: 'assistant' as const, text: 'There are 31 entries.',
+      timestampMs: 1790784986809 };
+    const step = { id: 'toolcall_toolu_X', role: 'tool' as const, text: '', timestampMs: 1790784993000,
+      tool: { name: 'exec', callId: 'toolu_X', status: 'success' as const } };
+    const merged = mergeGatewayHistory([user, reply], [{ ...user, id: 'usr_1790784965000' }, step, reply]);
+    expect(merged.map(message => message.id)).toEqual(['server-user', 'toolcall_toolu_X', reply.id]);
+    expect(mergeGatewayHistory([user, reply], merged)).toEqual(merged);
+
+    // Consecutive steps keep their order; a step with no confirmed successor
+    // still follows the clock.
+    const second = { ...step, id: 'toolcall_toolu_Y', timestampMs: 1790784994000, tool: { ...step.tool, callId: 'toolu_Y' } };
+    expect(mergeGatewayHistory([user, reply], [user, step, second, reply]).map(message => message.id))
+      .toEqual(['server-user', 'toolcall_toolu_X', 'toolcall_toolu_Y', reply.id]);
+    expect(mergeGatewayHistory([user, reply], [user, reply, step]).map(message => message.id))
+      .toEqual(['server-user', reply.id, 'toolcall_toolu_X']);
   });
 
   it('keeps the remote canonical message and only the optimistic cache tail', () => {
@@ -897,4 +934,41 @@ describe('complete and ordered roster snapshots', () => {
     await expect(retired).rejects.toThrow('previous connection');
     expect(snapshots).toEqual([200]);
   });
+});
+
+it.each([['openclaw', true], ['openclaw', false], ['hermes', true]] as const)('handles delivery directives only on artifact-capable OpenClaw (%s, %s)', (backend, supported) => {
+  const fake = new LifecycleGateway();
+  (fake as any).supportsMethod = (method: string) => supported && method.startsWith('clawket.artifacts.');
+  const options = { gateway: gateway(fake), historyCache: null, bridgeCapabilityMode: 'legacy' as const };
+  const adapter = backend === 'openclaw' ? new OpenClawAdapter(connection('openclaw', 'media'), options) : new HermesAdapter(connection('hermes', 'media'), options);
+  const updates: SessionUpdate[] = []; adapter.on('update', update => updates.push(update));
+  fake.emit('connection', { state: 'ready' });
+  fake.emit('chatDelta', { sessionKey: 'agent:main:test', runId: 'r', text: 'MEDIA: /tmp/image.png' });
+  fake.emit('chatFinal', { sessionKey: 'agent:main:test', runId: 'r', message: { content: 'MEDIA: /tmp/image.png' } });
+  const expected = backend === 'openclaw' && supported ? '' : 'MEDIA: /tmp/image.png';
+  expect(updates.find(update => update.type === 'agent_message_chunk')).toMatchObject({ text: expected });
+  expect(updates.find(update => update.type === 'run_finished')).toMatchObject({ message: { content: expected } });
+  adapter.disconnect();
+});
+
+it.each([false, true])('rebuild retries preserve native artifacts and fence a replaced connection (replace=%s)', async replace => {
+  jest.useFakeTimers();
+  const fake = new LifecycleGateway();
+  const adapter = new OpenClawAdapter(connection('openclaw', 'retry-media'), { gateway: gateway(fake), historyCache: null, bridgeCapabilityMode: 'legacy' });
+  let reads = 0;
+  fake.requestHandler = method => {
+    if (method !== 'chat.history') return {};
+    if (++reads === 1) throw new Error('[UNAVAILABLE] session history is rebuilding; retry shortly');
+    return { messages: [{ id: 'managed', role: 'assistant', content: [{ type: 'image', artifactId: 'confirmed', mimeType: 'image/png' }] }] };
+  };
+  fake.emit('connection', { state: 'ready' });
+  try {
+    const pending = adapter.loadSession('agent:main:main').catch(error => error);
+    await jest.advanceTimersByTimeAsync(0);
+    if (replace) { fake.emit('connection', { state: 'reconnecting' }); fake.emit('connection', { state: 'ready' }); }
+    await jest.runAllTimersAsync();
+    const result = await pending;
+    if (replace) { expect(result).toBeInstanceOf(Error); expect(reads).toBe(1); }
+    else { expect(result.messages[0].attachments[0].artifactId).toBe('confirmed'); expect(reads).toBe(2); }
+  } finally { adapter.dispose(); jest.useRealTimers(); }
 });

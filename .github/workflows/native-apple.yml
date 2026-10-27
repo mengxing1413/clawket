@@ -1,0 +1,131 @@
+name: Native Apple checks
+
+on:
+  pull_request:
+    paths:
+      - packages/apple/**
+      - apps/ios/**
+      - tests/native-contract/**
+      - tests/compat/fixtures/v1/**
+      - apps/mobile/src/connection/adapters/__fixtures__/openclaw-session-reset.json
+      - scripts/native-ios/**
+      - docs/native-ios/localization-inventory.json
+      - .github/workflows/native-apple.yml
+  push:
+    branches: [main]
+    paths:
+      - packages/apple/**
+      - apps/ios/**
+      - tests/native-contract/**
+      - tests/compat/fixtures/v1/**
+      - apps/mobile/src/connection/adapters/__fixtures__/openclaw-session-reset.json
+      - scripts/native-ios/**
+      - docs/native-ios/localization-inventory.json
+      - .github/workflows/native-apple.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-apple-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  swift-package:
+    name: Native Apple package
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: packages/apple
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show selected Xcode and Swift compiler
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Typecheck native UIKit and SwiftUI against iOS 16.4
+        run: |
+          python3 - <<'PY'
+          import glob
+          import subprocess
+          import sys
+
+          sources = sorted(glob.glob("Sources/ClawketUI/*.swift"))
+          if not sources:
+              sys.exit("ClawketUI source discovery is empty")
+          sdk = subprocess.check_output(
+              ["xcrun", "--sdk", "iphonesimulator", "--show-sdk-path"], text=True
+          ).strip()
+          print(f"Typechecking {len(sources)} native UI sources for iOS 16.4", flush=True)
+          subprocess.run([
+              "xcrun", "swiftc", "-swift-version", "6", "-typecheck",
+              "-target", "arm64-apple-ios16.4-simulator", "-sdk", sdk,
+              "-module-name", "ClawketUI", *sources
+          ], check=True)
+          PY
+      - name: Discover native tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test list --jobs 2 > "$RUNNER_TEMP/clawket-native-tests.txt"
+          test -s "$RUNNER_TEMP/clawket-native-tests.txt"
+          cat "$RUNNER_TEMP/clawket-native-tests.txt"
+          echo "Native test cases discovered: $(wc -l < "$RUNNER_TEMP/clawket-native-tests.txt")"
+      - name: Test native package with Swift 6 concurrency checking
+        run: swift test --jobs 2
+  ios-application:
+    name: Native iOS application
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check native test result validator
+        working-directory: apps/ios/scripts
+        run: python3 -m unittest test_validate_xctest_result.py
+      - name: Check all 19 native localizations and resource validation
+        run: |
+          node --test scripts/native-ios/localization.test.mjs
+          node scripts/native-ios/localization.mjs
+          python3 -m unittest discover -s scripts/native-ios -p test_localization_resources.py
+      - name: Create a simulator matching the selected SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          sdk = subprocess.check_output(["xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"], text=True).strip()
+          version = lambda text: tuple(int(part) for part in text.split("."))
+          runtimes = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "runtimes", "--json"], text=True))["runtimes"]
+          usable = [item for item in runtimes if item.get("isAvailable") and ".iOS-" in item["identifier"] and version(item["version"]) <= version(sdk)]
+          if not usable:
+              raise SystemExit("No available iOS simulator runtime matches the selected SDK")
+          runtime = max(usable, key=lambda item: version(item["version"]))
+          device = subprocess.check_output(["xcrun", "simctl", "create", "Clawket native CI", "com.apple.CoreSimulator.SimDeviceType.iPhone-16", runtime["identifier"]], text=True).strip()
+          if not device:
+              raise SystemExit("Simulator creation returned an empty ID")
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"CLAWKET_CI_SIMULATOR={device}\n")
+          print(f"Native app acceptance runtime: {runtime['name']}")
+          PY
+      - name: Build the SwiftUI app and run native recovery tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project apps/ios/Clawket.xcodeproj -scheme Clawket \
+            -configuration Debug -destination "platform=iOS Simulator,id=$CLAWKET_CI_SIMULATOR" \
+            -derivedDataPath "$RUNNER_TEMP/clawket-native-derived" \
+            -resultBundlePath "$RUNNER_TEMP/clawket-native-tests.xcresult" \
+            -jobs 2 -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- \
+            test -only-testing:ClawketTests
+          xcrun xcresulttool get test-results summary \
+            --path "$RUNNER_TEMP/clawket-native-tests.xcresult" > "$RUNNER_TEMP/clawket-native-summary.json"
+          python3 apps/ios/scripts/validate_xctest_result.py "$RUNNER_TEMP/clawket-native-summary.json"
+      - name: Verify exact translations in the compiled app bundle
+        run: |
+          python3 scripts/native-ios/localization_resources.py \
+            "$RUNNER_TEMP/clawket-native-derived/Build/Products/Debug-iphonesimulator/Clawket.app"

@@ -40,7 +40,7 @@ The screenshots show the new 3.0 interface. Store availability may differ while 
 - **Connect your way.** Use Relay for remote access, or connect over LAN, Tailscale, or your own endpoint. Self-host the infrastructure if you prefer.
 - **Use your language.** The app supports 19 interface languages, light and dark themes, and voice input with an optional transcription service.
 
-Clawket connects to agents you run; you need an existing OpenClaw or Hermes installation. Available tools and management features depend on that backend.
+Clawket connects to agents you run; you need an existing supported agent or model server. Available tools and management features depend on that backend.
 
 ## Get connected
 
@@ -51,7 +51,15 @@ npm install -g @p697/clawket
 clawket pair
 ```
 
-Scan the generated QR code in Clawket. The CLI detects installed backends and produces a labeled pairing result for each. Relay is the default; Hermes pairing also attempts to start its Clawket-managed bridge and Relay runtime.
+Scan the generated QR code in Clawket. The default command detects installed OpenClaw and Hermes backends and produces a labeled pairing result for each. Relay is the default; Hermes pairing also attempts to start its Clawket-managed bridge and Relay runtime.
+
+To detect installed platforms and choose one interactively (including Codex, Claude Code, and Pi), run this in your computer's terminal:
+
+```bash
+npx @p697/clawket@latest pair choose
+```
+
+The pairing home shows this command and its Copy action directly below the platform list, under **Or detect automatically**. Scan and expandable code entry are available on the same page, and the scanner can also read a QR code from your photos; manual codes require selecting their platform first. Platform-specific onboarding defaults to terminal scanning for Codex, Claude Code, Pi, and local models; OpenClaw and Hermes default to an agent message. You can switch methods and enter a pairing code instead of scanning. `pair choose` is interactive, accepts no flags, and is not a Preview command.
 
 For direct pairing on your local network:
 
@@ -59,7 +67,9 @@ For direct pairing on your local network:
 clawket pair local
 ```
 
-To select a backend explicitly, add `--backend openclaw` or `--backend hermes`. Use `clawket status`, `clawket doctor`, and `clawket logs` to inspect your connection.
+To select a backend explicitly, use `--backend` with `openclaw`, `hermes`, `codex`, `claude-code`, `pi`, or `local-model`. Use `clawket status`, `clawket doctor`, and `clawket logs` to inspect your connection.
+
+`status` summarizes all saved Agent connections; add `--verbose` for paths and capabilities. Use `clawket logs --backend codex --last 10m --follow` (or another backend) for live troubleshooting. Default lifecycle/reset commands retain the OpenClaw/Hermes service scope; use `clawket codex reset`, `clawket claude-code reset`, or `clawket pi reset` with the original pairing options for those Agents. Reset retains session history.
 
 ## Build from source
 
@@ -138,3 +148,5 @@ Live-service and release integration checks have separate prerequisites; see the
 ## License
 
 Unless a subdirectory states otherwise, this repository is licensed under [AGPL-3.0-only](./LICENSE).
+
+Bridge upgrades preserve existing pairing. See [Bridge updates](docs/bridge-updates.md) for unified update support, runtime verification and manual deployment exceptions.

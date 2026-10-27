@@ -1,3 +1,7 @@
+// Keep the real confirmation flow; native presentation measurement has its own boundary test.
+jest.mock('../../components/ui/PresentationSafeAreaProvider', () => ({
+  PresentationSafeAreaProvider: ({ children }: React.PropsWithChildren) => children,
+}));
 import React from 'react';
 import { Alert } from 'react-native';
 import { act, fireEvent, render, waitFor, within } from '@testing-library/react-native';
@@ -15,6 +19,7 @@ jest.mock('react-native', () => {
   return {
     Alert: { alert: jest.fn() },
     AccessibilityInfo: { announceForAccessibility: jest.fn() },
+    I18nManager: { isRTL: false },
     Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
     Pressable: host('Pressable'), View: host('View'), Text: host('Text'), TextInput: host('TextInput'), ScrollView: host('ScrollView'), ActivityIndicator: host('ActivityIndicator'),
     Modal: ({ visible, children }: { visible: boolean; children: React.ReactNode }) => visible ? children : null,
@@ -295,6 +300,19 @@ describe('guided Cron management', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  it('keeps the empty run line in place while the history re-reads', async () => {
+    const data = setup();
+    const view = render(<CronEditorScreen {...data} agent={agent} online jobId="daily" />);
+    await waitFor(() => expect(view.getByText('No runs yet')).toBeTruthy());
+    let finish!: (value: Awaited<ReturnType<typeof data.runs>>) => void;
+    data.runs.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    fireEvent.press(view.getByTestId('cron-refresh-runs'));
+    await waitFor(() => expect(data.runs).toHaveBeenCalledTimes(2));
+    expect(view.getByText('No runs yet')).toBeTruthy();
+    await act(async () => finish({ entries: [], total: 0, offset: 0, limit: 3, hasMore: false, nextOffset: null }));
+    expect(view.getByText('No runs yet')).toBeTruthy();
   });
 
   it('shows OpenClaw-owned monitors as read-only in the list and details', async () => {

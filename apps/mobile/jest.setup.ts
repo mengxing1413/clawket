@@ -16,6 +16,8 @@ jest.mock('react-native-svg', () => {
     LinearGradient: host('LinearGradient'),
     Rect: host('Rect'),
     Stop: host('Stop'),
+    // The built-in chat wallpaper tiles its doodles with a pattern fill.
+    Pattern: host('Pattern'),
   };
 });
 
@@ -79,12 +81,17 @@ jest.mock('react-native-reanimated', () => {
     interpolate: (_value: number, _input: number[], output: unknown[]) => output[0],
     interpolateColor: (_value: number, _input: number[], output: unknown[]) => output[0],
     makeMutable: <T>(value: T) => ({ value }),
+    measure: () => null,
     ReduceMotion: { Always: 'always', Never: 'never', System: 'system' },
     runOnJS: identity,
+    runOnUI: identity,
     scrollTo: jest.fn(),
+    useAnimatedReaction: () => undefined,
     useAnimatedRef: () => ({ current: null }),
     useAnimatedProps: (factory: () => unknown) => factory(),
     useAnimatedStyle: (factory: () => unknown) => factory(),
+    // Worklet event handlers never receive native events in Node.
+    useEvent: () => ({}),
     // Frame callbacks never tick in Node; tests drive worklet models directly.
     useFrameCallback: () => ({ setActive: () => undefined, isActive: false, callbackId: -1 }),
     useScrollOffset: () => ({ value: 0 }),
@@ -219,8 +226,10 @@ jest.mock('expo-haptics', () => ({
   impactAsync: jest.fn(),
   notificationAsync: jest.fn(),
   selectionAsync: jest.fn(),
-  ImpactFeedbackStyle: { Light: 'light', Medium: 'medium', Heavy: 'heavy' },
+  performAndroidHapticsAsync: jest.fn(),
+  ImpactFeedbackStyle: { Light: 'light', Medium: 'medium', Heavy: 'heavy', Rigid: 'rigid', Soft: 'soft' },
   NotificationFeedbackType: { Success: 'success', Warning: 'warning', Error: 'error' },
+  AndroidHaptics: { Confirm: 'confirm', Reject: 'reject', Virtual_Key: 'virtual-key' },
 }));
 
 // Mock expo-clipboard
@@ -588,11 +597,9 @@ if (!globalThis.crypto.getRandomValues) {
 // Metro resolves official platform artwork to numeric native asset handles.
 jest.mock('./assets/brands/openclaw.png', () => 301);
 jest.mock('./assets/brands/hermes.png', () => 302);
-jest.mock('./assets/brands/youmind.png', () => 303);
 jest.mock('./assets/brands/pi.png', () => 307);
 jest.mock('./assets/brands/codex.png', () => 308);
 jest.mock('./assets/brands/claude-code.png', () => 309);
-jest.mock('./assets/avatars/youmind-sprite-default.png', () => 306);
 
 jest.mock('./assets/icon.png', () => 304);
 jest.mock('./assets/app-icons/black/app-icon-black-1024.png', () => 305);

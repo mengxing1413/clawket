@@ -1,4 +1,5 @@
 import { isIncomingParticipant, messageParticipantKey } from '../../chat/messageAttribution';
+import { isTranscriptBoundaryNotice } from '../../chat/agentSystemNotice';
 import type {
   AdapterErrorCode,
   Capabilities,
@@ -9,7 +10,11 @@ import type {
 } from '@clawket/agent-protocol';
 import type { ConnectionState as LegacyConnectionState } from '../../types';
 import type { UiMessage } from '../../types/chat';
+import { renderKeyOf, type FoldedTurns, type TurnReceipt } from '../../components/chat/turn-work';
+import { toolCategory, unwrapToolCall } from '../../utils/tool-display';
+import { estimateTextWidth, truncateToEstimatedWidth } from '../../utils/text-width';
 import { resolveCronRunSessionKey } from '../../connection/adapters/cron-run-content';
+import { isSystemOwnedCronJob } from '../AgentSettings/cron-model';
 import { formatThreadTimestamp, localDayNumber, THREAD_TIME_GAP_MS } from './timestamps';
 
 export type ThreadContentState =
@@ -59,6 +64,8 @@ export type ThreadRunCard = Readonly<{
   summary?: string;
   /** The run record behind a Cron card; the execution record sheet reads it. */
   cronRun?: CronRunLogEntry;
+  /** The job may be run again from the conversation (system-owned jobs may not, as in the editor). */
+  runnable?: boolean;
 }>;
 
 export type ThreadRunSeed = Omit<ThreadRunCard, 'statusLabel' | 'timeLabel' | 'canOpenLogs'>;
@@ -74,6 +81,7 @@ function runSeedSignature(run: ThreadRunSeed): string {
     run.sessionKey ?? '',
     run.jobId ?? '',
     run.agentId ?? '',
+    run.runnable ? '1' : '0',
   ].join('\u0001');
 }
 
@@ -95,18 +103,35 @@ export function areThreadRunSeedsEqual(
 }
 
 export type ThreadTimelineItem =
-  | Readonly<{ type: 'tools'; key: string; messages: ReadonlyArray<UiMessage>; timestampMs?: number }>
+  | Readonly<{
+      /** A finished turn that said nothing: its receipt in an Agent bubble of its own. */
+      type: 'receipt';
+      key: string;
+      receipt: TurnReceipt;
+      /** The render key of the turn's newest step, where the bubble stands: it enters like a reply. */
+      anchorKey: string;
+      timestampMs?: number;
+    }>
   | Readonly<{
       type: 'message';
       key: string;
       timestampMs?: number;
       message: UiMessage;
+      /** The receipt of the turn this reply finished (tool process design C). */
+      receipt?: TurnReceipt;
     }>
   | Readonly<{
       type: 'run';
       key: string;
       timestampMs: number;
       run: ThreadRunCard;
+    }>
+  | Readonly<{
+      /** Adjacent scheduled results as one message (A+ chat design); runs are newest-first. */
+      type: 'cron';
+      key: string;
+      timestampMs: number;
+      runs: ReadonlyArray<ThreadRunCard>;
     }>
   | Readonly<{
       type: 'date';
@@ -211,6 +236,7 @@ export function buildCronRunSeeds(params: Readonly<{
       summary: entry.error?.trim() || entry.summary?.trim() || undefined,
       updatedAt,
       cronRun: entry,
+      runnable: !isSystemOwnedCronJob(job),
     });
     seenJobIds.add(entry.jobId);
   }
@@ -321,16 +347,26 @@ export function buildThreadTimelineItems(params: Readonly<{
 
   const timeline: ThreadTimelineItem[] = [];
   let previousTimestamp: number | undefined;
+  // A transcript boundary opens the rows after it, so it waits for the next row:
+  // that row's time label lands above the boundary, not between them.
+  let pendingBoundaries: ThreadTimelineItem[] = [];
   // Walk oldest-first to compare adjacent timed rows, never elapsed time since
   // the last separator. Preserve source order and ignore untimed/system rows.
   for (let index = merged.length - 1; index >= 0; index -= 1) {
     const current = merged[index]!;
+    if (current.item.type === 'message' && isTranscriptBoundaryNotice(current.item.message)) {
+      pendingBoundaries.push(current.item);
+      continue;
+    }
     const timestamp = current.item.type === 'message' && current.item.message.role === 'system'
       ? undefined : current.timestampMs;
+    // A scheduled result carries its own time inside the digest, so it only
+    // starts a new day; the results of one day stay adjacent and merge.
+    const scheduled = current.item.type === 'run' && current.item.run.kind === 'cron';
     if (timestamp !== undefined) {
       if (previousTimestamp === undefined
         || localDayNumber(timestamp) !== localDayNumber(previousTimestamp)
-        || timestamp - previousTimestamp >= THREAD_TIME_GAP_MS) {
+        || (!scheduled && timestamp - previousTimestamp >= THREAD_TIME_GAP_MS)) {
         timeline.push({
           type: 'date',
           // Server echoes can correct optimistic time without remounting rows.
@@ -341,8 +377,10 @@ export function buildThreadTimelineItems(params: Readonly<{
       }
       previousTimestamp = timestamp;
     }
-    timeline.push(current.item);
+    timeline.push(...pendingBoundaries, current.item);
+    pendingBoundaries = [];
   }
+  timeline.push(...pendingBoundaries);
   timeline.reverse();
   return timeline;
 }
@@ -418,16 +456,49 @@ export function resolveContextRemainingPercent(
   return Math.round(Math.min(1, Math.max(0, remaining)) * 100);
 }
 
+const THREAD_HEADER_NAME_SEPARATOR = ' · ';
+/** The most of an overflowing header line the Agent's part keeps (owner decision 2026-10-06). */
+const THREAD_HEADER_AGENT_SHARE = 0.4;
+
+/** The header names the Agent, then the session unless it is the main conversation. */
+export type ThreadHeaderName = Readonly<{ agent: string; session: string | null }>;
+
 export function resolveThreadHeaderName(
   agentName: string,
   sessionTitle: string | null | undefined,
   isMainSession: boolean,
-): string {
+): ThreadHeaderName {
   const normalizedTitle = sessionTitle?.trim();
   if (!normalizedTitle || isMainSession || normalizedTitle === agentName.trim()) {
-    return agentName;
+    return { agent: agentName, session: null };
   }
-  return `${agentName} · ${normalizedTitle}`;
+  return { agent: agentName, session: normalizedTitle };
+}
+
+/**
+ * The Agent as the Thread header names it (owner decision 2026-10-06). Beside its product's own
+ * mark, a Bridge-generated `Codex · Lucy's Mac mini` reads as the computer or project alone; a
+ * renamed connection keeps its own words.
+ */
+export function threadHeaderAgentLabel(agentName: string, faceBrand: string | null | undefined): string {
+  const prefix = faceBrand ? `${faceBrand}${THREAD_HEADER_NAME_SEPARATOR}` : '';
+  if (!prefix || !agentName.startsWith(prefix)) return agentName;
+  return agentName.slice(prefix.length).trim() || agentName;
+}
+
+/**
+ * The header's one line (owner decision 2026-10-06). When `Agent · session` overflows, the
+ * Agent's part is shortened first, to at most 40% of the line unless a short session title leaves
+ * it more; the session title keeps the rest up to the line's own tail ellipsis, so neither part
+ * disappears.
+ */
+export function fitThreadHeaderName(name: ThreadHeaderName, lineWidth: number, fontSize: number): string {
+  if (!name.session) return name.agent;
+  const rest = `${THREAD_HEADER_NAME_SEPARATOR}${name.session}`;
+  if (!(lineWidth > 0) || !(fontSize > 0)) return `${name.agent}${rest}`;
+  const restWidth = estimateTextWidth(rest, fontSize);
+  const agentBudget = Math.max(lineWidth * THREAD_HEADER_AGENT_SHARE, lineWidth - restWidth);
+  return `${truncateToEstimatedWidth(name.agent, agentBudget, fontSize)}${rest}`;
 }
 
 /** Home-relative like a shell prompt, so the header shows the project rather than `/Users/<name>`. */
@@ -437,43 +508,103 @@ export function displayProjectPath(path: string): string {
     .replace(/^[A-Za-z]:\\Users\\[^\\]+(?=\\|$)/, '~');
 }
 
+/**
+ * Title for a copy of a conversation, such as `Fix login (copy)`, kept within every Bridge's
+ * title limit by dropping whole characters from the source title. Undefined leaves the Bridge default.
+ */
+export function copiedSessionTitle(
+  title: string | null | undefined,
+  format: (title: string) => string,
+  maxLength = 200,
+): string | undefined {
+  const characters = Array.from(title?.trim() ?? '');
+  if (characters.length === 0) return undefined;
+  let copied = format(characters.join(''));
+  while (copied.length > maxLength && characters.length > 1) {
+    characters.pop();
+    copied = format(`${characters.join('').trimEnd()}…`);
+  }
+  return copied.length <= maxLength ? copied : undefined;
+}
+
 export type ThreadHeaderSubtitleInput = Readonly<{
-  projectPath?: string | null;
-  capabilities: Capabilities;
   state: ThreadContentState;
   isRunning: boolean;
   activityLabel?: string | null;
-  model?: string | null;
-  contextUsed?: number;
-  contextWindow?: number;
   offlineLabel: string;
   thinkingLabel: string;
-  formatModelContext: (model: string, remainingPercent: number) => string;
+  onlineLabel: string;
 }>;
 
+/**
+ * The header's line under the Agent's name when no status sentence applies
+ * (A+ chat design, owner decision 2026-09-30): "Online" while the Agent can
+ * answer. Its model, context left and project live in the model sheet.
+ */
 export function resolveThreadHeaderSubtitle({
-  projectPath,
-  capabilities,
   state,
   isRunning,
   activityLabel,
-  model,
-  contextUsed,
-  contextWindow,
   offlineLabel,
   thinkingLabel,
-  formatModelContext,
+  onlineLabel,
 }: ThreadHeaderSubtitleInput): string {
   if (state.kind === 'offline') return offlineLabel;
   if (isRunning) return activityLabel?.trim() || thinkingLabel;
-  if (projectPath?.trim() && (state.kind === 'ready' || state.kind === 'empty')) return displayProjectPath(projectPath);
-  if (!capabilities.models) return '';
+  return state.kind === 'ready' || state.kind === 'empty' ? onlineLabel : '';
+}
 
-  const normalizedModel = model?.trim() ?? '';
-  const remainingPercent = resolveContextRemainingPercent(contextUsed, contextWindow);
-  return remainingPercent === null
-    ? ''
-    : formatModelContext(normalizedModel, remainingPercent);
+type Translate = (key: string, options?: Record<string, unknown>) => string;
+
+/** A prompt the Agent received; a queued or sending draft has not started a turn yet. */
+function isOwnPrompt(message: UiMessage): boolean {
+  return message.role === 'user' && !isIncomingParticipant(message) && message.delivery === undefined;
+}
+
+/** A tool call of the current turn is still running. `messages` is newest-first. */
+export function isToolRunningInTurn(messages: ReadonlyArray<UiMessage>): boolean {
+  for (const message of messages) {
+    if (isOwnPrompt(message)) return false;
+    if (message.role === 'tool' && message.toolStatus === 'running' && !message.approval) return true;
+  }
+  return false;
+}
+
+/**
+ * The sentence under the Agent's name while it works (A+ chat design, owner
+ * decision 2026-09-30): what the running step of this turn does, "Typing…"
+ * once the reply streams, else the controller's activity or "Thinking…".
+ * Only the current turn counts, so an orphaned call from an earlier turn
+ * never speaks for this one. `messages` is newest-first.
+ */
+export function resolveThreadWorkingStatus({
+  messages,
+  activityLabel,
+  thinkingLabel,
+  t,
+}: Readonly<{
+  messages: ReadonlyArray<UiMessage>;
+  activityLabel?: string | null;
+  thinkingLabel: string;
+  t: Translate;
+}>): string {
+  let typing = false;
+  for (const message of messages) {
+    if (isOwnPrompt(message)) break;
+    if (message.role === 'tool' && message.toolStatus === 'running' && !message.approval) {
+      switch (toolCategory(unwrapToolCall(message.toolName?.trim() ?? '', message.toolArgs).name)) {
+        case 'command': return t('Running a command…', { ns: 'chat' });
+        case 'read': return t('Reading files…', { ns: 'chat' });
+        case 'edit': return t('Editing files…', { ns: 'chat' });
+        case 'search': return t('Searching…', { ns: 'chat' });
+        case 'web': return t('Browsing the web…', { ns: 'chat' });
+        default: return t('Using tools…', { ns: 'chat' });
+      }
+    }
+    if (message.role === 'assistant' && message.streaming === true && message.text.trim()) typing = true;
+  }
+  if (typing) return t('Typing…', { ns: 'chat' });
+  return activityLabel?.trim() || thinkingLabel;
 }
 
 export const THREAD_ERROR_COPY: Readonly<Record<AdapterErrorCode, Readonly<{
@@ -542,44 +673,90 @@ export function resolveThreadErrorDetail(error: unknown): string | undefined {
   return typeof message === 'string' ? message.trim() || undefined : undefined;
 }
 
-/** Input is newest-first. The oldest call anchors a group while new calls arrive. */
-export function groupThreadTools(items: ThreadTimelineItem[], expanded: ReadonlySet<string>): ThreadTimelineItem[] {
+/**
+ * Places what `foldTurnSteps` decided (tool process design C, owner decisions
+ * 2026-10-02 and 2026-10-05): a finished turn's last reply carries its
+ * receipt, and a turn that said nothing keeps the receipt in a bubble of its
+ * own where its newest step was, keyed by the turn's oldest call so it stays
+ * put while history replaces live call ids. Any other tool call leaves the
+ * conversation: the work dock shows the running turn. Approvals stay
+ * messages. Input is newest-first.
+ */
+export function placeTurnReceipts(
+  items: ReadonlyArray<ThreadTimelineItem>,
+  folded: Pick<FoldedTurns, 'receipts' | 'standalone'>,
+): ThreadTimelineItem[] {
+  const result: ThreadTimelineItem[] = [];
+  for (const item of items) {
+    if (item.type !== 'message') {
+      result.push(item);
+      continue;
+    }
+    const key = renderKeyOf(item.message);
+    const receipt = folded.receipts.get(key);
+    if (receipt) {
+      result.push({ ...item, receipt });
+      continue;
+    }
+    if (item.message.role !== 'tool' || item.message.approval) {
+      result.push(item);
+      continue;
+    }
+    const standalone = folded.standalone.get(key);
+    if (!standalone || standalone.steps.length === 0) continue;
+    result.push({
+      type: 'receipt',
+      key: `receipt:${renderKeyOf(standalone.steps[0]!)}`,
+      timestampMs: item.timestampMs,
+      receipt: standalone,
+      anchorKey: key,
+    });
+  }
+  return result;
+}
+
+/**
+ * Merges adjacent scheduled results into one digest message (A+ chat design,
+ * owner decision 2026-09-30); a lone result is a digest of one. The oldest
+ * run anchors the key so a newer result joins without remounting it.
+ * Sub-agent runs keep their own cards. Input is newest-first.
+ */
+export function groupThreadRuns(items: ReadonlyArray<ThreadTimelineItem>): ThreadTimelineItem[] {
   const result: ThreadTimelineItem[] = [];
   for (let index = 0; index < items.length;) {
     const item = items[index]!;
-    if (item.type !== 'message' || item.message.role !== 'tool' || item.message.approval || item.message.toolPresentation?.length || item.message.imageUris?.length || item.message.toolStatus === 'error') {
+    if (item.type !== 'run' || item.run.kind !== 'cron') {
       result.push(item); index += 1; continue;
     }
-    const calls: Extract<ThreadTimelineItem, { type: 'message' }>[] = [];
+    const runs: ThreadRunCard[] = [];
     while (index < items.length) {
       const next = items[index]!;
-      if (next.type !== 'message' || next.message.role !== 'tool' || next.message.approval || next.message.toolPresentation?.length || next.message.imageUris?.length || next.message.toolStatus === 'error') break;
-      calls.push(next); index += 1;
+      if (next.type !== 'run' || next.run.kind !== 'cron') break;
+      runs.push(next.run); index += 1;
     }
-    if (calls.length < 2) { result.push(...calls); continue; }
-    // Keyed like message rows: history can replace a live call's id
-    // (`toolcall_` → `toolresult_`, Hermes aliases) while its render identity,
-    // and with it the group and its expanded state, stays put.
-    const oldest = calls[calls.length - 1]!.message;
-    const key = `tools:${oldest.renderKey ?? oldest.id}`;
-    // Inverted list: children follow the summary visually, newest first in data.
-    if (expanded.has(key)) result.push(...calls);
-    result.push({ type: 'tools', key, timestampMs: item.timestampMs, messages: calls.map((call) => call.message) });
+    result.push({ type: 'cron', key: `cron:${runs[runs.length - 1]!.id}`, timestampMs: item.timestampMs, runs });
   }
   return result;
 }
 
 /**
  * Vertical rhythm of a timeline row: the gap it owns toward the older row
- * above it. `stack` keeps one voice's rows together (consecutive tool calls,
- * an activity stack and the reply it produced, repeated bubbles from one
- * speaker), `turn` separates the user's voice from the Agent's, and
- * `section` sets a time label apart from everything before it. The row after
- * a time label owns nothing: the label carries its own gap below.
+ * above it. `joined` keeps consecutive bubbles from one speaker together as
+ * one Telegram-style group; `stack` keeps other rows of one voice close (an
+ * approval card and the reply after it); `turn` separates the user's voice
+ * from the Agent's and sets service pills apart; `section` sets a time label
+ * apart from everything before it. The row after a time label owns nothing:
+ * the label carries its own gap below.
  */
-export type ThreadRowGap = 'none' | 'stack' | 'turn' | 'section';
+export type ThreadRowGap = 'none' | 'joined' | 'stack' | 'turn' | 'section';
 
-export type ThreadTimelineRow = ThreadTimelineItem & Readonly<{ gapAbove: ThreadRowGap }>;
+export type ThreadTimelineRow = ThreadTimelineItem & Readonly<{
+  gapAbove: ThreadRowGap;
+  /** The older row is a bubble from the same speaker: the bubble joins it. */
+  joinsOlder: boolean;
+  /** The newer row is a bubble from the same speaker: the tail waits for it. */
+  joinsNewer: boolean;
+}>;
 
 type ThreadVoice = string;
 
@@ -595,15 +772,34 @@ function timelineVoice(item: ThreadTimelineItem): ThreadVoice {
   return 'agent';
 }
 
-/** Assigns every row its gap from the visually preceding (older, next in data) row. */
+/**
+ * A row that draws a message bubble, so neighbours from its speaker can join
+ * it: a message, or a standalone receipt in the Agent's bubble. A reply with
+ * no words yet draws nothing.
+ */
+function isBubbleRow(item: ThreadTimelineItem | undefined): boolean {
+  if (item?.type === 'receipt') return true;
+  return item?.type === 'message' && !item.message.approval
+    && (item.message.role === 'user' || item.message.role === 'assistant')
+    && !(item.message.streaming === true && !item.message.text.trim());
+}
+
+function joins(item: ThreadTimelineItem, neighbour: ThreadTimelineItem | undefined): boolean {
+  return isBubbleRow(item) && isBubbleRow(neighbour) && timelineVoice(item) === timelineVoice(neighbour!);
+}
+
+/** Assigns every row its gap from the visually preceding (older, next in data) row and its bubble joins. */
 export function withThreadRhythm(items: ReadonlyArray<ThreadTimelineItem>): ThreadTimelineRow[] {
   return items.map((item, index) => {
     const older = items[index + 1];
+    const newer = index > 0 ? items[index - 1] : undefined;
+    const joinsOlder = joins(item, older);
     let gapAbove: ThreadRowGap;
     if (!older || older.type === 'date') gapAbove = 'none';
     else if (item.type === 'date') gapAbove = 'section';
+    else if (joinsOlder) gapAbove = 'joined';
     else gapAbove = timelineVoice(item) === timelineVoice(older) ? 'stack' : 'turn';
-    return { ...item, gapAbove };
+    return { ...item, gapAbove, joinsOlder, joinsNewer: joins(item, newer) };
   });
 }
 
@@ -623,16 +819,28 @@ function hasSameMessages(left: ReadonlyArray<UiMessage>, right: ReadonlyArray<Ui
     || (left.length === right.length && left.every((message, index) => hasSameFields(message, right[index]!)));
 }
 
+function hasSameReceipt(left: TurnReceipt | undefined, right: TurnReceipt | undefined): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return hasSameMessages(left.steps, right.steps);
+}
+
 function reuseThreadRow(previous: ThreadTimelineRow, next: ThreadTimelineRow): ThreadTimelineRow {
   if (previous === next) return previous;
-  if (previous.type !== next.type || previous.gapAbove !== next.gapAbove || previous.timestampMs !== next.timestampMs) return next;
+  if (previous.type !== next.type || previous.gapAbove !== next.gapAbove || previous.timestampMs !== next.timestampMs
+    || previous.joinsOlder !== next.joinsOlder || previous.joinsNewer !== next.joinsNewer) return next;
   switch (next.type) {
     case 'message':
-      return previous.type === 'message' && hasSameFields(previous.message, next.message) ? previous : next;
-    case 'tools':
-      return previous.type === 'tools' && hasSameMessages(previous.messages, next.messages) ? previous : next;
+      return previous.type === 'message' && hasSameFields(previous.message, next.message)
+        && hasSameReceipt(previous.receipt, next.receipt) ? previous : next;
+    case 'receipt':
+      return previous.type === 'receipt' && previous.anchorKey === next.anchorKey
+        && hasSameReceipt(previous.receipt, next.receipt) ? previous : next;
     case 'run':
       return previous.type === 'run' && previous.run === next.run ? previous : next;
+    case 'cron':
+      return previous.type === 'cron' && previous.runs.length === next.runs.length
+        && previous.runs.every((run, index) => run === next.runs[index]) ? previous : next;
     case 'date':
       return previous.type === 'date' && previous.label === next.label ? previous : next;
   }

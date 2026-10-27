@@ -22,13 +22,12 @@ it('does not round a real sub-cent cost down to free', () => {
 const TRANSPORT_BY_BACKEND: Readonly<Record<ConnectionDescriptor['backendKind'], ConnectionDescriptor['transportKind']>> = {
   openclaw: 'relay',
   hermes: 'relay',
-  'local-model': 'relay', pi: 'relay', codex: 'relay', 'claude-code': 'relay', youmind: 'https',
+  'local-model': 'relay', pi: 'relay', codex: 'relay', 'claude-code': 'relay',
 };
 
 const MAIN_SESSION_BY_BACKEND: Readonly<Record<ConnectionDescriptor['backendKind'], string>> = {
   openclaw: 'agent:main:main',
   hermes: 'main',
-  youmind: 'main',
   'local-model': 'main', pi: 'pi-session', codex: 'pi-session', 'claude-code': 'claude-session',
 };
 
@@ -199,28 +198,26 @@ describe('Agent settings descriptor model', () => {
     // Hermes declares no heartbeat, so a stray timestamp never becomes an activity line.
     expect(hermes.identity.activeMinutesAgo).toBeNull();
 
-    const sprite = buildAgentSettingsModel({
-      connection: connection('youmind'),
-      agent: agent('youmind'),
-      capabilities: capabilities('youmind'),
+    const chatOnly = buildAgentSettingsModel({
+      connection: connection('local-model'),
+      agent: agent('local-model'),
+      capabilities: capabilities('local-model', { attachments: false, models: false }),
       connectionState: 'ready',
       isPro: true,
-      identityDetail: 'owner@example.com',
     });
-    expect(sprite.identity).toMatchObject({
-      detail: 'owner@example.com',
-      backend: 'youmind',
+    expect(chatOnly.identity).toMatchObject({
+      backend: 'local-model',
       editable: false,
     });
-    expect(sprite.stats).toEqual([]);
-    expect(sprite.groups.map((group) => group.rows.map((row) => row.id))).toEqual([['connection']]);
+    expect(chatOnly.stats).toEqual([]);
+    expect(chatOnly.groups.map((group) => group.rows.map((row) => row.id))).toEqual([['connection']]);
   });
 
   it('shows the combined channels row when any contributing capability is true', () => {
-    const base = capabilities('youmind', { devices: true });
+    const base = capabilities('local-model', { attachments: false, models: false, devices: true });
     const model = buildAgentSettingsModel({
-      connection: connection('youmind'),
-      agent: agent('youmind'),
+      connection: connection('local-model'),
+      agent: agent('local-model'),
       capabilities: base,
       connectionState: 'offline',
       isPro: true,
@@ -274,4 +271,10 @@ describe('Agent settings descriptor model', () => {
  it.each(['openclaw', 'hermes'] as const)('labels a partial %s profile cost without changing its subtotal', (backend) => {
   const model = buildAgentSettingsModel({ connection: connection(backend), agent: agent(backend), capabilities: capabilities(backend), connectionState: 'ready', isPro: true, summary: { todayCostUsd: 0.258672624, todayCostMode: 'mixed' } });
   expect(model.stats.find((s) => s.id === 'usage')).toMatchObject({ value: '$0.26', title: 'Cost today', detail: { key: 'Partial', tone: 'neutral' } });
+});
+
+
+it('labels the Codex instruction entry Memory and preserves its files destination', () => {
+  const model = buildAgentSettingsModel({ connection: connection('codex'), agent: agent('codex'), capabilities: capabilities('codex', { profileManagement: true }), connectionState: 'ready', isPro: false, summary: { fileCount: 1 } });
+  expect(model.stats.find(row => row.id === 'files')).toEqual(expect.objectContaining({ title: 'Memory', section: 'files', value: '1' }));
 });

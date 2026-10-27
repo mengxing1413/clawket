@@ -47,6 +47,7 @@ let bridgeFixture: CompatFixture;
 let isolatedOpenClawState = '';
 let openClawPersistence = '';
 let hermesPersistence = '';
+let ownerEchoPair: Awaited<ReturnType<typeof pairOpenClaw>> | null = null;
 
 const savedOpenClawEnv = new Map<string, string | undefined>();
 const liveFixtureCoverage = new Map<string, Set<string>>();
@@ -85,15 +86,7 @@ beforeAll(async () => {
     openClawRelayPort,
     hermesRegistryPort,
     hermesRelayPort,
-    openClawRegistryInspectorPort,
-    openClawRelayInspectorPort,
-    hermesRegistryInspectorPort,
-    hermesRelayInspectorPort,
   ] = await Promise.all([
-    getFreePort(),
-    getFreePort(),
-    getFreePort(),
-    getFreePort(),
     getFreePort(),
     getFreePort(),
     getFreePort(),
@@ -107,7 +100,6 @@ beforeAll(async () => {
       cwd: process.cwd(),
       configPath: 'apps/relay-registry/wrangler.toml',
       port: openClawRegistryPort,
-      inspectorPort: openClawRegistryInspectorPort,
       persistencePath: openClawPersistence,
       envVars: {
         RELAY_REGION_MAP: relayMap(openClawRelayUrl),
@@ -119,7 +111,6 @@ beforeAll(async () => {
       cwd: process.cwd(),
       configPath: 'apps/relay-registry/wrangler.hermes.toml',
       port: hermesRegistryPort,
-      inspectorPort: hermesRegistryInspectorPort,
       persistencePath: hermesPersistence,
       envVars: {
         RELAY_REGION_MAP: relayMap(hermesRelayUrl),
@@ -134,7 +125,6 @@ beforeAll(async () => {
       cwd: process.cwd(),
       configPath: 'apps/relay-worker/wrangler.toml',
       port: openClawRelayPort,
-      inspectorPort: openClawRelayInspectorPort,
       persistencePath: openClawPersistence,
       envVars: {
         REGISTRY_VERIFY_URL: openClawRegistry.baseUrl,
@@ -150,7 +140,6 @@ beforeAll(async () => {
       cwd: process.cwd(),
       configPath: 'apps/relay-worker/wrangler.hermes.toml',
       port: hermesRelayPort,
-      inspectorPort: hermesRelayInspectorPort,
       persistencePath: hermesPersistence,
       envVars: {
         REGISTRY_VERIFY_URL: hermesRegistry.baseUrl,
@@ -190,6 +179,160 @@ afterAll(async () => {
 });
 
 describe('v1 compatibility live replay', () => {
+  it('contains legacy Hermes same-instance reconnect fights without evicting a healthy phone', async () => {
+    const paired = await pairHermes('Legacy Hermes Contention');
+    const ownerUrl = wsUrl(paired.relayUrl, { bridgeId: paired.bridgeId, role: 'gateway', clientId: 'legacy-shared-owner' });
+    const headers = { Authorization: `Bearer ${paired.relaySecret}` };
+    const first = await openWebSocket(ownerUrl, { headers });
+    let second: WebSocketInbox | undefined;
+    let phone: WebSocketInbox | undefined;
+    let replacement: WebSocketInbox | undefined;
+    try {
+      second = await openWebSocket(ownerUrl, { headers });
+      expect((await first.waitForCloseFrameWithMiniflareWorkaround()).code).toBe(4001);
+      await expectRelayReadyFirst(second);
+      const current = second;
+      current.socket.on('message', data => {
+        const text = toText(data);
+        if (!text.startsWith(CONTROL_PREFIX)) return;
+        const control = JSON.parse(text.slice(CONTROL_PREFIX.length));
+        // Recorded 0.7.x behavior: existing gateway_ping/pong, no new capability.
+        if (control.event === 'gateway_ping') current.socket.send(CONTROL_PREFIX + JSON.stringify({
+          type: 'control', event: 'gateway_pong', ts: control.ts,
+        }));
+      });
+      phone = await openHermesClient(paired, 'contention-phone');
+      await expectRelayReadyFirst(phone);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        expect((await rejectWebSocketUpgrade(ownerUrl, { headers })).status).toBe(409);
+        await delay(100);
+      }
+      expect(current.socket.readyState).toBe(WebSocket.OPEN);
+      expect(phone.socket.readyState).toBe(WebSocket.OPEN);
+      current.socket.send(JSON.stringify({ type: 'event', event: 'health', payload: { status: 'ok' } }));
+      await phone.nextJson(frame => frame.event === 'health');
+      // A genuinely disconnected owner still recovers immediately.
+      closeWebSocket(current);
+      await delay(100);
+      replacement = await openWebSocket(ownerUrl, { headers });
+      await expectRelayReadyFirst(replacement);
+    } finally {
+      closeWebSocket(first); if (second) closeWebSocket(second);
+      if (phone) closeWebSocket(phone); if (replacement) closeWebSocket(replacement);
+    }
+  });
+
+  it('allows a silent legacy Hermes owner takeover after one absolute contention probe deadline', async () => {
+    const paired = await pairHermes('Silent Legacy Hermes Owner');
+    const ownerUrl = wsUrl(paired.relayUrl, { bridgeId: paired.bridgeId, role: 'gateway', clientId: 'silent-shared-owner' });
+    const headers = { Authorization: `Bearer ${paired.relaySecret}` };
+    const first = await openWebSocket(ownerUrl, { headers });
+    let silent: WebSocketInbox | undefined;
+    let phone: WebSocketInbox | undefined;
+    let replacement: WebSocketInbox | undefined;
+    try {
+      silent = await openWebSocket(ownerUrl, { headers });
+      expect((await first.waitForCloseFrameWithMiniflareWorkaround()).code).toBe(4001);
+      await expectRelayReadyFirst(silent);
+      phone = await openHermesClient(paired, 'silent-owner-phone');
+      await expectRelayReadyFirst(phone);
+      // Socket stays OPEN but does not answer the existing gateway_ping.
+      expect((await rejectWebSocketUpgrade(ownerUrl, { headers })).status).toBe(409);
+      const deadline = Date.now() + 12_100;
+      for (let retry = 0; retry < 3; retry++) {
+        await delay(3_000);
+        expect((await rejectWebSocketUpgrade(ownerUrl, { headers })).status).toBe(409);
+      }
+      expect(silent.socket.readyState).toBe(WebSocket.OPEN);
+      expect(phone.socket.readyState).toBe(WebSocket.OPEN);
+      await delay(Math.max(0, deadline - Date.now()));
+      replacement = await openWebSocket(ownerUrl, { headers });
+      await expectRelayReadyFirst(replacement);
+      expect((await silent.waitForCloseFrameWithMiniflareWorkaround()).code).toBe(4001);
+      // A backend generation change retires the phone so it re-handshakes.
+      expect((await phone.waitForCloseFrameWithMiniflareWorkaround()).code).toBe(4011);
+    } finally {
+      closeWebSocket(first); if (silent) closeWebSocket(silent);
+      if (phone) closeWebSocket(phone); if (replacement) closeWebSocket(replacement);
+    }
+  });
+
+  it.each(['openclaw', 'hermes'] as const)('negotiates isolated owner/client echoes without changing legacy %s ready frames', async backend => {
+    const paired = backend === 'openclaw' ? await pairOpenClaw('Owner Echo Replay') : await pairHermes('Owner Echo Replay');
+    if ('gatewayId' in paired) ownerEchoPair = paired;
+    const identity = 'gatewayId' in paired ? { gatewayId: paired.gatewayId } : { bridgeId: paired.bridgeId };
+    const ownerUrl = (capabilities?: string) => wsUrl(paired.relayUrl, {
+      ...identity, role: 'gateway', clientId: 'echo-owner', ...(capabilities ? { capabilities } : {}),
+    });
+    const auth = { headers: { Authorization: `Bearer ${paired.relaySecret}` } };
+    const legacyOwner = await openWebSocket(ownerUrl(), auth);
+    await expectRelayReadyFirst(legacyOwner);
+    // Same identity replacement uses the existing owner-lease contract.
+    const owner = await openWebSocket(ownerUrl('relay.owner-pong.v1,relay.transfer-hint.v1'), auth);
+    const client = await openWebSocket(wsUrl(paired.relayUrl, {
+      ...identity, role: 'client', clientId: 'legacy-echo-phone', token: paired.clientToken,
+    }));
+    try {
+      await expectRelayReadyFirst(client);
+      expect(parseJson((await owner.nextText(text => text.includes('relay.ready'))).slice(CONTROL_PREFIX.length))).toEqual({
+        type: 'control', event: 'relay.ready', payload: { capabilities: ['relay.frame-limit.v2', 'relay.owner-pong.v1', 'relay.transfer-hint.v1'] },
+      });
+      const nonce = '0123456789abcdef0123456789abcdef';
+      const ping = CONTROL_PREFIX + JSON.stringify({ type: 'control', event: 'relay.owner-ping', payload: { nonce } });
+      owner.socket.send(ping);
+      expect(await owner.nextText(text => text.includes('relay.owner-pong'))).toBe(ping.replace('relay.owner-ping', 'relay.owner-pong'));
+      client.socket.send(ping);
+      client.socket.send(ping.replace('relay.owner-ping', 'relay.owner-pong'));
+      client.socket.send(CONTROL_PREFIX + JSON.stringify({ type: 'control', event: 'relay.ready', payload: { capabilities: ['relay.owner-pong.v1'] } }));
+      // An ordinary old-client request is the ordering barrier after forged controls.
+      client.socket.send(JSON.stringify({ type: 'req', id: 'echo-legacy-list', method: 'sessions.list', params: {} }));
+      await owner.nextJson(frame => frame.id === 'echo-legacy-list');
+      expect(owner.received.some(text => text.includes('relay.owner-pong') || text.includes('relay.owner-ping') || text.includes('relay.ready'))).toBe(false);
+      owner.socket.send(JSON.stringify({ type: 'res', id: 'echo-legacy-list', ok: true, payload: { sessions: [] } }));
+      expect(await client.nextJson(frame => frame.id === 'echo-legacy-list')).toMatchObject({ ok: true, payload: { sessions: [] } });
+      expect(client.received.some(text => text.includes('relay.owner-pong') || text.includes('relay.owner-ping'))).toBe(false);
+      const current = await openWebSocket(wsUrl(paired.relayUrl, {
+        ...identity, role: 'client', clientId: 'negotiated-echo-phone', token: paired.clientToken,
+        capabilities: 'relay.client-pong.v1,relay.client-ping.v1,relay.transfer-hint.v1',
+      }));
+      try {
+        expect(parseJson((await current.nextText(text => text.includes('relay.ready'))).slice(CONTROL_PREFIX.length))).toEqual({
+          type: 'control', event: 'relay.ready', payload: { capabilities: ['relay.frame-limit.v2', 'relay.client-ping.v1', 'relay.transfer-hint.v1'] },
+        });
+        const clientPing = ping.replace('relay.owner-ping', 'relay.client-ping');
+        client.socket.send(clientPing); // An old client is never silently opted in.
+        owner.socket.send(clientPing); // Owner credentials cannot use client controls.
+        current.socket.send(clientPing);
+        expect(await current.nextText(text => text.includes('relay.client-pong'))).toBe(clientPing.replace('relay.client-ping', 'relay.client-pong'));
+        // The legacy OpenClaw owner still requires a connect from a second
+        // phone before ordinary RPCs; client echo must not bypass that rule.
+        current.socket.send(JSON.stringify({ type: 'req', id: 'echo-current-list', method: 'connect', params: {} }));
+        await owner.nextJson(frame => frame.id === 'echo-current-list');
+        expect(owner.received.some(text => text.includes('relay.client-ping') || text.includes('relay.client-pong'))).toBe(false);
+        expect(client.received.some(text => text.includes('relay.client-ping') || text.includes('relay.client-pong'))).toBe(false);
+        owner.socket.send(JSON.stringify({ type: 'res', id: 'echo-current-list', ok: true, payload: { sessions: [] } }));
+        expect(await current.nextJson(frame => frame.id === 'echo-current-list')).toMatchObject({ ok: true });
+        const largeRequest = JSON.stringify({ type: 'req', id: 'transfer-current', method: 'sessions.list', params: { marker: '😀'.repeat(33_000) } });
+        const forgedHint = CONTROL_PREFIX + JSON.stringify({ type: 'control', event: 'relay.transfer-start', payload: { bytes: 131_072 } });
+        current.socket.send(forgedHint);
+        current.socket.send(largeRequest);
+        const upstreamHint = parseJson((await owner.nextText(text => text.includes('relay.transfer-start'))).slice(CONTROL_PREFIX.length));
+        expect(upstreamHint).toEqual({ type: 'control', event: 'relay.transfer-start', payload: { bytes: Buffer.byteLength(largeRequest) } });
+        expect(await owner.nextText(text => text === largeRequest)).toBe(largeRequest);
+        const largeResponse = JSON.stringify({ type: 'res', id: 'transfer-current', ok: true, payload: { marker: '😀'.repeat(33_000) } });
+        owner.socket.send(forgedHint);
+        owner.socket.send(largeResponse);
+        const downstreamHint = parseJson((await current.nextText(text => text.includes('relay.transfer-start'))).slice(CONTROL_PREFIX.length));
+        expect(downstreamHint).toEqual({ type: 'control', event: 'relay.transfer-start', payload: { bytes: Buffer.byteLength(largeResponse) } });
+        expect(await current.nextText(text => text === largeResponse)).toBe(largeResponse);
+      } finally { closeWebSocket(current); }
+    } finally {
+      closeWebSocket(client);
+      closeWebSocket(owner);
+      closeWebSocket(legacyOwner);
+    }
+  });
+
   it('returns structured 404 responses for unknown principals before websocket upgrade', async () => {
     const cases = [
       {
@@ -357,8 +500,11 @@ describe('v1 compatibility live replay', () => {
       gatewayUrl: `ws://127.0.0.1:${gatewayPort}`,
       reconnectBaseDelayMs: 100,
       reconnectMaxDelayMs: 500,
-      heartbeatIntervalMs: 250,
-      heartbeatTimeoutMs: 5_000,
+      // This replay tests client compatibility, not the owner's fast watchdog.
+      // Keep owner health on the normal deadline while the client pong test
+      // below still proves the 1.2-second negotiated expiry and legacy exemption.
+      heartbeatIntervalMs: 1_000,
+      heartbeatTimeoutMs: 35_000,
       createWebSocket: (url, options) => {
         if (url.startsWith(paired.relayUrl)) bridgeRelayConnections.push(connectionPayload(url, options?.headers));
         return new WebSocket(url, options);
@@ -371,8 +517,9 @@ describe('v1 compatibility live replay', () => {
       runtime.start();
       await waitFor(() => runtime.getSnapshot().relayConnected, 'BridgeRuntime did not connect to Relay');
       expect(bridgeRelayConnections).toHaveLength(1);
-      assertOpenClaw('gateway.connection', bridgeRelayConnections[0]);
-      assertBridge('relay.connection', bridgeRelayConnections[0]);
+      const legacyConnection = legacyOwnerConnectionPayload(bridgeRelayConnections[0]);
+      assertOpenClaw('gateway.connection', legacyConnection);
+      assertBridge('relay.connection', legacyConnection);
       assertOpenClaw('legacy-client.connection', openClawClientConnectionPayload(paired, 'compat-ios-legacy'));
       legacyClient = await openOpenClawClient(paired, 'compat-ios-legacy');
       await expectRelayReadyFirst(legacyClient);
@@ -576,7 +723,7 @@ describe('v1 compatibility live replay', () => {
         'HermesRelayRuntime did not connect both legs',
       );
       expect(bridgeRelayConnections).toHaveLength(1);
-      assertHermes('bridge.connection', bridgeRelayConnections[0]);
+      assertHermes('bridge.connection', legacyOwnerConnectionPayload(bridgeRelayConnections[0]));
       assertHermes('client.connection', clientConnection);
       assertHermes(
         'health.event',
@@ -602,6 +749,15 @@ describe('v1 compatibility live replay', () => {
 });
 
 type FixtureAsserter = (label: string, actual: unknown) => void;
+
+/** Assert only the negotiated additions, then compare every legacy connection field. */
+function legacyOwnerConnectionPayload(actual: JsonValue): JsonValue {
+  const value = structuredClone(requireRecord(actual, 'candidate owner connection'));
+  const query = requireRecord(value.query, 'candidate owner query');
+  expect(String(query.capabilities).split(',').sort()).toEqual(['relay.owner-pong.v1', 'relay.transfer-hint.v1']);
+  delete query.capabilities;
+  return value as JsonValue;
+}
 
 async function expectRelayReadyFirst(inbox: WebSocketInbox): Promise<void> {
   const firstFrame = await inbox.nextText(() => true);
@@ -678,7 +834,9 @@ async function expectGatewayReconnectCloseCode(assertClose: FixtureAsserter): Pr
 }
 
 async function expectFrameTooLargeCloseCode(): Promise<void> {
-  const paired = await pairOpenClaw('Close Oversized Frame');
+  // This client-only boundary needs no fresh owner. Reuse a completed room so
+  // the expanded replay still obeys the real ten-registrations/hour admission.
+  const paired = ownerEchoPair ?? await pairOpenClaw('Close Oversized Frame');
   const client = await openOpenClawClient(paired, 'oversized-frame-client');
   await expectRelayReadyFirst(client);
   client.socket.send(Buffer.alloc(RELAY_FRAME_MAX_BYTES + 1));

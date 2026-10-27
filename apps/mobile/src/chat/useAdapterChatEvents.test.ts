@@ -1,4 +1,5 @@
 import { act, renderHook } from '@testing-library/react-native';
+import { preserveCompletedRunPresentation } from './historyMergePolicy';
 import {
   createMockAdapter,
   type ConnectionDescriptor,
@@ -38,6 +39,35 @@ const session: SessionDescriptor = {
 };
 
 describe('mapAdapterChatMessage', () => {
+  it.each(['unknown', 'running'] as const)('clears prior completion clocks when a gap reload merges reported %s into the active turn', status => {
+    const user = { id: 'user', role: 'user' as const, text: 'inspect' };
+    const recovered = mapAdapterChatMessage({ id: 'tool', role: 'tool', text: '', tool: { name: 'read', status, statusReported: true } })!;
+    const live = { ...recovered, presentationRunId: 'run', toolStatus: 'success' as const, toolStartedAt: 100, toolFinishedAt: 200, toolDurationMs: 100 };
+    const merged = preserveCompletedRunPresentation([user, live], [user, recovered], { live: true });
+    expect(merged[1]).toMatchObject({ toolStatus: status, toolStatusReported: true });
+    expect(merged[1].toolFinishedAt).toBeUndefined();
+    expect(merged[1].toolDurationMs).toBeUndefined();
+  });
+
+  it('retains explicitly reported unknown history without treating it as a live start', () => {
+    const message = mapAdapterChatMessage({ id: 'unknown', role: 'tool', text: '', tool: { name: 'read', status: 'unknown', statusReported: true, durationMs: 50, finishedAtMs: 200 } });
+    expect(message)
+      .toMatchObject({ toolStatus: 'unknown', toolStatusReported: true });
+    expect(message?.toolDurationMs).toBeUndefined();
+    expect(message?.toolFinishedAt).toBeUndefined();
+  });
+  it('preserves valid native turn identity for users, paragraphs and tools and rejects malformed metadata', () => {
+    for (const role of ['user', 'assistant', 'tool'] as const) {
+      expect(mapAdapterChatMessage({ id: role, role, text: '', turnId: 'native-turn' })?.turnId).toBe('native-turn');
+      for (const turnId of ['', ' padded ', 'x'.repeat(257), 42]) {
+        expect(mapAdapterChatMessage({ id: role, role, text: '', turnId } as any)?.turnId).toBeUndefined();
+      }
+    }
+    const message = mapAdapterSessionUpdate({ type: 'tool_call', sessionKey: 'chat', runId: 'run',
+      turnId: 'native-turn', inputMessageId: 'original', toolCallId: 'tool', title: 'exec' });
+    expect(message).toMatchObject({ turnId: 'native-turn', inputMessageId: 'original', message: { turnId: 'native-turn' } });
+  });
+
   it('preserves normalized history content in the existing UiMessage shape', () => {
     expect(mapAdapterChatMessage({
       id: 'message-1',
@@ -128,6 +158,57 @@ describe('mapAdapterChatMessage', () => {
 });
 
 describe('mapAdapterSessionUpdate', () => {
+  it.each([undefined, null, NaN, Infinity, -1, 0, 1e20, '900'])('retains receipt-time presentation for omitted or invalid final clock %j', timestampMs => {
+    const update = mapAdapterSessionUpdate({
+      type: 'run_finished', sessionKey: session.key, runId: 'legacy-final', stopReason: 'end_turn',
+      message: { role: 'assistant', content: 'Done', timestampMs },
+    } as any, { now: () => 1000 });
+    expect(update.type).toBe('run_finished');
+    if (update.type === 'run_finished') expect(update.finalMessage?.timestampMs).toBe(1000);
+  });
+  it('prefers reported step clocks and native run time over receipt time', () => {
+    const options = { now: () => 90_000 };
+    const start = mapAdapterSessionUpdate({ type: 'tool_call', sessionKey: session.key, runId: 'run', toolCallId: 'exec', title: 'exec',
+      status: 'running', startedAtMs: 12_000 }, options);
+    expect(start).toMatchObject({ message: { toolStartedAt: 12_000 } });
+    const caughtUp = mapAdapterSessionUpdate({ type: 'tool_call', sessionKey: session.key, runId: 'run', toolCallId: 'done', title: 'exec',
+      status: 'success', startedAtMs: 13_000 }, options);
+    expect(caughtUp).toMatchObject({ message: { toolStartedAt: 13_000 } });
+    const settled = mapAdapterSessionUpdate({ type: 'tool_call_update', sessionKey: session.key, runId: 'run', toolCallId: 'exec', status: 'error',
+      startedAtMs: 12_000, finishedAtMs: 19_000, durationMs: 6_900 }, options);
+    expect(settled).toMatchObject({ message: { toolStartedAt: 12_000, toolFinishedAt: 19_000, toolDurationMs: 6_900 } });
+    const running = mapAdapterSessionUpdate({ type: 'tool_call_update', sessionKey: session.key, runId: 'run', toolCallId: 'exec', status: 'running',
+      startedAtMs: 12_000, finishedAtMs: 19_000, durationMs: 6_900 }, options);
+    if (running.type !== 'tool_call_update') throw new Error('Missing tool update');
+    expect(running.message).toMatchObject({ toolStartedAt: 12_000 });
+    expect(running.message.toolFinishedAt).toBeUndefined();
+    expect(running.message).not.toHaveProperty('toolDurationMs');
+  });
+
+  it.each([undefined, null, 0, -1, 1.5, NaN, Infinity, 1e20, '12000'])('keeps receipt timing for an omitted or malformed step clock %j', value => {
+    const options = { now: () => 90_000 };
+    const start = mapAdapterSessionUpdate({ type: 'tool_call', sessionKey: session.key, runId: 'run', toolCallId: 'exec', title: 'exec', startedAtMs: value } as any, options);
+    if (start.type !== 'tool_call') throw new Error('Missing tool call');
+    expect(start.message.toolStartedAt).toBe(90_000);
+    const settled = mapAdapterSessionUpdate({ type: 'tool_call_update', sessionKey: session.key, runId: 'run', toolCallId: 'exec', status: 'success',
+      startedAtMs: value, finishedAtMs: value, durationMs: value === 0 ? -1 : value } as any, options);
+    if (settled.type !== 'tool_call_update') throw new Error('Missing tool update');
+    expect(settled.message.toolFinishedAt).toBe(90_000);
+    expect(settled.message).not.toHaveProperty('toolStartedAt');
+    expect(settled.message).not.toHaveProperty('toolDurationMs');
+  });
+
+  it('uses an authoritative final clock without retiming a cancellation notice', () => {
+    const update = mapAdapterSessionUpdate({
+      type: 'run_finished', sessionKey: session.key, runId: 'clock-final', stopReason: 'cancelled',
+      message: { role: 'assistant', content: 'Partial reply', timestampMs: 900 },
+    }, { now: () => 1000 });
+    expect(update.type).toBe('run_finished');
+    if (update.type === 'run_finished') {
+      expect(update.finalMessage?.timestampMs).toBe(900);
+      expect(update.systemMessage?.timestampMs).toBe(1000);
+    }
+  });
   const options = {
     now: () => 1_000,
     translate: (key: string) => `translated:${key}`,
@@ -213,6 +294,23 @@ describe('mapAdapterSessionUpdate', () => {
       isSending: true,
     });
 
+    const commentary = mapAdapterSessionUpdate({
+      type: 'agent_commentary_chunk',
+      sessionKey: session.key,
+      runId: 'run-1',
+      itemId: 'msg_1',
+      text: 'Checking the folder.',
+    }, options);
+    expect(commentary).toEqual({
+      type: 'agent_commentary_chunk',
+      sessionKey: session.key,
+      runId: 'run-1',
+      itemId: 'msg_1',
+      text: 'Checking the folder.',
+      activeRunId: 'run-1',
+      isSending: true,
+    });
+
     expect(mapAdapterSessionUpdate({
       type: 'tool_call',
       sessionKey: session.key,
@@ -251,6 +349,18 @@ describe('mapAdapterSessionUpdate', () => {
         toolFinishedAt: 1_000,
       },
     });
+
+    for (const status of ['running', 'unknown', 'success', 'error'] as const) {
+      const start = mapAdapterSessionUpdate({ type: 'tool_call', sessionKey: session.key, runId: 'run-1', toolCallId: status, title: 'Read file', status }, options);
+      expect(start).toMatchObject({ message: { toolStatus: status, toolStatusReported: true } });
+      if (start.type !== 'tool_call') throw new Error('Missing tool call');
+      expect(start.message.toolStartedAt).toBe(status === 'running' ? 1_000 : undefined);
+      expect(start.message.toolFinishedAt).toBeUndefined();
+      const change = mapAdapterSessionUpdate({ type: 'tool_call_update', sessionKey: session.key, runId: 'run-1', toolCallId: status, status }, options);
+      if (change.type !== 'tool_call_update') throw new Error('Missing tool update');
+      expect(change.message.toolStatus).toBe(status);
+      expect(change.message.toolFinishedAt).toBe(status === 'success' || status === 'error' ? 1_000 : undefined);
+    }
 
     expect(mapAdapterSessionUpdate({
       type: 'run_finished',
@@ -296,6 +406,59 @@ describe('mapAdapterSessionUpdate', () => {
       stopReason: 'end_turn',
       message: { role: 'assistant', content: 'NO_REPLY' },
     }, options)).toMatchObject({ finalMessage: undefined });
+  });
+
+  it.each([
+    'Model authentication failed. Sign in again on your computer.',
+    'The model account has insufficient credits or quota.',
+    'The model is rate limited. Try again shortly.',
+    "The agent couldn't complete this reply. Please try again.",
+  ])('keeps the same localized terminal error identity in live and recovered history: %s', (text) => {
+    const terminalMessage = {
+      id: 'codex-turn-error:native-turn', role: 'system' as const,
+      text, timestampMs: 900,
+    };
+    const live = mapAdapterSessionUpdate({
+      type: 'run_finished', sessionKey: session.key, runId: 'bridge-run',
+      stopReason: 'error', terminalMessage,
+      message: { role: 'assistant', content: terminalMessage.text },
+    }, options);
+    const recovered = mapAdapterSessionUpdate({
+      type: 'history_reconciled', sessionKey: session.key,
+      history: { key: session.key, messages: [terminalMessage], hasActiveRun: false },
+    }, options);
+    expect(live).toMatchObject({ finalMessage: undefined, systemMessage: {
+      ...terminalMessage, text: `translated:${terminalMessage.text}`,
+    } });
+    expect(recovered.type === 'history_reconciled' && recovered.messages[0]).toMatchObject({
+      ...terminalMessage, text: `translated:${terminalMessage.text}`,
+    });
+    expect(mapAdapterChatMessage({ ...terminalMessage, role: 'assistant' }, options.translate)?.text)
+      .toBe(terminalMessage.text);
+    expect(mapAdapterChatMessage({ ...terminalMessage, role: 'user' }, options.translate)?.text)
+      .toBe(terminalMessage.text);
+    expect(mapAdapterChatMessage({ ...terminalMessage, text: 'Ordinary system prose' }, options.translate)?.text)
+      .toBe('Ordinary system prose');
+  });
+
+  it('does not turn invalid terminal notices or successful turns into a failure row', () => {
+    const base = { type: 'run_finished' as const, sessionKey: session.key, runId: 'bridge-run', stopReason: 'error' as const };
+    for (const terminalMessage of [
+      undefined,
+      { id: '', role: 'system', text: 'Failed' },
+      { id: 'notice', role: 'assistant', text: 'Failed' },
+      { id: 'notice', role: 'system', text: '' },
+      { id: 'x'.repeat(257), role: 'system', text: 'Failed' },
+    ]) {
+      expect(mapAdapterSessionUpdate({ ...base, terminalMessage } as SessionUpdate, options))
+        .toMatchObject({ systemMessage: undefined });
+    }
+    expect(mapAdapterSessionUpdate({ ...base, stopReason: 'end_turn', terminalMessage: {
+      id: 'notice', role: 'system', text: 'Failed',
+    } }, options)).toMatchObject({ systemMessage: undefined });
+    expect(mapAdapterSessionUpdate({ ...base, terminalMessage: {
+      id: 'notice', role: 'system', text: 'Failed', timestampMs: NaN,
+    } }, options)).toMatchObject({ systemMessage: { id: 'notice', timestampMs: 1_000 } });
   });
 
   it('maps compaction, approval, session, usage, system, and error updates', () => {
@@ -476,6 +639,74 @@ describe('useAdapterChatEvents', () => {
     consoleErrorSpy.mockRestore();
   });
 
+  it.each(['codex', 'openclaw', 'hermes', 'claude-code', 'pi'] as const)(
+    'describes %s cancellation without changing the other backends',
+    async (backendKind) => {
+      const adapter = createMockAdapter({
+        connection: { ...connection, backendKind },
+        sessions: [session],
+        timeline: [{
+          atMs: 10,
+          update: {
+            type: 'run_finished',
+            sessionKey: session.key,
+            runId: 'cancelled-run',
+            stopReason: 'cancelled',
+          },
+        }],
+      });
+      const onUpdate = jest.fn();
+      const { unmount } = renderHook(() => useAdapterChatEvents({ adapter, onUpdate, now: () => 123 }));
+      await act(async () => { await adapter.connect(); });
+      act(() => adapter.replayTimeline());
+
+      expect(onUpdate).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'run_finished',
+        activeRunId: null,
+        isSending: false,
+        stopReason: 'cancelled',
+        systemMessage: {
+          id: 'sys_abort_cancelled-run',
+          role: 'system',
+          text: backendKind === 'codex'
+            ? 'Reply stopped. Commands already running may continue.'
+            : 'Run aborted by user.',
+          timestampMs: 123,
+        },
+      }));
+      unmount();
+      adapter.disconnect();
+    },
+  );
+
+  it('does not show a stopped notice for a completed Codex reply', async () => {
+    const adapter = createMockAdapter({
+      connection: { ...connection, backendKind: 'codex' },
+      sessions: [session],
+      timeline: [{
+        atMs: 10,
+        update: {
+          type: 'run_finished',
+          sessionKey: session.key,
+          runId: 'completed-run',
+          stopReason: 'end_turn',
+          message: { role: 'assistant', content: 'Done' },
+        },
+      }],
+    });
+    const onUpdate = jest.fn();
+    const { unmount } = renderHook(() => useAdapterChatEvents({ adapter, onUpdate }));
+    await act(async () => { await adapter.connect(); });
+    act(() => adapter.replayTimeline());
+
+    expect(onUpdate).toHaveBeenCalledWith(expect.objectContaining({
+      finalMessage: expect.objectContaining({ text: 'Done' }),
+      systemMessage: undefined,
+    }));
+    unmount();
+    adapter.disconnect();
+  });
+
   it('subscribes to state, sessions, and mapped update events and cleans them up', async () => {
     const adapter = createMockAdapter({
       connection,
@@ -548,4 +779,14 @@ describe('useAdapterChatEvents', () => {
     expect(onState).toHaveBeenCalledTimes(4);
     expect(secondOnUpdate).toHaveBeenCalledTimes(1);
   });
+});
+
+
+it('does not pass session-list evidence to chat content or transport confirmation handlers', () => {
+  const adapter = createMockAdapter({ connection, sessions: [session], timeline: [
+    { atMs: 0, update: { type: 'session_activity_update', activity: { key: session.key, state: 'running' } } },
+  ] });
+  const onUpdate = jest.fn();
+  const view = renderHook(() => useAdapterChatEvents({ adapter, onUpdate }));
+  act(() => adapter.replayTimeline()); expect(onUpdate).not.toHaveBeenCalled(); view.unmount();
 });

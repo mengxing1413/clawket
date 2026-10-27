@@ -1,8 +1,22 @@
 import type { AdapterErrorCode, BackendKind, TransportKind } from '@clawket/agent-protocol';
+import type { PairingValidationReason } from '../../connection';
 
 // `@latest`: a bare `npx @p697/clawket` runs an older global install when one exists, and a 3.0 CLI
 // rejects `--backend codex|claude-code|pi` (Samsung A56 device review, 2026-09-27).
 export const PAIRING_COMMAND = 'npx @p697/clawket@latest pair';
+// Interactive discovery is production-only and must run in a person's terminal.
+export const PAIRING_CHOOSE_COMMAND = `${PAIRING_COMMAND} choose`;
+
+export type PairingMethod = 'agent' | 'terminal';
+
+const DEFAULT_PAIRING_METHOD: Readonly<Record<PairableBackendKind, PairingMethod>> = {
+  openclaw: 'agent', hermes: 'agent', codex: 'terminal',
+  'claude-code': 'terminal', pi: 'terminal', 'local-model': 'terminal',
+};
+
+export function getDefaultPairingMethod(backend: PairableBackendKind): PairingMethod {
+  return DEFAULT_PAIRING_METHOD[backend];
+}
 
 /**
  * Message the user pastes to the agent already running on their computer so it
@@ -68,7 +82,7 @@ export type OnboardingStatus =
   | Readonly<{ kind: 'loading' }>
   | Readonly<{ kind: 'offline' }>
   | Readonly<{ kind: 'connecting'; phase: OnboardingConnectionPhase }>
-  | Readonly<{ kind: 'error'; code: AdapterErrorCode }>;
+  | Readonly<{ kind: 'error'; code: AdapterErrorCode; pairingReason?: PairingValidationReason }>;
 
 export type OnboardingErrorPresentation = Readonly<{
   messageKey: string;
@@ -142,7 +156,22 @@ export function isPlausibleEmail(value: string): boolean {
 export function resolveOnboardingError(
   code: AdapterErrorCode,
   backendKind: PairableBackendKind,
+  pairingReason?: PairingValidationReason,
 ): OnboardingErrorPresentation {
+  if (code === 'unsupported' && pairingReason) {
+    switch (pairingReason) {
+      case 'backend_mismatch':
+        return { messageKey: 'This QR code belongs to another backend. Scan the QR code for this backend.' };
+      case 'invalid_backend':
+        return { messageKey: 'This QR code does not contain valid connection info.' };
+      case 'preview_requires_debug_mode':
+        return { messageKey: 'Enable Debug Mode before pairing with the Preview environment.' };
+      case 'official_environment_mismatch':
+        return { messageKey: 'Pairing environment does not match. Use the command shown on this page.' };
+      case 'saved_connection_mismatch':
+        return { messageKey: 'Could not save this connection. Try again.' };
+    }
+  }
   switch (code) {
     case 'bridge_offline':
       return {

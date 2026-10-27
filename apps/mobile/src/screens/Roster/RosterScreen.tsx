@@ -1,5 +1,5 @@
 import { useWorkspaceLayout } from '../../navigation/workspace-context';
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FlatList,
   RefreshControl,
@@ -107,6 +107,8 @@ export type RosterViewProps = Readonly<{
   recovering?: boolean;
   showOfflineBanner?: boolean;
   showErrorBanner?: boolean;
+  rosterError?: boolean;
+  onReviewInteraction?: () => void;
   onOpenAccount: () => void;
   onSearch: () => void;
   onAdd: () => void;
@@ -135,6 +137,8 @@ export type RosterScreenProps = Readonly<{
   graceBanner?: RosterGraceBanner;
   isPro?: boolean;
   accountAttentionCount?: number;
+  onReviewInteraction?: () => void;
+  onReviewBusyChange?: (busy: boolean) => void;
   onOpenAccount: () => void;
   onSearch: () => void;
   onAdd: () => void;
@@ -300,6 +304,7 @@ function RosterConnectionStatus({
   showOfflineBanner,
   recovering,
   showErrorBanner,
+  rosterError,
   onRefresh,
   onReconnect,
 }: Pick<
@@ -308,6 +313,7 @@ function RosterConnectionStatus({
   | 'recovering'
   | 'showOfflineBanner'
   | 'showErrorBanner'
+  | 'rosterError'
   | 'onRefresh'
   | 'onReconnect'
 >): React.JSX.Element | null {
@@ -344,8 +350,8 @@ function RosterConnectionStatus({
         testID="roster-error-banner"
         placement="inline"
         status="error"
-        actionLabel={t('Retry')}
-        accessibilityLabel={`${t('Connection unavailable')}, ${t('Retry')}`}
+        actionLabel={t(rosterError ? 'Retry list' : 'Retry')}
+        accessibilityLabel={rosterError ? t('Retry list') : `${t('Connection unavailable')}, ${t('Retry')}`}
         onAction={reconnect}
       />
     );
@@ -407,6 +413,8 @@ export function RosterView({
   showOfflineBanner,
   recovering,
   showErrorBanner,
+  rosterError,
+  onReviewInteraction,
   onOpenAccount,
   onSearch,
   onAdd,
@@ -420,7 +428,7 @@ export function RosterView({
   onOpenPro,
 }: RosterViewProps): React.JSX.Element {
   const { t } = useTranslation('common');
-  const { dismissRoster } = useWorkspaceLayout();
+  const { dismissRoster, paneWidth } = useWorkspaceLayout();
   const { theme } = useAppTheme();
   const insets = useSafeAreaInsets();
   const swipeGroup = useSwipeableRowGroup();
@@ -481,7 +489,7 @@ export function RosterView({
           : !activeConnectionOffline && item.working
           ? item.activity === 'thinking' ? t('Thinking…', { ns: 'chat' })
             : item.activity === 'tool' ? t('Using tool', { ns: 'chat' }) : t('Working')
-          : item.subtitle?.label ?? item.preview ?? t('No activity yet')}
+          : item.preview ?? t('No activity yet')}
         pinned={item.kind === 'agent' && item.agentPinned}
         platform={item.backendKind}
         platformBadge={backendMarks && item.kind === 'agent'}
@@ -539,7 +547,7 @@ export function RosterView({
   const loaderPhase = useLoadingHandoff(rosterLoading, rows.length > 0);
 
   return (
-    <View testID="roster-screen" style={[styles.screen, { backgroundColor: theme.colors.canvas }]}>
+    <View testID="roster-screen" onTouchStart={onReviewInteraction} style={[styles.screen, { backgroundColor: theme.colors.canvas }]}>
       <View pointerEvents="box-none" style={[styles.header, headerInsets]}>
         <RosterHeader
           accountBadge={accountBadge}
@@ -550,6 +558,7 @@ export function RosterView({
               recovering={recovering}
               showOfflineBanner={showOfflineBanner}
               showErrorBanner={showErrorBanner}
+              rosterError={rosterError}
               onRefresh={onRefresh}
               onReconnect={onReconnect}
             />
@@ -619,7 +628,8 @@ export function RosterView({
         accessibilityLabel={t('Add Connection', { ns: 'config' })}
         onPress={onAdd}
         style={[styles.addButton, {
-          right: insets.right + Space.xl,
+          right: paneWidth === undefined ? insets.right + Space.xl : undefined,
+          end: paneWidth !== undefined ? Space.xl : undefined,
           bottom: insets.bottom + Space.xl,
         }]}
       />
@@ -627,7 +637,13 @@ export function RosterView({
   );
 }
 
-export function RosterScreen({
+export function RosterScreen(props: RosterScreenProps): React.JSX.Element {
+  return <RosterController {...props}>{(viewProps) => <RosterView {...viewProps} />}</RosterController>;
+}
+
+// Keep tasks and their sheets alive while the workspace moves the list between hosts.
+export function RosterController({
+  children,
   presentation = 'page',
   selectedThread,
   onManageActiveConnection,
@@ -640,6 +656,8 @@ export function RosterScreen({
   graceBanner,
   isPro = false,
   accountAttentionCount = 0,
+  onReviewInteraction,
+  onReviewBusyChange,
   onOpenAccount,
   onSearch,
   onAdd,
@@ -655,18 +673,31 @@ export function RosterScreen({
   onRenameSession,
   onGraceAction,
   onOpenPro,
-}: RosterScreenProps): React.JSX.Element {
+}: RosterScreenProps & { children: (props: RosterViewProps) => React.ReactNode }): React.JSX.Element {
   const { t } = useTranslation(['common', 'chat', 'config']);
   const { theme } = useAppTheme();
   const connections = useConnections();
   const roster = useRoster();
   const [refreshing, setRefreshing] = useState(false);
   const reconnectInFlight = useRef(false);
+  // A retry pressed on the unavailable card keeps that card, and every row under it, in place with a
+  // spinner on its button until the attempt answers: removing it at once pulled the list up and pushed
+  // it back down when the retry failed (owner rule 2026-09-29).
+  const [heldFailure, setHeldFailure] = useState<Readonly<{ connectionId: string; failure: ConnectionUnavailableProps }> | null>(null);
   const [addVisible, setAddVisible] = useState(false);
   const afterAddCloseRef = useRef<(() => void) | undefined>(undefined);
   const [actionRow, setActionRow] = useState<RosterDisplayRow | null>(null);
   const [removeRow, setRemoveRow] = useState<RosterDisplayRow | null>(null);
   const [renameRow, setRenameRow] = useState<RosterDisplayRow | null>(null);
+  useEffect(() => {
+    if (refreshing || addVisible || actionRow || removeRow || renameRow) onReviewInteraction?.();
+  }, [refreshing, addVisible, actionRow, removeRow, renameRow, onReviewInteraction]);
+  const reviewBusy = Boolean(refreshing || addVisible || actionRow || removeRow || renameRow);
+  // A persistent task may already be open when navigation creates a new review opportunity.
+  useEffect(() => {
+    onReviewBusyChange?.(reviewBusy);
+    return () => onReviewBusyChange?.(false);
+  }, [reviewBusy, onReviewBusyChange]);
   const rows = useMemo(() => buildRosterRows(roster, {
     runActivities: connections.runActivities,
     ...(pinnedSessionKeys ? { pinnedSessionKeys } : {}),
@@ -717,6 +748,10 @@ export function RosterScreen({
     if (!connectionId || reconnectInFlight.current) return;
     reconnectInFlight.current = true;
     try {
+      if (connections.error?.operation === 'roster' && connections.activeState === 'ready') {
+        await getConnectionRuntime().refreshRoster();
+        return;
+      }
       // A button retry is not a pull gesture. The runtime owns recovery UI and
       // opens a fresh socket without expanding iOS RefreshControl's top inset.
       await getConnectionRuntime().reconnectConnection(connectionId);
@@ -725,7 +760,25 @@ export function RosterScreen({
     } finally {
       reconnectInFlight.current = false;
     }
-  }, [connections.activeConnectionId]);
+  }, [connections.activeConnectionId, connections.activeState, connections.error?.operation]);
+
+  const pausedActive = activeConnection ? connections.pausedConnectionIds?.includes(activeConnection.id) === true : false;
+  const connectionFailure: ConnectionUnavailableProps | undefined = !connections.recovering && !connections.switching && activeConnection
+    && (offline || connectionError) ? {
+      name: activeConnection.label,
+      lastReadyAt: connections.connectionDetails[activeConnection.id]?.lastReadyAt,
+      message: pausedActive ? t('Connection paused', { ns: 'config' }) : undefined,
+      actionLabel: pausedActive ? t('Resume connection', { ns: 'config' }) : undefined,
+      onRetry: () => {
+        const connectionId = activeConnection.id;
+        if (reconnectInFlight.current) return;
+        setHeldFailure({ connectionId, failure: connectionFailure! });
+        void reconnect().finally(() => setHeldFailure((held) => (held?.connectionId === connectionId ? null : held)));
+      },
+      onManage: onManageActiveConnection ? () => onManageActiveConnection(activeConnection.id) : undefined,
+    } : undefined;
+  const heldForActive = heldFailure && heldFailure.connectionId === connections.activeConnectionId ? heldFailure.failure : undefined;
+  const shownFailure = connectionFailure ?? heldForActive;
 
   const addActions = useMemo(
     () => assembleRosterAddActions({ canCreateAgent: canCreateAgent && Boolean(onCreateAgent) }),
@@ -829,43 +882,35 @@ export function RosterScreen({
 
   return (
     <>
-      <RosterView
-        selectedThread={presentation === 'sidebar' ? selectedThread : undefined}
-        connecting={connections.activeState === 'connecting' || connections.activeState === 'handshaking'}
-        connectionFailure={!connections.recovering && !connections.switching && activeConnection
-          && (offline || connectionError) ? {
-            name: activeConnection.label,
-            lastReadyAt: connections.connectionDetails[activeConnection.id]?.lastReadyAt,
-            message: connections.pausedConnectionIds?.includes(activeConnection.id)
-              ? t('Connection paused', { ns: 'config' }) : undefined,
-            actionLabel: connections.pausedConnectionIds?.includes(activeConnection.id)
-              ? t('Resume connection', { ns: 'config' }) : undefined,
-            onRetry: reconnect,
-            onManage: onManageActiveConnection ? () => onManageActiveConnection(activeConnection.id) : undefined,
-          } : undefined}
-        state={state}
-        rows={rows}
-        activeConnectionId={connections.activeConnectionId}
-        liveConnectionId={liveConnectionId}
-        refreshing={refreshing}
-        graceBanner={graceBanner}
-        accountBadge={accountBadge}
-        showProEntry={!isPro}
-        recovering={connections.recovering}
-        showOfflineBanner={offline}
-        showErrorBanner={connections.error !== null && !offline}
-        onOpenAccount={onOpenAccount}
-        onSearch={onSearch}
-        onAdd={() => addActions.length === 1 ? onAdd() : setAddVisible(true)}
-        onOpenRow={onOpenRow}
-        onOpenLockedRow={onOpenLockedRow}
-        onLongPressRow={handleLongPressRow}
-        rowSwipeActions={rowSwipeActions}
-        onRefresh={refresh}
-        onReconnect={reconnect}
-        onGraceAction={onGraceAction}
-        onOpenPro={onOpenPro}
-      />
+      {children({
+        onReviewInteraction,
+        selectedThread: presentation === 'sidebar' ? selectedThread : undefined,
+        connecting: connections.activeState === 'connecting' || connections.activeState === 'handshaking',
+        connectionFailure: shownFailure ? { ...shownFailure, retrying: heldForActive !== undefined } : undefined,
+        state,
+        rows,
+        activeConnectionId: connections.activeConnectionId,
+        liveConnectionId,
+        refreshing,
+        graceBanner,
+        accountBadge,
+        showProEntry: !isPro,
+        recovering: connections.recovering,
+        showOfflineBanner: offline,
+        showErrorBanner: connections.error !== null && !offline,
+        rosterError: connections.error?.operation === 'roster' && connections.activeState === 'ready',
+        onOpenAccount,
+        onSearch,
+        onAdd: () => addActions.length === 1 ? onAdd() : setAddVisible(true),
+        onOpenRow,
+        onOpenLockedRow,
+        onLongPressRow: handleLongPressRow,
+        rowSwipeActions,
+        onRefresh: refresh,
+        onReconnect: reconnect,
+        onGraceAction,
+        onOpenPro,
+      })}
       <Sheet
         testID="roster-add-sheet"
         visible={addVisible}
