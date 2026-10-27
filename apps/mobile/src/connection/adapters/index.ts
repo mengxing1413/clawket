@@ -9,7 +9,6 @@ import type { GatewayClient } from '../protocol';
 import type { ConnectionAdapterFactoryContext } from '../registry/connection-store';
 import { HermesAdapter } from './hermes';
 import { OpenClawAdapter } from './openclaw';
-import { YouMindSpriteAdapter } from './youmind-sprite';
 import { CodexAdapter } from './codex';
 import { ClaudeCodeAdapter } from './claude-code';
 import { PiAdapter } from './pi';
@@ -18,7 +17,6 @@ import { NanobotAdapter } from './nanobot';
 
 type CreateConnectionAdapterOptions = ConnectionAdapterFactoryContext & Readonly<{
   gateway?: GatewayClient;
-  onSpriteGreetingSent?: () => void;
 }>;
 
 /**
@@ -51,11 +49,6 @@ export function createConnectionAdapter(
         gateway: options.gateway,
         onReconnect: options.onReconnect,
       });
-    case 'youmind':
-      return new YouMindSpriteAdapter(record, {
-        isFreeSlot,
-        onGreetingSent: options.onSpriteGreetingSent,
-      });
     case 'nanobot':
       return new NanobotAdapter(record, { isFreeSlot });
     default:
@@ -69,4 +62,3 @@ function assertNever(value: never): never {
 
 export { HermesAdapter } from './hermes';
 export { OpenClawAdapter } from './openclaw';
-export { YouMindSpriteAdapter } from './youmind-sprite';

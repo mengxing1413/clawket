@@ -1,10 +1,14 @@
 import type { BackendKind, PromptAttachment } from './descriptors';
 
 export interface Capabilities {
+  /** Complete profile management v1; negotiated independently of session controls. */
+  profileManagement?: boolean;
   projects?: boolean;
   agentQuestions?: boolean;
   sessionBranch?: boolean;
   chat: boolean;
+  /** Read-only lookup of durable Bridge receipt; requires positive runtime negotiation. */
+  promptStatus?: boolean;
   abort: boolean;
   /** Exact active-run guidance; missing means unsupported. */
   steer?: boolean;
@@ -20,6 +24,10 @@ export interface Capabilities {
   sessionRename: boolean;
   sessionReset: boolean;
   sessionDelete: boolean;
+  /** Native reversible archive, with a separate archived-session listing. */
+  sessionArchive?: boolean;
+  /** Native session-scoped execution permissions, independently of config diagnostics. */
+  sessionPermissions?: boolean;
   agents: boolean;
   agentEdit: boolean;
   agentCreate: boolean;
@@ -32,6 +40,8 @@ export interface Capabilities {
    */
   modelManage?: boolean;
   modelHealth?: boolean;
+  /** Native session speed setting; requires positive runtime negotiation. */
+  fastMode?: boolean;
   thinkingLevels: boolean;
   /**
    * Backend interprets the full `/command` catalog, so the App may offer it as
@@ -73,15 +83,19 @@ export interface Capabilities {
   logs: boolean;
   execApproval: boolean;
   pairRequests: boolean;
+  /** Phone-started official update of every managed Bridge on the computer; requires positive runtime negotiation. */
+  bridgeRemoteUpdate?: boolean;
 }
 
 export type Capability = keyof Capabilities;
 
 export const CAPABILITY_KEYS = [
+  'profileManagement',
   'projects',
   'agentQuestions',
   'sessionBranch',
   'chat',
+  'promptStatus',
   'abort',
   'steer',
   'history',
@@ -93,6 +107,8 @@ export const CAPABILITY_KEYS = [
   'sessionRename',
   'sessionReset',
   'sessionDelete',
+  'sessionArchive',
+  'sessionPermissions',
   'agents',
   'agentEdit',
   'agentCreate',
@@ -100,6 +116,7 @@ export const CAPABILITY_KEYS = [
   'modelPerSession',
   'modelManage',
   'modelHealth',
+  'fastMode',
   'thinkingLevels',
   'slashCommands',
   'skills',
@@ -128,6 +145,7 @@ export const CAPABILITY_KEYS = [
   'logs',
   'execApproval',
   'pairRequests',
+  'bridgeRemoteUpdate',
 ] as const satisfies readonly Capability[];
 
 const OPENCLAW_CAPABILITIES: Capabilities = {
@@ -176,6 +194,7 @@ const OPENCLAW_CAPABILITIES: Capabilities = {
   logs: true,
   execApproval: true,
   pairRequests: true,
+  bridgeRemoteUpdate: true,
 };
 
 const HERMES_CAPABILITIES: Capabilities = {
@@ -224,9 +243,11 @@ const HERMES_CAPABILITIES: Capabilities = {
   logs: false,
   execApproval: true,
   pairRequests: false,
+  bridgeRemoteUpdate: true,
 };
 
-const YOUMIND_CAPABILITIES: Capabilities = {
+/** Chat with abort and history and nothing else: the row the Agent backends build on. */
+const MINIMAL_CHAT_CAPABILITIES: Capabilities = {
   chat: true,
   abort: true,
   history: true,
@@ -267,10 +288,50 @@ const YOUMIND_CAPABILITIES: Capabilities = {
   logs: false,
   execApproval: false,
   pairRequests: false,
+  bridgeRemoteUpdate: false,
 };
 
 const NANOBOT_CAPABILITIES: Capabilities = {
-  ...YOUMIND_CAPABILITIES,
+    chat: true,
+    abort: true,
+    history: true,
+    attachments: false,
+    fileAttachments: false,
+    sessions: false,
+    sessionCreate: false,
+    sessionRename: false,
+    sessionReset: false,
+    sessionDelete: false,
+    agents: false,
+    agentEdit: false,
+    agentCreate: false,
+    models: false,
+    modelPerSession: false,
+    modelManage: false,
+    thinkingLevels: false,
+    slashCommands: false,
+    skills: false,
+    skillDiscover: false,
+    skillInstall: false,
+    cron: false,
+    cronCreate: false,
+    heartbeat: false,
+    files: false,
+    fileEdit: false,
+    usage: false,
+    cost: false,
+    configManage: false,
+    permissions: false,
+    diagnostics: false,
+    backups: false,
+    tools: false,
+    channels: false,
+    channelManage: false,
+    devices: false,
+    nodes: false,
+    logs: false,
+    execApproval: false,
+    pairRequests: false,
   chat: true,
   abort: false,
   history: true,
@@ -312,23 +373,22 @@ const NANOBOT_CAPABILITIES: Capabilities = {
 };
 
 export const CAPABILITY_MATRIX: Record<BackendKind, Capabilities> = {
-  'claude-code': { ...YOUMIND_CAPABILITIES, steer: false, sessionBranch: true, projects: true, chat: true, abort: true, history: true, attachments: true,
+  'claude-code': { ...MINIMAL_CHAT_CAPABILITIES, bridgeRemoteUpdate: true, promptStatus: true, steer: false, sessionBranch: true, projects: true, chat: true, abort: true, history: true, attachments: true,
     sessions: true, sessionCreate: true, sessionRename: true, sessionReset: true, sessionDelete: true,
     models: true, modelPerSession: true, agentQuestions: true, execApproval: true },
-  codex: { ...YOUMIND_CAPABILITIES, projects: true, chat: true, abort: true, steer: true, history: true, attachments: true,
-    sessions: true, sessionCreate: true, sessionRename: true, sessionReset: true, sessionDelete: true,
-    models: true, modelPerSession: true, thinkingLevels: true, skills: true, agentQuestions: true, sessionBranch: true, execApproval: true },
-  pi: { ...YOUMIND_CAPABILITIES, chat: true, abort: true, steer: true, history: true, attachments: true,
+  codex: { ...MINIMAL_CHAT_CAPABILITIES, bridgeRemoteUpdate: true, profileManagement: true, promptStatus: true, projects: true, chat: true, abort: true, steer: true, history: true, attachments: true,
+    sessions: true, sessionCreate: true, sessionRename: true, sessionReset: true, sessionDelete: true, sessionArchive: true, sessionPermissions: true,
+    models: true, modelPerSession: true, fastMode: true, thinkingLevels: true, skills: true, agentQuestions: true, sessionBranch: true, execApproval: true },
+  pi: { ...MINIMAL_CHAT_CAPABILITIES, bridgeRemoteUpdate: true, promptStatus: true, chat: true, abort: true, steer: true, history: true, attachments: true,
     sessions: true, sessionCreate: true, sessionRename: true, sessionReset: true, sessionDelete: true,
     models: true, modelPerSession: true, thinkingLevels: true, skills: true, agentQuestions: true, sessionBranch: true },
   openclaw: OPENCLAW_CAPABILITIES,
   hermes: HERMES_CAPABILITIES,
-  youmind: YOUMIND_CAPABILITIES,
   nanobot: NANOBOT_CAPABILITIES,
   'local-model': {
-    ...YOUMIND_CAPABILITIES,
+    ...MINIMAL_CHAT_CAPABILITIES,
     chat: true, abort: true, history: true, attachments: true,
-    models: true,
+    models: true, bridgeRemoteUpdate: true,
   },
 };
 

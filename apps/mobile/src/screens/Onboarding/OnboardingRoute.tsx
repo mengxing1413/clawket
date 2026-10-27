@@ -1,6 +1,7 @@
 import React, {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -9,16 +10,17 @@ import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import type { BackendKind } from '@clawket/agent-protocol';
 import * as Clipboard from 'expo-clipboard';
 import * as Linking from 'expo-linking';
+import { useTranslation } from 'react-i18next';
 import {
   connectBackendPairingCode,
   connectBackendPairingLink,
   connectBackendPairingPayload,
-  createYouMindOnboardingConnection,
   getConnectionRuntime,
+  resolvePairingPayloadBackend,
+  resolvePairingValidationReason,
   type BackendPairingPayload,
   type BackendPairingResult,
-  type YouMindOnboardingAuthSession,
-  type YouMindOnboardingConnection,
+  type PairingValidationReason,
   useConnections,
 } from '../../connection';
 import { useAppContext } from '../../contexts/AppContext';
@@ -27,9 +29,9 @@ import { savePairedConnection } from '../../connection/pairing/save-paired-conne
 import { useProPaywall } from '../../contexts/ProPaywallContext';
 import type { RootStackParamList } from '../../navigation/root-stack';
 import type { RelayServiceEnvironment } from '../../types';
+import { showNoticeAlert } from '../../utils/notice-alert';
 import { OnboardingScreen } from './OnboardingScreen';
 import { WelcomeScreen } from './WelcomeScreen';
-import { YouMindOnboardingScreen } from './YouMindOnboardingScreen';
 import type {
   OnboardingConnectionPhase,
   PairableBackendKind,
@@ -55,7 +57,6 @@ export type OnboardingConnectedResult = Readonly<{
 
 export type OnboardingRouteProps = NavigationProps & Readonly<{
   onConnected?: (result: OnboardingConnectedResult) => void;
-  onOpenYouMind?: () => void;
   onViewed?: () => void;
   onDocsOpened?: (backendKind: BackendKind) => void;
   onAgentPromptCopied?: (backendKind: PairableBackendKind) => void;
@@ -74,6 +75,7 @@ type PairingOperation = Readonly<{
   phase: OnboardingConnectionPhase;
   targetConnectionId: string | null;
   errorCode?: ReturnType<typeof resolveOnboardingAdapterError>;
+  pairingReason?: PairingValidationReason;
 }>;
 
 const INITIAL_OPERATION: PairingOperation = Object.freeze({
@@ -87,7 +89,6 @@ export function OnboardingRoute({
   navigation,
   route,
   onConnected,
-  onOpenYouMind,
   onViewed,
   onDocsOpened,
   onAgentPromptCopied,
@@ -96,13 +97,13 @@ export function OnboardingRoute({
   onOpenPaywall,
   onClose,
 }: OnboardingRouteProps): React.JSX.Element {
+  const { t } = useTranslation('config');
   const runtime = useConnections();
   const { debugMode } = useAppContext();
   const {
     connectPairingCode: connectSecurePairingCode,
     connectPairingLink: connectSecurePairingLink,
     openGatewayScanner,
-    importGatewayQrImage,
   } = useGatewayScanner();
   const { isPro, requirePro } = useProPaywall();
   const environment: RelayServiceEnvironment = debugMode ? 'preview' : 'production';
@@ -112,7 +113,6 @@ export function OnboardingRoute({
     ...INITIAL_OPERATION,
     backendKind: initialBackend,
   }));
-  const [youMindDraft, setYouMindDraft] = useState<YouMindOnboardingConnection | null>(null);
   const requestIdRef = useRef(0);
   const pairingRequestInFlightRef = useRef(false);
   const handledPairingUrlRef = useRef<string | null>(null);
@@ -156,6 +156,7 @@ export function OnboardingRoute({
       ...current,
       active: false,
       errorCode: resolveOnboardingAdapterError(error),
+      pairingReason: resolvePairingValidationReason(error),
     }));
   }, []);
 
@@ -234,7 +235,7 @@ export function OnboardingRoute({
   ) => {
     if (pairingRequestInFlightRef.current) return;
     if (!acquirePairingRequest()) return;
-    const action = () => { void connectScannedPayload(payload, expectedBackendKind); };
+    const action = () => { void connectScannedPayloadRef.current(payload, expectedBackendKind); };
     lastActionRef.current = action;
     const requestId = beginOperation(expectedBackendKind);
     try {
@@ -262,7 +263,15 @@ export function OnboardingRoute({
     releasePairingRequest,
   ]);
 
-  const scanQr = useCallback((expectedBackendKind: PairableBackendKind, importImage = false) => {
+  // Camera permission/modal work is asynchronous. Validate a delivered result
+  // against the current environment, rather than the render which opened it.
+  const connectScannedPayloadRef = useRef(connectScannedPayload);
+  useLayoutEffect(() => {
+    connectScannedPayloadRef.current = connectScannedPayload;
+  }, [connectScannedPayload]);
+
+  // The scanner's own photo action delivers a saved QR through these same callbacks.
+  const scanQr = useCallback((expectedBackendKind: PairableBackendKind) => {
     const perform = () => {
       if (pairingRequestInFlightRef.current) return;
       onScanQrTapped?.(expectedBackendKind);
@@ -271,23 +280,44 @@ export function OnboardingRoute({
         active: false,
         backendKind: expectedBackendKind,
         errorCode: undefined,
+        pairingReason: undefined,
       }));
-      const openScanner = importImage ? importGatewayQrImage : openGatewayScanner;
-      void openScanner({
-        onScanned: (result) => connectScannedPayload(result, expectedBackendKind),
+      void openGatewayScanner({
+        onScanned: (result) => connectScannedPayloadRef.current(result, expectedBackendKind),
       });
     };
     if (!canBeginPairing(perform)) return;
     perform();
-  }, [canBeginPairing, connectScannedPayload, onScanQrTapped, openGatewayScanner, importGatewayQrImage]);
+  }, [canBeginPairing, onScanQrTapped, openGatewayScanner]);
 
-  const connectFromPairingLink = useCallback(async (url: string) => {
+  // The chooser's generic scan (owner request 2026-09-28): every pairing QR names its backend, so
+  // the scanned payload selects the step and then runs the same backend-checked claim path.
+  const scanAnyQr = useCallback(() => {
+    const perform = () => {
+      if (pairingRequestInFlightRef.current) return;
+      setOperation((current) => ({ ...current, active: false, errorCode: undefined }));
+      void openGatewayScanner({
+        onScanned: (result) => {
+          const backendKind = resolvePairingPayloadBackend(result);
+          if (!backendKind) {
+            showNoticeAlert(t('Invalid QR Code'), t('This QR code does not contain valid connection info.'));
+            return;
+          }
+          return connectScannedPayloadRef.current(result, backendKind);
+        },
+      });
+    };
+    if (!canBeginPairing(perform)) return;
+    perform();
+  }, [canBeginPairing, openGatewayScanner, t]);
+
+  const connectFromPairingLink = useCallback(async (url: string, expectedBackendKind = initialBackend) => {
     const perform = async () => {
       if (!acquirePairingRequest()) return;
-      const requestId = beginOperation(initialBackend);
+      const requestId = beginOperation(expectedBackendKind);
       try {
         const result = await connectBackendPairingLink({
-          backendKind: initialBackend,
+          backendKind: expectedBackendKind,
           environment,
           debugMode,
           runtime: getConnectionRuntime(),
@@ -391,6 +421,7 @@ export function OnboardingRoute({
           ...current,
           active: false,
           errorCode: resolveOnboardingAdapterError(error),
+          pairingReason: resolvePairingValidationReason(error),
         }));
       });
       return;
@@ -408,46 +439,8 @@ export function OnboardingRoute({
     void Linking.openURL(ONBOARDING_WEBSITE_URLS[backendKind]);
   }, [onDocsOpened]);
 
-  const openYouMind = useCallback(() => {
-    const perform = () => {
-      onOpenYouMind?.();
-      setYouMindDraft(createYouMindOnboardingConnection({
-        runtime: getConnectionRuntime(),
-        debugMode,
-      }));
-    };
-    if (!canBeginPairing(perform)) return;
-    perform();
-  }, [canBeginPairing, debugMode, onOpenYouMind]);
-
-  const closeYouMind = useCallback(() => {
-    const draft = youMindDraft;
-    setYouMindDraft(null);
-    if (draft) void draft.discard();
-  }, [youMindDraft]);
-
-  const finishYouMindSignIn = useCallback(async (
-    session: YouMindOnboardingAuthSession,
-  ) => {
-    const draft = youMindDraft;
-    if (!draft) throw new Error('YouMind sign-in session is no longer active.');
-    const result = await draft.finish(session);
-    setYouMindDraft(null);
-    onConnected?.(result);
-  }, [onConnected, youMindDraft]);
-
   const close = onClose
     ?? (route.params?.presentation === 'modal' ? navigation.goBack : undefined);
-
-  if (youMindDraft) {
-    return (
-      <YouMindOnboardingScreen
-        client={youMindDraft.client}
-        onBack={closeYouMind}
-        onSignedIn={finishYouMindSignIn}
-      />
-    );
-  }
 
   if (!setupVisible && !operation.active && !operation.errorCode && !route.params?.pairingUrl) {
     return <WelcomeScreen onSettings={() => navigation.navigate('AccountSettings')} onConnect={() => setSetupVisible(true)} onClose={close} />;
@@ -472,10 +465,11 @@ export function OnboardingRoute({
         await Clipboard.setStringAsync(prompt);
         onAgentPromptCopied?.(backend);
       }}
-      onPastePairingCode={async () => {
+      onPastePairingCode={async (backend, isCurrent) => {
         const pasted = (await Clipboard.getStringAsync()).trim();
+        if (isCurrent && !isCurrent()) return null;
         if (/^(https?:\/\/|clawket:\/\/)/i.test(pasted)) {
-          await connectFromPairingLink(pasted);
+          await connectFromPairingLink(pasted, backend);
           return null;
         }
         return pasted;
@@ -483,8 +477,7 @@ export function OnboardingRoute({
       onSubmitPairing={submitPairing}
       onSubmitNanobot={submitNanobot}
       onScanQr={scanQr}
-      onImportQr={(backend) => scanQr(backend, true)}
-      onOpenYouMind={openYouMind}
+      onScanAnyQr={() => scanAnyQr()}
       onOpenWebsite={openWebsite}
       onErrorAction={(code) => {
         if (code === 'bridge_offline') {
@@ -494,6 +487,7 @@ export function OnboardingRoute({
         retry();
       }}
       onRetry={retry}
+      onOpenCustomConnection={() => navigation.navigate('OpenClawDirect')}
     />
   );
 }

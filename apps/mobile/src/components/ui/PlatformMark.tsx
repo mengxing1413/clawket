@@ -1,5 +1,6 @@
 import React from 'react';
 import { Image, StyleSheet, View } from 'react-native';
+import { getGatewayBackendDescriptor } from '@clawket/agent-protocol';
 import Svg, { Path, Rect } from 'react-native-svg';
 import { ControlSize, Radius } from '../../theme/tokens';
 import { useAppTheme } from '../../theme';
@@ -10,7 +11,6 @@ const marks = {
   pi: require('../../../assets/brands/pi.png'),
   openclaw: require('../../../assets/brands/openclaw.png'),
   hermes: require('../../../assets/brands/hermes.png'),
-  youmind: require('../../../assets/brands/youmind.png'),
   nanobot: require('../../../assets/brands/nanobot.png'),
 } as const;
 
@@ -20,12 +20,20 @@ export type PlatformKind = Platform;
 /**
  * Backends whose Agent is the product itself — one Agent per connection with no identity of its own —
  * so the official mark is that Agent's face wherever it appears (owner decision 2026-09-27). OpenClaw
- * Agents and YouMind Sprites keep their own avatars and carry the mark as a corner badge instead.
+ * Agents keep their own avatars and carry the mark as a corner badge instead.
  */
 const PRODUCT_FACE_PLATFORMS: ReadonlySet<Platform> = new Set(['hermes', 'codex', 'claude-code', 'pi', 'local-model', 'nanobot']);
 
 export function isProductFacePlatform(platform: Platform | null | undefined): platform is Platform {
   return platform != null && PRODUCT_FACE_PLATFORMS.has(platform);
+}
+
+/**
+ * The brand a product face shows, so a name beside it need not repeat it; null when the face is
+ * the Agent's own. The local model's chip names no brand.
+ */
+export function productFaceBrand(platform: Platform | null | undefined): string | null {
+  return isProductFacePlatform(platform) && platform !== 'local-model' ? getGatewayBackendDescriptor(platform).label : null;
 }
 
 /**
@@ -38,7 +46,6 @@ const ARTWORK: Readonly<Record<keyof typeof marks, Readonly<{ fill: number; tile
   pi: { fill: 0.59, tile: false },
   codex: { fill: 0.81, tile: true },
   hermes: { fill: 0.79, tile: true },
-  youmind: { fill: 1, tile: true },
   nanobot: { fill: 0.98, tile: true },
 };
 
@@ -60,18 +67,17 @@ const BALANCED_SIZE: Readonly<Record<Platform, number>> = {
   hermes: 46,
   codex: 45,
   pi: 50,
-  youmind: 36,
   'local-model': 41,
   nanobot: 45,
 };
 
 /**
  * Product marks; bundled artwork provenance is recorded in assets/brands/SOURCES.md. `balanced` sizes
- * the mark for a 44-point list slot beside other brands (Onboarding chooser); `size` sets the image box.
+ * the mark beside other brands in a slot set by `size` (44 points by default); otherwise `size` sets the image box.
  */
 export function PlatformMark({ platform, size, balanced = false }: { platform: Platform; size?: number; balanced?: boolean }) {
-  const drawn = balanced ? BALANCED_SIZE[platform] : size;
-  if (platform === 'local-model') return <LocalModelMark size={drawn ?? ControlSize.settingsRow} />;
+  const drawn = balanced ? BALANCED_SIZE[platform] * ((size ?? ControlSize.floatingButton) / ControlSize.floatingButton) : size;
+  if (platform === 'local-model') return <LocalModelMark size={drawn} />;
   return <Image accessible={false} source={marks[platform]} resizeMode="contain" style={[platform === 'hermes' || platform === 'codex' || platform === 'nanobot' ? styles.appIcon : styles.mark, drawn ? { width: drawn, height: drawn } : null]} />;
 }
 

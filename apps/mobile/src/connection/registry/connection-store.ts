@@ -1,3 +1,4 @@
+import { canonicalizeOfficialRelayUrl } from '../../../../../packages/bridge-core/src/official-relay';
 import type {
   AgentAdapter,
   BackendKind,
@@ -25,52 +26,24 @@ const SECURE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
 };
 
-const BACKEND_KINDS = new Set<BackendKind>(['openclaw', 'hermes', 'youmind', 'local-model', 'pi', 'codex', 'claude-code', 'nanobot']);
+const BACKEND_KINDS = new Set<BackendKind>(['openclaw', 'hermes', 'local-model', 'pi', 'codex', 'claude-code', 'nanobot']);
 const TRANSPORT_KINDS = new Set<TransportKind>([
   'relay',
   'local',
   'tailscale',
   'cloudflare',
   'custom',
-  'https',
 ]);
 
 const LEGACY_TRANSPORT_NORMALIZERS: Record<BackendKind, (value: TransportKind) => TransportKind> = {
   openclaw: (value) => value,
   hermes: (value) => value,
-  youmind: () => 'https',
   'local-model': value => value,
   pi: value => value,
   codex: value => value,
   'claude-code': value => value,
   nanobot: value => value,
 };
-
-const LEGACY_YOUMIND_METADATA: Record<BackendKind, (id: string) => ConnectionRecord['youmind']> = {
-  openclaw: () => undefined,
-  hermes: () => undefined,
-  youmind: (id) => ({ authScopeKey: `cfg:${id}` }),
-  'local-model': () => undefined,
-  pi: () => undefined,
-  codex: () => undefined,
-  'claude-code': () => undefined,
-  nanobot: () => undefined,
-};
-
-// Before 3.0, onboarding generated `YouMind (<email>)`. Keep the matcher
-// deliberately narrow so names, host labels, and user-authored variants stay
-// untouched: exact casing/spacing, one local-part separator, and a dotted
-// domain with no whitespace or parentheses.
-const LEGACY_YOUMIND_EMAIL_LABEL = /^YouMind \([^@()\s]+@[^@().\s]+(?:\.[^@().\s]+)+\)$/u;
-
-function sanitizeLegacyYouMindEmailLabel(
-  backendKind: BackendKind,
-  label: string,
-): string {
-  return backendKind === 'youmind' && LEGACY_YOUMIND_EMAIL_LABEL.test(label)
-    ? 'YouMind'
-    : label;
-}
 
 type RegistryState = {
   activeConnectionId: string | null;
@@ -84,7 +57,7 @@ type PersistedRegistrySnapshot = {
   state: RegistryState;
 };
 
-type LegacyConnectionSupplement = Pick<ConnectionRecord, 'environment' | 'debugMode' | 'youmind'>;
+type LegacyConnectionSupplement = Pick<ConnectionRecord, 'environment' | 'debugMode'>;
 
 export type NewConnectionRecord = Omit<ConnectionRecord, 'id' | 'createdAt'> & {
   id?: string;
@@ -106,7 +79,6 @@ export type ConnectionRecordPatch = Partial<
   bootstrap?: ConnectionRecord['bootstrap'] | null;
   relay?: ConnectionRecord['relay'] | null;
   hermes?: ConnectionRecord['hermes'] | null;
-  youmind?: ConnectionRecord['youmind'] | null;
   debugMode?: boolean | null;
 };
 
@@ -142,7 +114,6 @@ export interface SecureConnectionStorage {
 
 export interface LegacyConnectionStorage {
   readLegacyGatewayConfigsState(): Promise<GatewayConfigsState>;
-  migrateLegacyYouMindState(url: string, scopeKey: string): Promise<void>;
 }
 
 export interface ConnectionStoreOptions {
@@ -236,12 +207,6 @@ function normalizeHermes(value: unknown): ConnectionRecord['hermes'] {
   return { bridgeUrl, ...(displayName ? { displayName } : {}) };
 }
 
-function normalizeYouMind(value: unknown): ConnectionRecord['youmind'] {
-  if (!isObject(value)) return undefined;
-  const authScopeKey = readNonEmptyString(value.authScopeKey);
-  return authScopeKey ? { authScopeKey } : undefined;
-}
-
 function normalizeConnectionRecord(value: unknown): ConnectionRecord | null {
   if (!isObject(value)) return null;
   const id = readNonEmptyString(value.id);
@@ -265,7 +230,6 @@ function normalizeConnectionRecord(value: unknown): ConnectionRecord | null {
   const bootstrap = normalizeBootstrap(value.bootstrap);
   const relay = normalizeRelay(value.relay);
   const hermes = normalizeHermes(value.hermes);
-  const youmind = normalizeYouMind(value.youmind);
   const invalidAuth = value.auth !== undefined && (
     !isObject(value.auth)
     || (value.auth.token !== undefined && !readOptionalString(value.auth.token))
@@ -277,7 +241,6 @@ function normalizeConnectionRecord(value: unknown): ConnectionRecord | null {
     || (value.bootstrap !== undefined && !bootstrap)
     || (value.relay !== undefined && !relay)
     || (value.hermes !== undefined && !hermes)
-    || (value.youmind !== undefined && !youmind)
     || (value.debugMode !== undefined && typeof value.debugMode !== 'boolean')
   ) {
     return null;
@@ -289,12 +252,11 @@ function normalizeConnectionRecord(value: unknown): ConnectionRecord | null {
     label,
     ...(environment ? { environment } : {}),
     createdAt,
-    url,
+    url: value.transportKind === 'relay' ? canonicalizeOfficialRelayUrl(url, String(value.backendKind), environment) : url,
     ...(auth ? { auth } : {}),
     ...(bootstrap ? { bootstrap } : {}),
-    ...(relay ? { relay } : {}),
+    ...(relay ? { relay: { ...relay, serverUrl: canonicalizeOfficialRelayUrl(relay.serverUrl, String(value.backendKind), environment) } } : {}),
     ...(hermes ? { hermes } : {}),
-    ...(youmind ? { youmind } : {}),
     ...(typeof value.debugMode === 'boolean' ? { debugMode: value.debugMode } : {}),
   };
 }
@@ -303,10 +265,7 @@ function normalizeRegistryState(value: unknown): RegistryState | null {
   if (!isObject(value) || !Array.isArray(value.records)) return null;
   const records = value.records.map(normalizeConnectionRecord);
   if (records.some((record) => record === null)) return null;
-  const normalizedRecords = (records as ConnectionRecord[]).map((record) => {
-    const label = sanitizeLegacyYouMindEmailLabel(record.backendKind, record.label);
-    return label === record.label ? record : { ...record, label };
-  });
+  const normalizedRecords = records as ConnectionRecord[];
   const ids = new Set(normalizedRecords.map((record) => record.id));
   if (ids.size !== normalizedRecords.length) return null;
   const activeConnectionId = value.activeConnectionId === null
@@ -368,11 +327,9 @@ function readLegacySupplements(raw: string | null): Map<string, LegacyConnection
       const id = readNonEmptyString(item.id);
       if (!id) continue;
       const environment = normalizeEnvironment(item.environment);
-      const youmind = normalizeYouMind(item.youmind);
       supplements.set(id, {
         ...(environment ? { environment } : {}),
         ...(typeof item.debugMode === 'boolean' ? { debugMode: item.debugMode } : {}),
-        ...(youmind ? { youmind } : {}),
       });
     }
   } catch {
@@ -392,12 +349,11 @@ function migrateLegacyConfig(
   const auth = config.token || config.password
     ? { token: config.token, password: config.password }
     : undefined;
-  const youmind = supplement?.youmind ?? LEGACY_YOUMIND_METADATA[backendKind](config.id);
   return {
     id: config.id,
     backendKind,
     transportKind,
-    label: sanitizeLegacyYouMindEmailLabel(backendKind, config.name),
+    label: config.name,
     ...(environment ? { environment } : {}),
     createdAt: config.createdAt,
     url: config.url,
@@ -405,7 +361,6 @@ function migrateLegacyConfig(
     ...(config.bootstrap ? { bootstrap: config.bootstrap } : {}),
     ...(config.relay ? { relay: config.relay } : {}),
     ...(config.hermes ? { hermes: config.hermes } : {}),
-    ...(youmind ? { youmind } : {}),
     ...(supplement?.debugMode !== undefined ? { debugMode: supplement.debugMode } : {}),
   };
 }
@@ -414,7 +369,7 @@ function migrateLegacyState(
   value: GatewayConfigsState,
   supplements: ReadonlyMap<string, LegacyConnectionSupplement>,
 ): RegistryState {
-  const records = value.configs.map((config) => migrateLegacyConfig(config, supplements.get(config.id)));
+  const records = value.configs.map((config) => normalizeConnectionRecord(migrateLegacyConfig(config, supplements.get(config.id)))!);
   const ids = new Set(records.map((record) => record.id));
   const activeConnectionId = value.activeId && ids.has(value.activeId)
     ? value.activeId
@@ -433,7 +388,7 @@ function cloneRecord(record: ConnectionRecord): ConnectionRecord {
 function patchRecord(record: ConnectionRecord, patch: ConnectionRecordPatch): ConnectionRecord | null {
   const next: Record<string, unknown> = { ...cloneRecord(record) };
   const requiredFields = ['backendKind', 'transportKind', 'label', 'url'] as const;
-  const optionalFields = ['environment', 'auth', 'bootstrap', 'relay', 'hermes', 'youmind', 'debugMode'] as const;
+  const optionalFields = ['environment', 'auth', 'bootstrap', 'relay', 'hermes', 'debugMode'] as const;
   for (const field of requiredFields) {
     if (patch[field] !== undefined) next[field] = patch[field];
   }
@@ -496,7 +451,7 @@ function normalizeConnectionIdentityUrl(value: string | undefined): string | nul
   const trimmed = value?.trim().replace(/\/+$/, '');
   if (!trimmed) return null;
   try {
-    const parsed = new URL(trimmed);
+    const parsed = new URL(canonicalizeOfficialRelayUrl(trimmed));
     const pathname = parsed.pathname.replace(/\/+$/, '');
     return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${pathname}${parsed.search}`;
   } catch {
@@ -559,7 +514,6 @@ function mergeConnectionRecord(
     bootstrap: input.bootstrap ?? existing.bootstrap,
     relay: mergeConnectionRelay(existing.relay, input.relay),
     hermes: mergeConnectionHermes(existing.hermes, input.hermes),
-    youmind: input.youmind ?? existing.youmind,
     debugMode: input.debugMode ?? existing.debugMode,
     id: existing.id,
     createdAt: existing.createdAt,
@@ -575,7 +529,7 @@ function createDescriptor(
     id: record.id,
     backendKind: record.backendKind,
     transportKind: record.transportKind,
-    label: sanitizeLegacyYouMindEmailLabel(record.backendKind, record.label),
+    label: record.label,
     ...(record.environment ? { environment: record.environment } : {}),
     createdAt: record.createdAt,
     ...(bridgeOutdated ? { bridgeOutdated: true } : {}),
@@ -932,7 +886,16 @@ export class ConnectionStore {
   private async readOrMigrate(): Promise<PersistedRegistrySnapshot> {
     const currentRaw = await this.secureStorage.getItemAsync(CURRENT_STORAGE_KEY, SECURE_OPTIONS);
     const current = parsePersistedSnapshot(currentRaw);
-    if (current) return current;
+    if (current) {
+      const original = JSON.parse(currentRaw!) as PersistedRegistrySnapshot;
+      if (original.state.records.some((record, index) => record.url !== current.state.records[index]?.url
+        || record.relay?.serverUrl !== current.state.records[index]?.relay?.serverUrl)) {
+        const revision = current.revision + 1;
+        await this.persist(original, current.state, revision);
+        return { ...current, revision };
+      }
+      return current;
+    }
 
     const rollbackRaw = await this.secureStorage.getItemAsync(ROLLBACK_STORAGE_KEY, SECURE_OPTIONS);
     const rollback = parsePersistedSnapshot(rollbackRaw);
@@ -941,14 +904,6 @@ export class ConnectionStore {
     const legacyRaw = await this.secureStorage.getItemAsync(LEGACY_CONFIGS_STORAGE_KEY, SECURE_OPTIONS);
     const legacy = await this.legacyStorage.readLegacyGatewayConfigsState();
     const state = migrateLegacyState(legacy, readLegacySupplements(legacyRaw));
-    for (const record of state.records) {
-      if (record.backendKind === 'youmind') {
-        await this.legacyStorage.migrateLegacyYouMindState(
-          record.url,
-          record.youmind?.authScopeKey ?? record.id,
-        );
-      }
-    }
     const migrated: PersistedRegistrySnapshot = {
       version: STORAGE_VERSION,
       revision: 1,

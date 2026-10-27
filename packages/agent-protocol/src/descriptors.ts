@@ -1,12 +1,11 @@
-export type BackendKind = 'openclaw' | 'hermes' | 'youmind' | 'local-model' | 'pi' | 'codex' | 'claude-code' | 'nanobot';
+export type BackendKind = 'openclaw' | 'hermes' | 'local-model' | 'pi' | 'codex' | 'claude-code' | 'nanobot';
 
 export type TransportKind =
   | 'relay'
   | 'local'
   | 'tailscale'
   | 'cloudflare'
-  | 'custom'
-  | 'https';
+  | 'custom';
 
 export type ServiceEnvironment = 'production' | 'preview';
 
@@ -47,7 +46,6 @@ export interface ConnectionRecord {
   bootstrap?: OpenClawBootstrapConfig;
   relay?: RelayGatewayConfig;
   hermes?: HermesGatewayConfig;
-  youmind?: { authScopeKey: string };
   debugMode?: boolean;
 }
 
@@ -85,6 +83,7 @@ export type SessionKind =
   | 'other';
 
 export interface SessionActions {
+  archive?: boolean;
   rename: boolean;
   reset: boolean;
   delete: boolean;
@@ -98,7 +97,15 @@ export interface ProjectDescriptor {
   available: boolean;
 }
 
+/** Fresh presentation evidence; unknown never establishes idle or writer ownership. */
+export interface SessionActivity {
+  key: string;
+  state: 'running' | 'idle' | 'waiting' | 'unknown';
+  attention?: 'input' | 'approval' | null;
+}
+
 export interface SessionDescriptor {
+  archived?: boolean;
   project?: ProjectDescriptor;
   /** Exact native continuation is available; absent preserves legacy read-only semantics. */
   canContinue?: boolean;
@@ -194,8 +201,12 @@ export interface MessageAttribution {
 
 /** Rendering-neutral subset of the existing mobile `UiMessage` model. */
 export interface ChatMessage {
+  /** Additive attachment-card projection; legacy text remains intact on the wire. */
+  artifactDisplayText?: string;
   id: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
+  /** Optional backend-authored execution group; never inferred from prose or clocks. */
+  turnId?: string;
   text: string;
   timestampMs?: number;
   idempotencyKey?: string;
@@ -209,6 +220,7 @@ export interface ChatMessage {
     content?: string;
     uri?: string;
     name?: string;
+    artifactId?: string;
   }>;
   provider?: string;
   model?: string;
@@ -216,6 +228,8 @@ export interface ChatMessage {
   tool?: {
     name: string;
     status: 'running' | 'success' | 'error' | 'unknown';
+    /** Adapter-reported state, including unknown; do not infer a live start from it. */
+    statusReported?: true;
     callId?: string;
     summary?: string;
     input?: unknown;
@@ -231,17 +245,25 @@ export interface SessionHistory {
   toolCallAliases?: Readonly<Record<string, string>>;
   key: string;
   messages: ChatMessage[];
+  /** Adapter-declared cursor semantics: an absent nextCursor is a complete page,
+   * including the first empty page. Omission preserves legacy limit/local paging. */
+  pagination?: 'cursor';
   nextCursor?: string;
   hasActiveRun: boolean;
   /** Backend recovery snapshot; absent on peers that do not expose live runs. */
-  activeRun?: { runId: string; text: string; startedAtMs?: number; sessionAbortable?: boolean };
+  activeRun?: { runId: string; text: string; startedAtMs?: number; messageTimestampMs?: number; sessionAbortable?: boolean;
+    turnId?: string; inputMessageId?: string; inputMessageKey?: string };
   sessionId?: string;
   thinkingLevel?: string;
 }
 
 export interface FinalMessage {
+  artifactDisplayText?: string;
   role: 'assistant';
   content: string;
+  /** Native final-reply clock in milliseconds; absent keeps receipt-time presentation. */
+  timestampMs?: number;
+  attachments?: ChatMessage['attachments'];
   provider?: string;
   model?: string;
 }
